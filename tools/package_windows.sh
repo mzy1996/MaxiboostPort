@@ -80,6 +80,24 @@ cp "$root/launcher/win_launcher.py" "$package/launcher/"
 cp "$root/launcher/bbport_i18n.py" "$package/launcher/"
 cp "$root/launcher/bbport_assets.py" "$package/launcher/" 2>/dev/null || true
 cp "$root/launcher/maxiboost.svg" "$package/launcher/" 2>/dev/null || true
+# The file that starts the launcher by a double click.
+cp "$root/launcher/launcher.bat" "$package/launcher/"
+
+# The packaged launcher: the executable that needs nothing installed (no Python, no
+# PySide6). It is the one the player starts; the Python sources stay in the package for
+# the ones who want them.
+for packaged in "$root/out/win/launcher-onefile/MAXIBOOST ON.exe" \
+                "$root/out/win/launcher/MAXIBOOST ON/MAXIBOOST ON.exe"; do
+    if [ -f "$packaged" ]; then
+        cp "$packaged" "$package/launcher/"
+        echo "The packaged launcher: $package/launcher/MAXIBOOST ON.exe"
+        break
+    fi
+done
+if [ ! -f "$package/launcher/MAXIBOOST ON.exe" ]; then
+    echo "NOTE: the packaged launcher was not built (tools/build_launcher_exe.py); the"
+    echo "      player needs Python for launcher\\win_launcher.py"
+fi
 
 # The built-in patch file.
 cp "$root/patches/Maxiboost.xml" "$package/patches/"
@@ -91,30 +109,45 @@ cp "$root/README.md" "$root/BUILD.win.md" "$root/LEGAL.md" "$package/docs/" 2>/d
 cat > "$package/README.txt" <<'EOF'
 MAXIBOOST ON for Windows (mbport)
 
-What is here:
-  bin/bb-probe.exe    the runtime (the game's own x86-64 code runs on the CPU)
-  bin/bbgpu.dll       the GPU library (the graphics are translated to Vulkan)
-  scripts/            the scripts that prepare the game (the eboot is decrypted and linked)
-  launcher/           the launcher (run: python launcher/win_launcher.py)
-  patches/            the built-in patch file (the game's fixes)
+WHAT TO RUN
+  launcher\MAXIBOOST ON.exe  the launcher: the window with the game, the cheats and the
+                            settings. This is the program to start (double click it).
+                            It needs nothing installed: the window's library is inside
+                            it.
 
-What is needed:
+  launcher\launcher.bat     the same launcher, for the ones who have Python and want to
+                            run it from the sources.
+
+  bin\bb-probe.exe          the runtime: it runs the game's own code. The launcher starts
+                            it for you; it has no window of its own.
+
+WHAT IS HERE
+  bin\                      the runtime and the GPU library, and the DLLs they need
+  scripts\                  the scripts that prepare the game (the eboot is decrypted and
+                            linked with the game's modules)
+  launcher\                 the launcher (the window)
+  patches\                  the built-in patch file (the game's fixes)
+
+WHAT IS NEEDED
   - a dump of MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON with update 1.15 merged in
     (the North American release CUSA18758 or the Hong Kong release CUSA15006), in a folder
     the launcher can read;
   - a Vulkan driver (the GPU library needs it);
-  - Python 3.9 or newer (the scripts and the launcher).
+  - Python 3.9 or newer (the launcher and the scripts).
 
-How to start:
+HOW TO START
   1. put the dump in a folder, e.g. C:\Games\MAXIBOOST ON;
-  2. run  python launcher\win_launcher.py ;
-  3. choose the folder, press Play.
+  2. double click launcher\launcher.bat (the first start installs PySide6, the window's
+     library, which takes a moment);
+  3. choose the game's folder on the first page, press Play.
 
-The JSON cheats (the "Cheats" page of the launcher) are the tables the game reads: the file
-CUSA15006_01.15.json of the Hong Kong release is one. The port writes the entries you switch
-on into the executable when the game starts.
+THE JSON CHEATS
+  The "Cheats" page of the launcher lists the cheats of the JSON file you choose, one
+  checkbox each. The file CUSA15006_01.15.json of the Hong Kong release is one. The port
+  writes the entries you switch on into the executable when the game starts.
 
-The legal notice is in docs/LEGAL.md: no game files are included here, and none may be.
+THE LEGAL NOTICE
+  It is in docs\LEGAL.md: no game files are included here, and none may be.
 EOF
 
 echo "Package: $package"

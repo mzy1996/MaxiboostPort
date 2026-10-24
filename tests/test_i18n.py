@@ -1,5 +1,6 @@
 from paths import ROOT
 import ast
+import os
 import re
 import string
 import sys
@@ -14,14 +15,14 @@ class GameLanguageTests(unittest.TestCase):
                  'de_DE.UTF-8': 4, 'it_IT.UTF-8': 5, 'en_GB.UTF-8': 1, 'nl_NL.UTF-8': 1, '': 1}
         for locale, code in cases.items():
             with self.subTest(locale=locale):
-                self.assertEqual(bbport_i18n.system_game_language({'LANG': locale}), code)
+                self.assertEqual(bbport_i18n.system_game_language({'LANG': locale}, prefer_env=True), code)
 
     def test_lc_all_overrides_lang(self):
-        self.assertEqual(bbport_i18n.system_game_language({'LC_ALL': 'de_DE', 'LANG': 'es_ES'}), 4)
+        self.assertEqual(bbport_i18n.system_game_language({'LC_ALL': 'de_DE', 'LANG': 'es_ES'}, prefer_env=True), 4)
 
 
 # The languages this fork keeps complete.
-MAINTAINED = ('EN', 'ES', 'IT', 'FR', 'DE', 'PT_BR', 'ZH_CN')
+MAINTAINED = ('EN', 'ES', 'IT', 'FR', 'DE', 'PT_BR', 'ZH_CN', 'ZH_TW')
 CYRILLIC = re.compile('[А-Яа-яЁё]')
 
 
@@ -65,6 +66,80 @@ class TranslationTests(unittest.TestCase):
             for key, text in getattr(bbport_i18n, language).items():
                 with self.subTest(language=language, key=key[:40]):
                     self.assertEqual(len(fields(text)), len(fields(key)))
+
+
+class FallbackTests(unittest.TestCase):
+    """A text a language does not have must not show up as the Russian key: the window
+    would look like a mixture of two languages."""
+
+    def test_a_missing_text_falls_back_to_english(self):
+        original = bbport_i18n._language
+        try:
+            for language in bbport_i18n.LANGUAGES:
+                if language == 'ru':
+                    continue  # the Russian key is the Russian text
+                bbport_i18n.set_language(language)
+                for key in launcher_texts():
+                    shown = bbport_i18n.tr(key)
+                    with self.subTest(language=language, key=key[:40]):
+                        # The Russian key must not show up: the window would look like a
+                        # mixture of two languages.
+                        self.assertNotEqual(shown, key)
+                        self.assertIsNone(CYRILLIC.search(shown))
+        finally:
+            bbport_i18n._language = original
+
+    def test_the_traditional_chinese_table_differs_from_the_simplified_one(self):
+        self.assertGreater(len(bbport_i18n.ZH_TW), 500)
+        different = [key for key, text in bbport_i18n.ZH_TW.items()
+                     if bbport_i18n.ZH_CN.get(key) != text]
+        self.assertGreater(len(different), 100)
+
+
+class WindowTests(unittest.TestCase):
+    """The window itself must not show the Russian text in another language."""
+
+    def test_the_window_shows_no_russian_in_the_other_languages(self):
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+        try:
+            from PySide6.QtWidgets import QApplication, QComboBox, QListWidget
+        except ImportError:
+            self.skipTest('PySide6 is not installed')
+        app = QApplication.instance() or QApplication([])
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import win_launcher
+
+        def texts(widget, found):
+            for child in widget.children():
+                for getter in ('text', 'title', 'toolTip', 'statusTip', 'placeholderText'):
+                    if hasattr(child, getter):
+                        try:
+                            value = getattr(child, getter)()
+                        except Exception:
+                            value = None
+                        if isinstance(value, str) and value.strip():
+                            found.append(value)
+                if isinstance(child, QComboBox):
+                    for index in range(child.count()):
+                        found.append(child.itemText(index))
+                if isinstance(child, QListWidget):
+                    for index in range(child.count()):
+                        found.append(child.item(index).text())
+                texts(child, found)
+            return found
+
+        original = bbport_i18n._language
+        try:
+            for language in ('en', 'zh_CN', 'zh_TW'):
+                bbport_i18n.set_language(language)
+                window = win_launcher.Window()
+                shown = texts(window, [])
+                russian = [text for text in shown if CYRILLIC.search(text)]
+                with self.subTest(language=language):
+                    self.assertEqual(russian, [])
+        finally:
+            bbport_i18n._language = original
 
 
 if __name__ == '__main__':

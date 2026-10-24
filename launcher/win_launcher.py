@@ -16,34 +16,58 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QTimer
-from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QFileDialog,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QSplitter,
-    QTabWidget,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
+try:
+    from PySide6.QtCore import Qt, QProcess, QTimer, Signal
+    from PySide6.QtGui import QAction, QKeySequence
+    from PySide6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QComboBox,
+        QFileDialog,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QListWidget,
+        QListWidgetItem,
+        QMainWindow,
+        QMessageBox,
+        QPushButton,
+        QSpinBox,
+        QSplitter,
+        QTabWidget,
+        QTextEdit,
+        QVBoxLayout,
+        QWidget,
+    )
+except ImportError as error:
+    # The launcher needs PySide6; without it there is no window, only this message.
+    print("The launcher needs PySide6, which is not installed.\n"
+          "\n"
+          "Install it with:\n"
+          "    python -m pip install PySide6\n"
+          "\n"
+          f"(the error was: {error})", file=sys.stderr)
+    sys.exit(1)
 
-PORT_DIR = Path(__file__).resolve().parent.parent
+# The program's own directory. In the packaged program (a single executable) it is the
+# folder the executable was put in, not the folder it was unpacked into: the runtime and
+# the game's data are beside the player, not inside the executable.
+if getattr(sys, "frozen", False):
+    PORT_DIR = Path(sys.executable).resolve().parent.parent
+    # The modules and the data are inside the executable's own folder.
+    unpacked = getattr(sys, "_MEIPASS", None)
+    if unpacked:
+        for folder in ("launcher", "scripts"):
+            path = str(Path(unpacked) / folder)
+            if path not in sys.path:
+                sys.path.insert(0, path)
+else:
+    PORT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PORT_DIR / "launcher"))
 sys.path.insert(0, str(PORT_DIR / "scripts"))
 
@@ -51,6 +75,7 @@ from bbport_i18n import language, set_language, system_game_language, tr  # noqa
 
 import game_check  # noqa: E402
 import cheats  # noqa: E402
+import port_prepare  # noqa: E402
 from patches import APP_VERSION as PATCH_APP_VERSION, BUILTIN_XML, FPS_PRESETS  # noqa: E402
 from patches import EFFECTS as PATCH_EFFECTS, external_patches  # noqa: E402
 
@@ -62,9 +87,26 @@ DATA_DIR = Path(os.environ.get("BB_DATA_DIR", PORT_DIR))
 CHEATS_CONFIG = DATA_DIR / "cheats.json"
 PATCHES_CONFIG = DATA_DIR / "patches.json"
 
+# The language of the launcher: the first entry is the system's own, the others are named
+# in the language they are (a person who does not read the rest looks for their own).
+# The languages the launcher has. Each is named in its own language, so that the person
+# who reads it finds their own (the "system" entry is translated, because it is the
+# launcher's own wording).
+def choice_label(label, value):
+    """The name of a choice in a list.
+
+    The "system" entry is the launcher's own wording, so it is translated; the languages
+    keep their own names, so that the person who reads it finds their own."""
+    if value == "":
+        return tr("Как в системе")
+    if value == "ru" and language() != "ru":
+        return "Russian"
+    return label
+
+
 UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("English", "en"), ("Português (Brasil)", "pt_BR"),
                 ("Español", "es"), ("Italiano", "it"), ("Français", "fr"), ("Deutsch", "de"),
-                ("简体中文", "zh_CN")]
+                ("简体中文", "zh_CN"), ("繁體中文", "zh_TW")]
 # The game's own language (the two the game has).
 GAME_LANGUAGES = [("Как в системе", ""), ("English", "1"), ("日本語", "2")]
 FPS_MODES = [("Как в системе", ""), ("30", "30"), ("60", "60"), ("120", "120")]
@@ -230,6 +272,29 @@ def folder_button(callback):
     return button
 
 
+class PrepareWorker(threading.Thread):
+    """Prepares the game in the background, so that the window stays alive.
+
+    The eboot is decrypted and the modules are linked: that takes a while, and the window
+    would freeze if it were done in the thread of the button."""
+    def __init__(self, window):
+        super().__init__(daemon=True)
+        self.window = window
+        self.result = Signal(list)
+        self.failed = Signal(str)
+
+    def run(self):
+        try:
+            prepared = port_prepare.prepare_game(DATA_DIR, self.window.config_path())
+        except port_prepare.PrepareError as error:
+            self.failed.emit(str(error))
+            return
+        except Exception as error:  # something else went wrong
+            self.failed.emit(f"{error}")
+            return
+        self.result.emit(port_prepare.runtime_arguments(prepared))
+
+
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -376,7 +441,9 @@ class Window(QMainWindow):
 
         self.ui_language = QComboBox()
         for label, value in UI_LANGUAGES:
-            self.ui_language.addItem(label, value)
+            # The languages are named in their own language; the "system" entry is the
+            # launcher's own wording, so it follows the chosen language.
+            self.ui_language.addItem(choice_label(label, value), value)
         self.select(self.ui_language, self.settings.get("ui_language", ""))
         self.ui_language.currentIndexChanged.connect(self.on_ui_language)
         form.addWidget(Row(tr("Язык интерфейса"), self.ui_language), row, 0)
@@ -384,7 +451,7 @@ class Window(QMainWindow):
 
         self.game_language = QComboBox()
         for label, value in GAME_LANGUAGES:
-            self.game_language.addItem(label, value)
+            self.game_language.addItem(choice_label(label, value), value)
         self.select(self.game_language, self.settings.get("language", ""))
         self.game_language.currentIndexChanged.connect(self.on_game_language)
         form.addWidget(Row(tr("Язык игры"), self.game_language), row, 0)
@@ -392,7 +459,7 @@ class Window(QMainWindow):
 
         self.fps = QComboBox()
         for label, value in fps_modes():
-            self.fps.addItem(label, value)
+            self.fps.addItem(choice_label(label, value), value)
         self.select(self.fps, self.settings.get("fps_mode", "60"))
         self.fps.currentIndexChanged.connect(self.on_fps)
         form.addWidget(Row(tr("Частота кадров"), self.fps), row, 0)
@@ -414,7 +481,7 @@ class Window(QMainWindow):
         row += 1
 
         self.memory_model = QComboBox()
-        for label, value in (("Авто", "auto"), ("Новая", "new"), ("Старая", "old")):
+        for label, value in ((tr("Авто"), "auto"), (tr("Новая"), "new"), (tr("Старая"), "old")):
             self.memory_model.addItem(label, value)
         self.select(self.memory_model, self.settings.get("memory_model", "auto"))
         self.memory_model.currentIndexChanged.connect(self.on_memory_model)
@@ -529,7 +596,7 @@ class Window(QMainWindow):
     # --- the cheats ----------------------------------------------------------------------
     def on_choose_cheats(self):
         path, _ = QFileDialog.getOpenFileName(self, tr("Файл читов"), "",
-                                              "Файлы читов (*.json);;Все файлы (*)")
+                                              tr("Файлы читов (*.json);;Все файлы (*)"))
         if not path:
             return
         self.settings["cheats_file"] = path
@@ -665,13 +732,65 @@ class Window(QMainWindow):
         save_settings(self.settings)
 
     def runtime_path(self):
-        """The runtime's program: beside the launcher (out/win/bin) or in the tree."""
-        for candidate in (PORT_DIR / "out" / "win" / "bin" / "bb-probe.exe",
-                          PORT_DIR / "out" / "win" / "bb-probe.exe",
-                          PORT_DIR / "bb-probe.exe"):
+        """The runtime's program: in the package (bin), or in the build tree."""
+        for candidate in (PORT_DIR / "bin" / "bb-probe.exe",
+                          PORT_DIR / "bb-probe.exe",
+                          PORT_DIR.parent / "bin" / "bb-probe.exe",
+                          PORT_DIR / "out" / "win" / "bin" / "bb-probe.exe",
+                          PORT_DIR / "out" / "win" / "bb-probe.exe"):
             if candidate.is_file():
                 return candidate
         return None
+
+    def runtime_arguments(self):
+        """The arguments the runtime is started with.
+
+        The game is prepared first: the eboot is decrypted, the game's modules are linked
+        into it, the profile and the patches are written. The steps take a while, so they
+        run in a thread and the window stays alive."""
+        self.set_busy(True)
+        self.log.append(tr("Готовим игру..."))
+        worker = PrepareWorker(self)
+        worker.result.connect(self.on_prepared)
+        worker.failed.connect(self.on_prepare_failed)
+        worker.start()
+        return None
+
+    def config_path(self):
+        """The file the settings are read from (the runtime's own configuration)."""
+        return DATA_DIR / "bbport.ini"
+
+    def set_busy(self, busy):
+        """The window's buttons while the game is being prepared."""
+        self.play.setEnabled(not busy)
+        self.stop.setEnabled(not busy)
+
+    def on_prepared(self, arguments):
+        """The game is prepared: the runtime can start."""
+        self.set_busy(False)
+        if not arguments:
+            return
+        runtime = self.runtime_path()
+        if runtime is None:
+            QMessageBox.warning(self, tr("Запустить"),
+                                tr("Не найден исполняемый файл bb-probe.exe. Соберите проект."))
+            return
+        env = game_environment(self.settings)
+        self.process = QProcess(self)
+        self.process.setProcessEnvironment(_qt_environment(env))
+        self.process.setWorkingDirectory(str(runtime.parent))
+        self.process.readyReadStandardOutput.connect(self.on_output)
+        self.process.readyReadStandardError.connect(self.on_output)
+        self.process.finished.connect(self.on_finished)
+        self.process.start(str(runtime), arguments)
+        self.play.setEnabled(False)
+        self.stop.setEnabled(True)
+
+    def on_prepare_failed(self, message):
+        """The game could not be prepared."""
+        self.set_busy(False)
+        self.log.append(message)
+        QMessageBox.critical(self, tr("Запустить"), message)
 
     def on_play(self):
         if self.process is not None:
@@ -689,16 +808,7 @@ class Window(QMainWindow):
         self.store()
         self.tabs.setCurrentIndex(3)
         self.log.clear()
-        env = game_environment(self.settings)
-        self.process = QProcess(self)
-        self.process.setProcessEnvironment(_qt_environment(env))
-        self.process.setWorkingDirectory(str(runtime.parent))
-        self.process.readyReadStandardOutput.connect(self.on_output)
-        self.process.readyReadStandardError.connect(self.on_output)
-        self.process.finished.connect(self.on_finished)
-        self.process.start(str(runtime), [])
-        self.play.setEnabled(False)
-        self.stop.setEnabled(True)
+        self.runtime_arguments()
 
     def on_output(self):
         data = bytes(self.process.readAllStandardOutput())

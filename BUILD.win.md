@@ -47,6 +47,26 @@ the toolchain file; it points CMake at the MinGW-w64 environment. The MSYS2 CMak
 program and cannot drive a Windows compiler, so the tools come from the Python packages
 (`pip install cmake ninja`) or from a native installation.
 
+### The launcher: one executable, nothing to install
+
+The player should not have to install Python, PySide6 or anything else, so the launcher
+is packaged into a single executable (`tools/build_launcher_exe.py`, PyInstaller):
+
+```
+python tools/build_launcher_exe.py            # one file (46 MB)
+python tools/build_launcher_exe.py --onedir   # a folder (it starts a little faster)
+```
+
+The executable carries the interpreter, the window's library and the game's preparation
+scripts, so the player only double clicks `launcher/MAXIBOOST ON.exe`. The Qt modules the
+launcher does not use (WebEngine, Quick, 3D, Charts) are left out, which is most of the
+size.
+
+Two paths matter in a packaged program and they are not the same: the modules and the
+data are in the folder the executable was unpacked into (`sys._MEIPASS`), while the
+runtime and the player's own files are in the folder the executable was put in
+(`Path(sys.executable).parent`).
+
 ### The libraries the program ships with
 
 The GPU library links the ffmpeg (the video decoder), the Vulkan loader, SDL3 (the window and

@@ -108,7 +108,7 @@ FSR411_BUILD_ERRORS = {
 # Choices: (label, value). The first entry is the default. Labels are translated when shown.
 UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("English", "en"), ("Português (Brasil)", "pt_BR"),
                 ("Español", "es"), ("Italiano", "it"), ("Français", "fr"), ("Deutsch", "de"),
-                ("简体中文", "zh_CN")]
+                ("简体中文", "zh_CN"), ("繁體中文", "zh_TW")]
 # The temporal upscalers need the game's scene color, depth and motion, which the GPU library learns
 # from the game profile (gpu/games/maxiboost.cpp maps MAXIBOOST ON's camera, scene passes and the
 # pass scaling the scene into the display buffer).
