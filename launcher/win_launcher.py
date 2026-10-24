@@ -16,11 +16,10 @@ import json
 import os
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import Qt, QProcess, QTimer, Signal
+    from PySide6.QtCore import Qt, QProcess, QThread, QTimer, Signal
     from PySide6.QtGui import QAction, QKeySequence
     from PySide6.QtWidgets import (
         QApplication,
@@ -285,16 +284,21 @@ def folder_button(callback):
     return button
 
 
-class PrepareWorker(threading.Thread):
+class PrepareWorker(QThread):
     """Prepares the game in the background, so that the window stays alive.
 
     The eboot is decrypted and the modules are linked: that takes a while, and the window
-    would freeze if it were done in the thread of the button."""
+    would freeze if it were done in the thread of the button. It is a QThread and not a
+    plain one, because the result is passed to the window through a signal."""
+
+    # The signals are declared here: PySide6 binds them to the instance only when they
+    # are the class's own attributes (a signal made in __init__ is a plain object).
+    result = Signal(list)
+    failed = Signal(str)
+
     def __init__(self, window):
-        super().__init__(daemon=True)
+        super().__init__()
         self.window = window
-        self.result = Signal(list)
-        self.failed = Signal(str)
 
     def run(self):
         try:
