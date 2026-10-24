@@ -77,6 +77,7 @@ from bbport_i18n import game_language as i18n_game_language  # noqa: E402
 import game_check  # noqa: E402
 import cheats  # noqa: E402
 import port_prepare  # noqa: E402
+import input_devices  # noqa: E402
 from patches import APP_VERSION as PATCH_APP_VERSION, BUILTIN_XML, FPS_PRESETS  # noqa: E402
 from patches import EFFECTS as PATCH_EFFECTS, external_patches  # noqa: E402
 
@@ -317,11 +318,16 @@ class Window(QMainWindow):
         self.setWindowTitle("MAXIBOOST ON (mbport)")
         self.resize(980, 720)
 
+        # The language is set before the pages are built: every text is translated as it
+        # is created, so the window is in the chosen language from the start.
+        set_language(self.settings.get("ui_language", ""))
+
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.build_game_tab()
         self.build_cheats_tab()
         self.build_settings_tab()
+        self.build_controls_tab()
         self.build_log_tab()
 
         self.play = QPushButton(tr("Запустить"))
@@ -553,18 +559,221 @@ class Window(QMainWindow):
         layout.addLayout(buttons)
         self.tabs.addTab(page, tr("Журнал"))
 
+
+    # --- the menu bar --------------------------------------------------------------------
+    def build_menu(self):
+        """The menu bar: the language, so that it can be changed from any page."""
+        bar = self.menuBar()
+        self.language_menu = bar.addMenu(tr("Язык"))
+        self.language_actions = {}
+        for label, value in UI_LANGUAGES:
+            action = QAction(self.language_label(label, value), self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked=False, code=value: self.choose_language(code))
+            self.language_menu.addAction(action)
+            self.language_actions[value] = action
+        self.mark_language()
+
+    def rebuild_menu(self):
+        """The menu bar is built again in the new language (its own texts are translated
+        when it is created)."""
+        self.menuBar().clear()
+        self.build_menu()
+
+    def language_label(self, label, value):
+        """The name of a language in the menu: each in its own language, so that the
+        person who reads it finds their own."""
+        if value == "":
+            return tr("Как в системе")
+        if value == "ru" and language() != "ru":
+            return "Russian"
+        return label
+
+    def mark_language(self):
+        """The chosen language is marked in the menu."""
+        chosen = self.settings.get("ui_language", "")
+        for value, action in self.language_actions.items():
+            action.setChecked(value == chosen)
+
+    def choose_language(self, code):
+        """The language is changed: the window is built again in it."""
+        if code == self.settings.get("ui_language", ""):
+            return
+        self.settings["ui_language"] = code
+        self.store()
+        self.apply_language()
+        self.mark_language()
+
+    # --- the controls page ----------------------------------------------------------------
+    def build_controls_tab(self):
+        """The input devices and the key bindings.
+
+        The devices that are connected are shown with the architecture they are read
+        through (XInput or DirectInput); the bindings can be changed one by one, and the
+        automatic configuration fills them in for the device that is there."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        devices_row = QHBoxLayout()
+        self.device_box = QComboBox()
+        self.device_box.currentIndexChanged.connect(self.on_device_changed)
+        devices_row.addWidget(QLabel(tr("Устройство ввода")))
+        devices_row.addWidget(self.device_box, 1)
+        refresh = QPushButton(tr("Обновить список"))
+        refresh.clicked.connect(self.fill_devices)
+        devices_row.addWidget(refresh)
+        layout.addLayout(devices_row)
+
+        self.device_info = QLabel("")
+        self.device_info.setWordWrap(True)
+        layout.addWidget(self.device_info)
+
+        # The bindings: one row per input, the keyboard key and the gamepad button.
+        self.binding_widgets = {}
+        grid = QGridLayout()
+        grid.addWidget(QLabel(tr("Действие")), 0, 0)
+        grid.addWidget(QLabel(tr("Клавиша")), 0, 1)
+        grid.addWidget(QLabel(tr("Кнопка геймпада")), 0, 2)
+        for row, (name, label) in enumerate(input_devices.INPUTS, start=1):
+            key = QComboBox()
+            key.setEditable(True)
+            key.addItem("", "")
+            for key_name in input_devices.KEY_NAMES:
+                key.addItem(key_name, key_name)
+            pad = QComboBox()
+            pad.setEditable(True)
+            pad.addItem("", "")
+            for pad_name in input_devices.PAD_NAMES:
+                pad.addItem(pad_name, pad_name)
+            self.binding_widgets[name] = (key, pad)
+            grid.addWidget(QLabel(tr(label)), row, 0)
+            grid.addWidget(key, row, 1)
+            grid.addWidget(pad, row, 2)
+        layout.addLayout(grid, 1)
+
+        # The buttons: the automatic configuration and the way back to the defaults.
+        buttons = QHBoxLayout()
+        automatic = QPushButton(tr("Настроить автоматически"))
+        automatic.clicked.connect(self.automatic_bindings)
+        buttons.addWidget(automatic)
+        reset = QPushButton(tr("Сбросить"))
+        reset.clicked.connect(self.reset_bindings)
+        buttons.addWidget(reset)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self.tabs.addTab(page, tr("Управление"))
+        self.fill_devices()
+
+    def fill_devices(self):
+        """The devices that are connected, and the bindings of the chosen one."""
+        self.device_box.blockSignals(True)
+        self.device_box.clear()
+        for device in input_devices.devices(self.runtime_path()):
+            self.device_box.addItem(device.name or device.guid, device)
+        self.device_box.blockSignals(False)
+        self.on_device_changed()
+
+    def on_device_changed(self):
+        """The bindings of the chosen device are shown."""
+        device = self.device_box.currentData()
+        if device is None:
+            # No device: the keyboard's bindings are shown (a person with only a keyboard
+            # plays too).
+            self.device_info.setText(tr("Устройство не выбрано"))
+            self.show_keyboard_bindings()
+            return
+        if device.is_pad:
+            architecture = tr("XInput") if device.architecture == "xinput" else tr("DirectInput")
+            self.device_info.setText(tr("Геймпад через {}: {}").format(architecture, device.name))
+        else:
+            self.device_info.setText(tr("Клавиатура"))
+        bindings = input_devices.read_bindings(self.config_path())
+        for name, (key, pad) in self.binding_widgets.items():
+            entry = bindings.get(name, {})
+            if device.is_pad:
+                pad.setCurrentText(entry.get("pad", input_devices.DEFAULT_PADS.get(name, "")))
+                key.setCurrentText("")
+            else:
+                key.setCurrentText(entry.get("key", input_devices.DEFAULT_KEYS.get(name, "")))
+                pad.setCurrentText("")
+
+    def show_keyboard_bindings(self):
+        """The keyboard's bindings are shown (no gamepad is chosen)."""
+        bindings = input_devices.read_bindings(self.config_path())
+        for name, (key, pad) in self.binding_widgets.items():
+            entry = bindings.get(name, {})
+            key.setCurrentText(entry.get("key", input_devices.DEFAULT_KEYS.get(name, "")))
+            pad.setCurrentText("")
+
+    def collect_bindings(self):
+        """The bindings the page shows, as the configuration file writes them."""
+        bindings = {}
+        for name, (key, pad) in self.binding_widgets.items():
+            entry = {}
+            if key.currentText().strip():
+                entry["key"] = key.currentText().strip()
+            if pad.currentText().strip():
+                entry["pad"] = pad.currentText().strip()
+            bindings[name] = entry
+        return bindings
+
+    def save_bindings(self):
+        """The bindings are written into the configuration file."""
+        input_devices.write_bindings(self.config_path(), self.collect_bindings())
+
+    def automatic_bindings(self):
+        """The bindings are filled in for the device that is there."""
+        device = self.device_box.currentData()
+        if device is None:
+            return
+        bindings = input_devices.automatic_bindings(device)
+        for name, (key, pad) in self.binding_widgets.items():
+            entry = bindings.get(name, {})
+            if device.is_pad:
+                pad.setCurrentText(entry.get("pad", ""))
+                key.setCurrentText("")
+            else:
+                key.setCurrentText(entry.get("key", ""))
+                pad.setCurrentText("")
+        self.save_bindings()
+
+    def reset_bindings(self):
+        """The bindings are the defaults again."""
+        device = self.device_box.currentData()
+        for name, (key, pad) in self.binding_widgets.items():
+            if device is not None and device.is_pad:
+                pad.setCurrentText(input_devices.DEFAULT_PADS.get(name, ""))
+                key.setCurrentText("")
+            else:
+                key.setCurrentText(input_devices.DEFAULT_KEYS.get(name, ""))
+                pad.setCurrentText("")
+        self.save_bindings()
+
     # --- helpers -------------------------------------------------------------------------
     def select(self, box, value):
         index = box.findData(value)
         box.setCurrentIndex(index if index >= 0 else 0)
 
     def apply_language(self):
+        """Sets the language and builds the window's texts again.
+
+        Every text is translated as it is created, so a new language means the pages are
+        built again. The window is not replaced: the tabs are emptied and filled anew, so
+        that the game that runs keeps going."""
         set_language(self.settings.get("ui_language", ""))
         self.setWindowTitle("MAXIBOOST ON (mbport)")
-        self.tabs.setTabText(0, tr("Игра"))
-        self.tabs.setTabText(1, tr("Читы"))
-        self.tabs.setTabText(2, tr("Настройки"))
-        self.tabs.setTabText(3, tr("Журнал"))
+        # The pages are emptied first: the old ones would keep their texts.
+        while self.tabs.count():
+            widget = self.tabs.widget(0)
+            self.tabs.removeTab(0)
+            widget.deleteLater()
+        self.build_game_tab()
+        self.build_cheats_tab()
+        self.build_settings_tab()
+        self.build_controls_tab()
+        self.build_log_tab()
+        self.rebuild_menu()
         self.play.setText(tr("Запустить"))
         self.stop.setText(tr("Остановить"))
 
@@ -836,7 +1045,13 @@ class Window(QMainWindow):
             QMessageBox.warning(self, tr("Запустить"), game_check.explain(kind, title, version))
             return
         self.store()
-        self.tabs.setCurrentIndex(3)
+        # The bindings the controls page shows are written into the configuration file,
+        # and the chosen pad is named to the runtime.
+        self.save_bindings()
+        device = self.device_box.currentData() if hasattr(self, "device_box") else None
+        if device is not None and device.is_pad:
+            self.settings["gamepad"] = device.guid
+        self.tabs.setCurrentIndex(self.tabs.count() - 1)
         self.log.clear()
         self.runtime_arguments()
 

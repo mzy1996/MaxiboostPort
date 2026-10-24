@@ -1,5 +1,6 @@
 from paths import ROOT
 import ast
+import json
 import os
 import re
 import string
@@ -7,6 +8,50 @@ import sys
 import unittest
 sys.path.insert(0, str(ROOT / 'launcher'))
 import bbport_i18n
+
+
+class MenuTests(unittest.TestCase):
+    """The menu bar holds the language, so that it can be changed from any page."""
+
+    def _window(self, language=None):
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            self.skipTest('PySide6 is not installed')
+        app = QApplication.instance() or QApplication([])
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import win_launcher
+        if language is not None:
+            win_launcher.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            win_launcher.CONFIG_FILE.write_text(
+                json.dumps({'ui_language': language}), encoding='utf-8')
+        return win_launcher.Window()
+
+    def test_the_menu_bar_is_in_the_chosen_language(self):
+        for language, title in (('en', 'Language'), ('zh_CN', '语言'), ('zh_TW', '語言')):
+            with self.subTest(language=language):
+                window = self._window(language)
+                titles = [action.text() for action in window.menuBar().actions()]
+                self.assertEqual(titles, [title])
+                for text in titles:
+                    self.assertIsNone(CYRILLIC.search(text))
+
+    def test_the_menu_holds_every_language_and_marks_the_chosen_one(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        window = self._window('zh_TW')
+        self.assertEqual(len(window.language_menu.actions()), len(win_launcher.UI_LANGUAGES))
+        chosen = [action.text() for action in window.language_menu.actions() if action.isChecked()]
+        self.assertEqual(chosen, ['繁體中文'])
+
+    def test_changing_the_language_builds_the_window_again(self):
+        window = self._window('en')
+        window.choose_language('zh_CN')
+        tabs = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+        self.assertEqual(tabs, ['游戏', '金手指', '设置', '操作设置', '日志'])
+        self.assertEqual([action.text() for action in window.menuBar().actions()], ['语言'])
 
 
 class GameLanguageTests(unittest.TestCase):
@@ -66,6 +111,50 @@ class TranslationTests(unittest.TestCase):
             for key, text in getattr(bbport_i18n, language).items():
                 with self.subTest(language=language, key=key[:40]):
                     self.assertEqual(len(fields(text)), len(fields(key)))
+
+
+class MenuTests(unittest.TestCase):
+    """The menu bar holds the language, so that it can be changed from any page."""
+
+    def _window(self, language=None):
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            self.skipTest('PySide6 is not installed')
+        app = QApplication.instance() or QApplication([])
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import win_launcher
+        if language is not None:
+            win_launcher.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            win_launcher.CONFIG_FILE.write_text(
+                json.dumps({'ui_language': language}), encoding='utf-8')
+        return win_launcher.Window()
+
+    def test_the_menu_bar_is_in_the_chosen_language(self):
+        for language, title in (('en', 'Language'), ('zh_CN', '语言'), ('zh_TW', '語言')):
+            with self.subTest(language=language):
+                window = self._window(language)
+                titles = [action.text() for action in window.menuBar().actions()]
+                self.assertEqual(titles, [title])
+                for text in titles:
+                    self.assertIsNone(CYRILLIC.search(text))
+
+    def test_the_menu_holds_every_language_and_marks_the_chosen_one(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        window = self._window('zh_TW')
+        self.assertEqual(len(window.language_menu.actions()), len(win_launcher.UI_LANGUAGES))
+        chosen = [action.text() for action in window.language_menu.actions() if action.isChecked()]
+        self.assertEqual(chosen, ['繁體中文'])
+
+    def test_changing_the_language_builds_the_window_again(self):
+        window = self._window('en')
+        window.choose_language('zh_CN')
+        tabs = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+        self.assertEqual(tabs, ['游戏', '金手指', '设置', '操作设置', '日志'])
+        self.assertEqual([action.text() for action in window.menuBar().actions()], ['语言'])
 
 
 class GameLanguageTests(unittest.TestCase):

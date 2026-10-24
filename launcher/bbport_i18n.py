@@ -834,6 +834,8 @@ EN = {
     "Camera right": "Camera right",
     "Китайский (традиционный)": "Chinese (traditional)",
     "Корейский": "Korean",
+    "HDR": "HDR",
+    "Чит": "Cheat",
 }
 
 
@@ -1713,6 +1715,8 @@ PT_BR = {
     "XInput": "XInput",
     "Circle": "Circle",
     "Кнопка геймпада": "Gamepad button",
+    "HDR": "HDR",
+    "Чит": "Trapaça",
 }
 
 
@@ -2509,6 +2513,8 @@ ES = {
     "XInput": "XInput",
     "Circle": "Circle",
     "Кнопка геймпада": "Gamepad button",
+    "HDR": "HDR",
+    "Чит": "Truco",
 }
 
 
@@ -3305,6 +3311,8 @@ IT = {
     "XInput": "XInput",
     "Circle": "Circle",
     "Кнопка геймпада": "Gamepad button",
+    "HDR": "HDR",
+    "Чит": "Truffa",
 }
 
 
@@ -4101,6 +4109,8 @@ FR = {
     "XInput": "XInput",
     "Circle": "Circle",
     "Кнопка геймпада": "Gamepad button",
+    "HDR": "HDR",
+    "Чит": "Triche",
 }
 
 
@@ -4897,6 +4907,8 @@ DE = {
     "XInput": "XInput",
     "Circle": "Circle",
     "Кнопка геймпада": "Gamepad button",
+    "HDR": "HDR",
+    "Чит": "Cheat",
 }
 
 
@@ -5666,6 +5678,7 @@ ZH_CN = {
     "XInput": "XInput",
     "Circle": "Circle",
     "Кнопка геймпада": "手柄按键",
+    "HDR": "HDR",
 }
 
 
@@ -6297,6 +6310,7 @@ ZH_TW = {
     "XInput": "XInput",
     "Circle": "Circle",
     "Кнопка геймпада": "手柄按鍵",
+    "HDR": "HDR",
 }
 
 # Translations by language code; Russian is the key itself. Strings missing in a translation

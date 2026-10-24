@@ -35,6 +35,8 @@ MODULE = ROOT / "launcher" / "bbport_i18n.py"
 ENGLISH = {
     "English": "English",
     "Язык": "Language",
+    "HDR": "HDR",
+    "Чит": "Cheat",
     "Управление": "Controls",
     "Устройство ввода": "Input device",
     "Обновить список": "Refresh the list",
@@ -118,6 +120,7 @@ ADDITIONS = {
         "Чит": "金手指",
     },
     "pt_BR": {
+        "Чит": "Trapaça",
         "R3: управлять целью, L3: вернуться. Не вместе со свободной камерой":
             "R3: controlar o alvo, L3: voltar. Não junto com a câmera livre",
         "Rally не угасает": "Rally nunca desaparece",
@@ -150,6 +153,7 @@ ADDITIONS = {
         "Физика тел как в Dark Souls": "Física de corpos como em Dark Souls",
     },
     "es": {
+        "Чит": "Truco",
         "R3: управлять целью, L3: вернуться. Не вместе со свободной камерой":
             "R3: controlar el objetivo, L3: volver. No junto con la cámara libre",
         "Rally не угасает": "Rally nunca se desvanece",
@@ -182,6 +186,7 @@ ADDITIONS = {
         "Физика тел как в Dark Souls": "Física de cuerpos como en Dark Souls",
     },
     "it": {
+        "Чит": "Truffa",
         "R3: управлять целью, L3: вернуться. Не вместе со свободной камерой":
             "R3: controlla il bersaglio, L3: indietro. Non insieme alla camera libera",
         "Rally не угасает": "Rally non svanisce mai",
@@ -214,6 +219,7 @@ ADDITIONS = {
         "Физика тел как в Dark Souls": "Fisica dei corpi come in Dark Souls",
     },
     "fr": {
+        "Чит": "Triche",
         "R3: управлять целью, L3: вернуться. Не вместе со свободной камерой":
             "R3 : cibler l'ennemi, L3 : retour. Pas avec la caméra libre",
         "Rally не угасает": "Rally ne s'estompe jamais",
@@ -246,6 +252,7 @@ ADDITIONS = {
         "Физика тел как в Dark Souls": "Physique des corps comme dans Dark Souls",
     },
     "de": {
+        "Чит": "Cheat",
         "R3: управлять целью, L3: вернуться. Не вместе со свободной камерой":
             "R3: Ziel anvisieren, L3: zurück. Nicht zusammen mit der freien Kamera",
         "Rally не угасает": "Rally verblasst nie",
