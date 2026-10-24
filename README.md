@@ -1,4 +1,4 @@
-# MAXIBOOST ON for Linux (mbport)
+# MAXIBOOST ON for Windows (mbport)
 
 The PlayStation 4 version of *MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON* (2020, Bandai Namco
 Entertainment) running natively on Linux. The game's own x86-64 code runs directly on the CPU and
@@ -11,7 +11,7 @@ engine). The runtime, the GPU translation, the upscalers and the launcher come f
 points them at MAXIBOOST ON.
 
 > **No game files are included, and none will ever be.** You need your own dump of MAXIBOOST ON,
-> the North American release `CUSA18758`, with update 1.15, made from a copy you own. Don't ask for
+> the North American release `CUSA18758` and the HongKong release `CUSA15006`, with update 1.15, made from a copy you own. Don't ask for
 > game files, saves or keys, and don't share them: see [LEGAL.md](LEGAL.md). This project is not
 > affiliated with Bandai Namco Entertainment, SOTSU, SUNRISE or Sony Interactive Entertainment.
 > MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON © SOTSU · SUNRISE.
@@ -82,15 +82,22 @@ executable's library layout.
 
 ### 1. The game folder
 
-Dump the game (`CUSA18758`, version 1.00) and its 1.15 update from your PS4. The game's files are
+Dump the game (`CUSA18758` and `CUSA5006`, version 1.00) and its 1.15 update from your PS4. The game's files are
 at the folder's root: `eboot.bin`, `sce_sys/`, `sce_module/`, `archives/`, `raw/` (the movies and
 sound banks) and `sce_discmap.plt`. Then merge the update into the game. On one filesystem,
 hardlinks keep the 30 GB from being copied:
 
+for CUSA18758:
 ```bash
 cp -al CUSA18758 CUSA18758-full
 cp -al --remove-destination CUSA18758-patch/. CUSA18758-full/
 python3 scripts/game_check.py CUSA18758-full
+```
+for CUSA15006:
+```bash
+cp -al CUSA15006 CUSA15006-full
+cp -al --remove-destination CUSA15006-patch/. CUSA15006-full/
+python3 scripts/game_check.py CUSA15006-full
 ```
 
 ### 2. Build and run
@@ -168,7 +175,7 @@ verified yet.
 ### DLC
 
 The add-ons are unlock keys: their data is in the game and its update. Put their `.pkg` files
-(for example `UP0700-CUSA18758_00-GUNDAMVSMBDLC001`, Gundam Barbatos Lupus Rex) in a folder and
+(for example `UP0700-CUSA18758_00-GUNDAMVSMBDLC001` or `HP0700-CUSA15005_00-GUNDAMVSMBDLC001-A0000-V0100`, Gundam Barbatos Lupus Rex) in a folder and
 choose it as the launcher's DLC folder; the port reports them to the game as installed.
 Verified with Barbatos Lupus Rex, offline and online: it is in Machine Select (Iron-Blooded
 Orphans) and plays in Free Battle. The game checks an add-on's entitlement key against its own
