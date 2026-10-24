@@ -836,6 +836,7 @@ EN = {
     "Корейский": "Korean",
     "HDR": "HDR",
     "Чит": "Cheat",
+    "Память игры": "Game memory",
 }
 
 
@@ -1717,6 +1718,7 @@ PT_BR = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Trapaça",
+    "Память игры": "Game memory",
 }
 
 
@@ -2515,6 +2517,7 @@ ES = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Truco",
+    "Память игры": "Game memory",
 }
 
 
@@ -3313,6 +3316,7 @@ IT = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Truffa",
+    "Память игры": "Game memory",
 }
 
 
@@ -4111,6 +4115,7 @@ FR = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Triche",
+    "Память игры": "Game memory",
 }
 
 
@@ -4909,6 +4914,7 @@ DE = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Cheat",
+    "Память игры": "Game memory",
 }
 
 
@@ -5679,6 +5685,7 @@ ZH_CN = {
     "Circle": "Circle",
     "Кнопка геймпада": "手柄按键",
     "HDR": "HDR",
+    "Память игры": "游戏内存",
 }
 
 
@@ -6311,6 +6318,7 @@ ZH_TW = {
     "Circle": "Circle",
     "Кнопка геймпада": "手柄按鍵",
     "HDR": "HDR",
+    "Память игры": "遊戲記憶體",
 }
 
 # Translations by language code; Russian is the key itself. Strings missing in a translation

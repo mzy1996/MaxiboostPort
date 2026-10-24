@@ -112,6 +112,24 @@ UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("En
 # the parameter 1): 0 Japanese, 1 English, 9 Chinese (simplified), 10 Chinese
 # (traditional), 11 Korean. The game decides which of them it has: the North American
 # release is in English, the Hong Kong one in the traditional Chinese and the Korean.
+# The size of the game's memory pool, in megabytes. The pool is an address range the game
+# reserves, not memory it has to fill: a machine with little memory can take a smaller
+# one (the game's own is 5056 MiB).
+GAME_MEMORY = [
+    ("512 МБ (экономичный)", 512),
+    ("1024 МБ", 1024),
+    ("2048 МБ", 2048),
+    ("4096 МБ", 4096),
+    ("5056 МБ (как на PS4)", 5056),
+]
+# The output resolutions. All of them are 16:9, so the picture keeps its shape (the
+# window takes the 16:9 part of the display, the rest is black).
+OUTPUT_RESOLUTIONS = [
+    ("1280×720", "1280x720"),
+    ("1920×1080", "1920x1080"),
+    ("2560×1440", "2560x1440"),
+    ("3840×2160", "3840x2160"),
+]
 GAME_LANGUAGE_NAMES = {0: "日本語", 1: "English", 9: "简体中文", 10: "繁體中文", 11: "한국어"}
 GAME_LANGUAGES = [("Как в системе", ""), ("English", "1"), ("繁體中文", "10"), ("한국어", "11")]
 FPS_MODES = [("Как в системе", ""), ("30", "30"), ("60", "60"), ("120", "120")]
@@ -125,6 +143,8 @@ DEFAULTS = {
     "cheats_file": "",
     "language": "",
     "fullscreen": False,
+    "output_res": "1920x1080",
+    "game_memory": 5056,
     "hdr": False,
     "present_mode": "Mailbox",
     "gamepad": "",
@@ -218,6 +238,13 @@ def game_environment(s):
     env["BB_LANGUAGE"] = s["language"] or str(game_language(s))
     env["BB_MENU_LANGUAGE"] = language()
     env["BB_FULLSCREEN"] = "1" if s["fullscreen"] else "0"
+    if s.get("game_memory"):
+        # The pool the game reserves: a machine with little memory takes a smaller one.
+        env["BB_DMEM_MB"] = str(s["game_memory"])
+    if s.get("output_res"):
+        # The picture is drawn in this size; the window takes the 16:9 part of the display
+        # (the rest is black), so it is never stretched.
+        env["BB_OUTPUT_RES"] = str(s["output_res"])
     env["BB_PRESENT_MODE"] = s["present_mode"]
     if s.get("gamepad"):
         env["BB_GAMEPAD"] = s["gamepad"]
@@ -483,6 +510,22 @@ class Window(QMainWindow):
         self.select(self.fps, self.settings.get("fps_mode", "60"))
         self.fps.currentIndexChanged.connect(self.on_fps)
         form.addWidget(Row(tr("Частота кадров"), self.fps), row, 0)
+        row += 1
+
+        self.game_memory = QComboBox()
+        for label, value in GAME_MEMORY:
+            self.game_memory.addItem(label, value)
+        self.select(self.game_memory, self.settings.get("game_memory", 5056))
+        self.game_memory.currentIndexChanged.connect(self.on_game_memory)
+        form.addWidget(Row(tr("Память игры"), self.game_memory), row, 0)
+        row += 1
+
+        self.output_res = QComboBox()
+        for label, value in OUTPUT_RESOLUTIONS:
+            self.output_res.addItem(label, value)
+        self.select(self.output_res, self.settings.get("output_res", "1920x1080"))
+        self.output_res.currentIndexChanged.connect(self.on_output_res)
+        form.addWidget(Row(tr("Разрешение вывода"), self.output_res), row, 0)
         row += 1
 
         self.fps_limit = QSpinBox()
@@ -932,6 +975,14 @@ class Window(QMainWindow):
 
     def on_fps(self):
         self.settings["fps_mode"] = self.fps.currentData()
+        self.store()
+
+    def on_game_memory(self):
+        self.settings["game_memory"] = self.game_memory.currentData()
+        self.store()
+
+    def on_output_res(self):
+        self.settings["output_res"] = self.output_res.currentData()
         self.store()
 
     def on_fps_limit(self, value):

@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
@@ -168,7 +167,3 @@ void runtime_eventflag_report(void) {
     printf("Runtime: event flags created=%zu, blocking waits=%zu, timeouts=%zu\n",created,waits,timed_out);
     pthread_mutex_unlock(&lock);
 }
-#else
-uintptr_t runtime_eventflag_resolve(const char *name) { (void)name; return 0; }
-void runtime_eventflag_report(void) {}
-#endif

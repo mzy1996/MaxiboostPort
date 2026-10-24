@@ -15,6 +15,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <pthread.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -136,6 +137,17 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     fflush(NULL);
     _exit(20); /* no destructors: GPU, audio and guest threads are still running */
 }
+#ifdef _WIN32
+/* The game's entry and the stack it runs on (the host's main thread has a stack of one
+ * megabyte, which the game overflows while it starts). */
+typedef struct { void *entry; void *params; void *exit_fn; unsigned char *stack; } GuestMain;
+static void *guest_main_start(void *argument) {
+    const GuestMain *main_thread=(const GuestMain *)argument;
+    typedef void (ABI *Entry)(void *, void (ABI *)(void));
+    ((Entry)(main_thread->entry))(main_thread->params,main_thread->exit_fn);
+    return NULL;
+}
+#endif
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
 __asm__(BB_ASM_TEXT BB_ASM_GLOBAL("enter_on_stack") "enter_on_stack:\n"
@@ -248,6 +260,7 @@ void bb_fault_wait(const char *what) {
 }
 static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
     const DWORD code = exception->ExceptionRecord->ExceptionCode;
+
     if (code!=EXCEPTION_ACCESS_VIOLATION && code!=EXCEPTION_IN_PAGE_ERROR &&
         code!=EXCEPTION_ILLEGAL_INSTRUCTION && code!=EXCEPTION_INT_DIVIDE_BY_ZERO &&
         code!=EXCEPTION_PRIV_INSTRUCTION && code!=EXCEPTION_STACK_OVERFLOW) {
@@ -794,14 +807,24 @@ int main(int argc, char **argv) {
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
-#ifdef _WIN32
-    typedef void (ABI *Entry)(void *, void (ABI *)(void));
-    ((Entry)(image + entry))(&params, guest_exit);
-#else
     /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
     enum { MAIN_STACK=8*1024*1024 };
-    unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
+    unsigned char *stack=runtime_low_map(MAIN_STACK,BB_PROT_READ|BB_PROT_WRITE);
     if (!stack) fail("cannot allocate guest main stack");
+#ifdef _WIN32
+    /* The host's main thread has a stack of one megabyte, which the game overflows while it
+     * starts (its own initialization is deep). The game's entry therefore runs on a thread
+     * of its own with the same big stack as on the other platforms. */
+    GuestMain main_thread = { image + entry, &params, (void *)guest_exit, stack };
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstack(&attr, stack, MAIN_STACK);
+    pthread_t host_thread;
+    const int created=pthread_create(&host_thread,&attr,guest_main_start,&main_thread);
+    pthread_attr_destroy(&attr);
+    if (created) fail("cannot create the guest's main thread");
+    pthread_join(host_thread,NULL);
+#else
     /* 64 KiB above the entry's stack pointer stay mapped (zeros): a PS4's main thread starts below
      * the process's start-up data, and MAXIBOOST ON's main thread reads ~0x340 bytes above where
      * it was entered (guest+0x192b10, once signed in to PSN). */

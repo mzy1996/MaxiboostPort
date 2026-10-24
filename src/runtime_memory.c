@@ -23,14 +23,19 @@
 #else
 #include <windows.h>
 #endif
-/* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
- * patches above 1080p need about 4 GiB more; run.sh sets it). */
+/* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB sets it: the
+ * resolution patches above 1080p need about 4 GiB more (run.sh sets it), and a machine
+ * with little memory can ask for less (the launcher's "Game memory" setting does). The
+ * pool is an address range, not memory the game has to fill: on a machine with little
+ * memory a smaller pool means a smaller reservation. */
+#define DMEM_MIN_MB 512
+#define DMEM_MAX_MB 16384
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
         const char *env = getenv("BB_DMEM_MB");
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
-        if (mb < 5056 || mb > 16384) mb = 5056;
+        if (mb < DMEM_MIN_MB || mb > DMEM_MAX_MB) mb = 5056;
         size = mb * 1024 * 1024;
     }
     return size;
@@ -134,6 +139,7 @@ static uint64_t live_bytes, flexible_bytes;
 
 static int valid_alignment(uint64_t a) { return a >= PAGE && a <= POOL_SIZE && !(a & (a-1)); }
 static uint64_t align_up(uint64_t n, uint64_t a) { return (n+a-1) & ~(a-1); }
+static uint64_t align_down(uint64_t n, uint64_t a) { return n & ~(a-1); }
 static int host_prot(int prot) {
     /* GPU read/write bits (0x10/0x20) need host access for the future GPU backend. */
     return ((prot & 0x11) ? BB_PROT_READ : 0) | ((prot & 0x22) ? BB_PROT_WRITE|BB_PROT_READ : 0) | ((prot & 4) ? BB_PROT_EXEC|BB_PROT_READ : 0);
@@ -184,6 +190,12 @@ static void ensure_chunks(uint64_t phys, uint64_t size) {
 }
 /* mmap of direct or flexible memory at phys, split where it crosses chunks. */
 static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys) {
+#ifdef _WIN32
+    /* The ranges the game asks for are full of the host's own mappings (Windows): the
+     * host picks the address itself. The mapping is made where the host can make it. */
+    (void)address;
+    return platform_section_map(pool_fd,NULL,size,phys,prot);
+#else
     if (!chunk_fds || phys>=POOL_SIZE)
         return platform_section_map(pool_fd,(void *)address,size,phys,prot);
     ensure_chunks(phys,size);
@@ -205,12 +217,22 @@ static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys)
         done+=n;
         if (done==size) return (void *)address;
     }
+    uintptr_t mapped_at=0;
     for (uint64_t done=0;done<size;) {
         const uint64_t at=phys+done, c=at/CHUNK;
         const uint64_t room=c*CHUNK+chunk_size(c)-at, n=size-done<room ? size-done : room;
         void *p = chunk_fds[c]>=0
             ? platform_section_map(chunk_fds[c],(void *)(address+done),n,at-c*CHUNK,prot)
             : platform_section_map(pool_fd,(void *)(address+done),n,at,prot);
+#ifdef _WIN32
+        if (!p) {
+            /* The range the game asks for is full of the host's own mappings (Windows):
+             * the host picks the address itself. The whole range is mapped at once, so
+             * that it is one range. */
+            p=platform_section_map(pool_fd,NULL,size,at,prot);
+            if (p) done=size;
+        }
+#endif
         if (!p) {
             static int reported;
             if (reported++ < 4)
@@ -218,9 +240,13 @@ static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys)
                         at,n,chunk_fds[c]>=0 ? "a GPU-visible dma-buf chunk" : "the memfd",strerror(errno));
             return (void *)-1;
         }
+        if (!mapped_at) mapped_at=(uintptr_t)p;
         done+=n;
     }
-    return (void *)address;
+    /* The address the mapping has: the one that was asked for, or the one the host gave
+     * (Windows). */
+    return (void *)mapped_at;
+#endif
 }
 /* Returns released physical memory to zero: hole punching in the memfd, a clear in a chunk. */
 static void zero_phys(uint64_t phys, uint64_t size) {
@@ -341,8 +367,17 @@ static uintptr_t find_free_in(uintptr_t from, uintptr_t limit, uint64_t size, ui
  * USER_MIN stays the game's: GUNDAM VERSUS places its own blocks there with MAP_FIXED|NO_OVERWRITE
  * from 0x1000000000 up, and libc's first heap block or a flexible mapping there made them fail.
  * A hint inside the user range is searched from the hint, as before. */
+#ifdef _WIN32
+/* The host's own mappings fill everything below the user's range (Windows): the flexible
+ * memory goes above the user's range, where the host can still make room, and the
+ * game's own mappings keep the user's range. */
+#define SYSTEM_MIN UINT64_C(0x1000000000)
+#define LOW_MIN UINT64_C(0x4000000000)
+#define FLEXIBLE_MIN UINT64_C(0x4000000000)
+#else
 #define SYSTEM_MIN UINT64_C(0x0200000000)
 #define LOW_MIN UINT64_C(0x0800000000)
+#endif
 static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
     if (hint<USER_MIN) {
         const uintptr_t at=find_free_in(hint<SYSTEM_MIN ? SYSTEM_MIN : hint,LOW_MIN,size,alignment);
@@ -378,13 +413,31 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
             return NO_MEMORY;
         }
     } else {
+#ifdef _WIN32
+        if (kind==KIND_FLEXIBLE && address<FLEXIBLE_MIN) address=FLEXIBLE_MIN;
+#endif
         address=find_free(address,size,alignment);
-        if (!address) return NO_MEMORY;
+        if (!address) {
+#ifdef _WIN32
+            /* The ranges the game asks for are full of the host's own mappings (Windows):
+             * the host's choice of the address is used (the mapping is made where the
+             * host can make it). */
+            address=0;
+#else
+            return NO_MEMORY;
+#endif
+        }
     }
     void *mapped = kind!=KIND_RESERVED
         ? map_phys(address,size,host_prot(prot),phys)
         : platform_reserve_fixed((void *)address,size);
     if (!mapped) return NO_MEMORY;
+    if ((uintptr_t)mapped!=address) {
+        /* The host gave the address (Windows: the range the game asks for is full of the
+         * host's own mappings), so the range is the one it gave. */
+        address=align_down((uintptr_t)mapped,PAGE);
+        size=align_up((uintptr_t)mapped+size-address,PAGE);
+    }
     drop_range(address,address+size);
     trap_forget(address,address+size); /* a new mapping starts without traps */
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
