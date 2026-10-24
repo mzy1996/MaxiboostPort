@@ -4,6 +4,16 @@ The port runs the game's own x86-64 code on the CPU and translates its graphics 
 page describes the Windows build: what it is made of, how it is compiled, and what is still
 missing.
 
+## The game
+
+The dump of MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON with update 1.15 merged in. Both
+releases work: the North American one (`CUSA18758`) and the Hong Kong / Chinese deluxe
+soundtrack edition (`CUSA15006`, 豪華原聲版). The Hong Kong dump comes with or without the
+cheat trainer injected into the eboot; both are accepted (`scripts/game_check.py`).
+
+The files go to the folder's root (`eboot.bin`, `sce_sys/`, `sce_module/`, `archives/`,
+`raw/`), and the update is merged into that folder (the launcher asks for it).
+
 ## The toolchain: MinGW-w64, not MSVC
 
 The guest's code speaks the **SysV ABI** and the runtime uses **pthreads**. Both decide the
