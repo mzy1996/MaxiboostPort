@@ -514,7 +514,7 @@ class Window(QMainWindow):
 
         self.game_memory = QComboBox()
         for label, value in GAME_MEMORY:
-            self.game_memory.addItem(label, value)
+            self.game_memory.addItem(tr(label), value)
         self.select(self.game_memory, self.settings.get("game_memory", 5056))
         self.game_memory.currentIndexChanged.connect(self.on_game_memory)
         form.addWidget(Row(tr("Память игры"), self.game_memory), row, 0)
