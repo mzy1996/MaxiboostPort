@@ -38,3 +38,5 @@ runtime_sleep_stats
 runtime_thread_attach_host
 runtime_tsc_frequency
 runtime_wait_report
+bbgpu_input_devices
+bbgpu_input_buttons

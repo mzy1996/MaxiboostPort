@@ -68,6 +68,40 @@ class TranslationTests(unittest.TestCase):
                     self.assertEqual(len(fields(text)), len(fields(key)))
 
 
+class GameLanguageTests(unittest.TestCase):
+    """The game's own language: the release decides which languages it has."""
+
+    def test_the_release_decides_the_languages(self):
+        # The North American release is in English; the Hong Kong one has the traditional
+        # Chinese and the Korean.
+        self.assertEqual(bbport_i18n.RELEASE_LANGUAGES['CUSA18758'], (1,))
+        self.assertEqual(bbport_i18n.RELEASE_LANGUAGES['CUSA15006'], (10, 11))
+
+    def test_the_system_language_is_used_when_the_game_has_it(self):
+        for title, wanted, expected in (('CUSA18758', 1, 1), ('CUSA15006', 11, 11),
+                                        ('CUSA15006', 10, 10)):
+            with self.subTest(title=title, wanted=wanted):
+                self.assertEqual(bbport_i18n.game_language('', title, wanted), expected)
+
+    def test_a_language_the_game_does_not_have_is_not_used(self):
+        # The North American release is in English, whatever the system speaks.
+        for wanted in (0, 10, 11, 2):
+            with self.subTest(wanted=wanted):
+                self.assertEqual(bbport_i18n.game_language('', 'CUSA18758', wanted), 1)
+        # The Hong Kong one: a Chinese system gets the traditional Chinese, an English one
+        # the traditional Chinese as well (the game has no English).
+        self.assertEqual(bbport_i18n.game_language('', 'CUSA15006', 1), 10)
+        self.assertEqual(bbport_i18n.game_language('', 'CUSA15006', 9), 10)
+
+    def test_the_chosen_language_is_used_as_it_is(self):
+        self.assertEqual(bbport_i18n.game_language('11', 'CUSA18758', 1), 11)
+        self.assertEqual(bbport_i18n.game_language('1', 'CUSA15006', 10), 1)
+
+    def test_an_unknown_release_keeps_the_system_language(self):
+        self.assertEqual(bbport_i18n.game_language('', '', 10), 10)
+        self.assertEqual(bbport_i18n.game_language('', 'CUSA99999', 11), 11)
+
+
 class FallbackTests(unittest.TestCase):
     """A text a language does not have must not show up as the Russian key: the window
     would look like a mixture of two languages."""

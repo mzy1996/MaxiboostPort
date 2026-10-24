@@ -803,6 +803,37 @@ EN = {
     "Эксперимент, только видеокарты AMD. Видеокарта работает с памятью игры напрямую, как в игре для ПК, а команды графики переводятся, а не эмулируются; возможны ошибки. Выключено — старая модель памяти, как в 0.3, со всеми исправлениями": "Experimental, AMD graphics cards only. The card works with the game's memory directly, as in a PC game, and the graphics commands are translated rather than emulated; errors are possible. Off — the old memory model, as in 0.3, with all the fixes",
     "Старая": "Old",
     "Файлы читов (*.json);;Все файлы (*)": "Cheat files (*.json);;All files (*)",
+    "Язык": "Language",
+    "Устройство ввода": "Input device",
+    "Устройство не выбрано": "No device chosen",
+    "Действие": "Action",
+    "Клавиша": "Key",
+    "Кнопка геймпада": "Gamepad button",
+    "Настроить автоматически": "Set automatically",
+    "XInput": "XInput",
+    "DirectInput": "DirectInput",
+    "Геймпад через {}: {}": "Gamepad through {}: {}",
+    "Cross": "Cross",
+    "Circle": "Circle",
+    "Square": "Square",
+    "Triangle": "Triangle",
+    "Options": "Options",
+    "Touchpad (left half)": "Touchpad (left half)",
+    "Touchpad (right half)": "Touchpad (right half)",
+    "D-pad up": "D-pad up",
+    "D-pad down": "D-pad down",
+    "D-pad left": "D-pad left",
+    "D-pad right": "D-pad right",
+    "Move forward": "Move forward",
+    "Move back": "Move back",
+    "Move left": "Move left",
+    "Move right": "Move right",
+    "Camera up": "Camera up",
+    "Camera down": "Camera down",
+    "Camera left": "Camera left",
+    "Camera right": "Camera right",
+    "Китайский (традиционный)": "Chinese (traditional)",
+    "Корейский": "Korean",
 }
 
 
@@ -1651,6 +1682,37 @@ PT_BR = {
     "Нужны видеокарта NVIDIA RTX и проприетарный драйвер; иначе используется встроенная": "Precisa de uma placa NVIDIA RTX e do driver proprietário; senão usa a integrada",
     "Старая": "Old",
     "Файлы читов (*.json);;Все файлы (*)": "Cheat files (*.json);;All files (*)",
+    "Move right": "Move right",
+    "Touchpad (right half)": "Touchpad (right half)",
+    "Язык": "Language",
+    "Move left": "Move left",
+    "D-pad up": "D-pad up",
+    "Настроить автоматически": "Set automatically",
+    "D-pad left": "D-pad left",
+    "Геймпад через {}: {}": "Gamepad through {}: {}",
+    "Корейский": "Korean",
+    "Клавиша": "Key",
+    "Действие": "Action",
+    "DirectInput": "DirectInput",
+    "Triangle": "Triangle",
+    "Camera left": "Camera left",
+    "Устройство не выбрано": "No device chosen",
+    "Touchpad (left half)": "Touchpad (left half)",
+    "D-pad down": "D-pad down",
+    "Китайский (традиционный)": "Chinese (traditional)",
+    "Cross": "Cross",
+    "D-pad right": "D-pad right",
+    "Options": "Options",
+    "Camera up": "Camera up",
+    "Camera right": "Camera right",
+    "Move forward": "Move forward",
+    "Square": "Square",
+    "Camera down": "Camera down",
+    "Move back": "Move back",
+    "Устройство ввода": "Input device",
+    "XInput": "XInput",
+    "Circle": "Circle",
+    "Кнопка геймпада": "Gamepad button",
 }
 
 
@@ -2416,6 +2478,37 @@ ES = {
     "Relaxed (по умолчанию)": "Relaxed (default)",
     "Старая": "Old",
     "Файлы читов (*.json);;Все файлы (*)": "Cheat files (*.json);;All files (*)",
+    "Move right": "Move right",
+    "Touchpad (right half)": "Touchpad (right half)",
+    "Язык": "Language",
+    "Move left": "Move left",
+    "D-pad up": "D-pad up",
+    "Настроить автоматически": "Set automatically",
+    "D-pad left": "D-pad left",
+    "Геймпад через {}: {}": "Gamepad through {}: {}",
+    "Корейский": "Korean",
+    "Клавиша": "Key",
+    "Действие": "Action",
+    "DirectInput": "DirectInput",
+    "Triangle": "Triangle",
+    "Camera left": "Camera left",
+    "Устройство не выбрано": "No device chosen",
+    "Touchpad (left half)": "Touchpad (left half)",
+    "D-pad down": "D-pad down",
+    "Китайский (традиционный)": "Chinese (traditional)",
+    "Cross": "Cross",
+    "D-pad right": "D-pad right",
+    "Options": "Options",
+    "Camera up": "Camera up",
+    "Camera right": "Camera right",
+    "Move forward": "Move forward",
+    "Square": "Square",
+    "Camera down": "Camera down",
+    "Move back": "Move back",
+    "Устройство ввода": "Input device",
+    "XInput": "XInput",
+    "Circle": "Circle",
+    "Кнопка геймпада": "Gamepad button",
 }
 
 
@@ -3181,6 +3274,37 @@ IT = {
     "Relaxed (по умолчанию)": "Relaxed (default)",
     "Старая": "Old",
     "Файлы читов (*.json);;Все файлы (*)": "Cheat files (*.json);;All files (*)",
+    "Move right": "Move right",
+    "Touchpad (right half)": "Touchpad (right half)",
+    "Язык": "Language",
+    "Move left": "Move left",
+    "D-pad up": "D-pad up",
+    "Настроить автоматически": "Set automatically",
+    "D-pad left": "D-pad left",
+    "Геймпад через {}: {}": "Gamepad through {}: {}",
+    "Корейский": "Korean",
+    "Клавиша": "Key",
+    "Действие": "Action",
+    "DirectInput": "DirectInput",
+    "Triangle": "Triangle",
+    "Camera left": "Camera left",
+    "Устройство не выбрано": "No device chosen",
+    "Touchpad (left half)": "Touchpad (left half)",
+    "D-pad down": "D-pad down",
+    "Китайский (традиционный)": "Chinese (traditional)",
+    "Cross": "Cross",
+    "D-pad right": "D-pad right",
+    "Options": "Options",
+    "Camera up": "Camera up",
+    "Camera right": "Camera right",
+    "Move forward": "Move forward",
+    "Square": "Square",
+    "Camera down": "Camera down",
+    "Move back": "Move back",
+    "Устройство ввода": "Input device",
+    "XInput": "XInput",
+    "Circle": "Circle",
+    "Кнопка геймпада": "Gamepad button",
 }
 
 
@@ -3946,6 +4070,37 @@ FR = {
     "Relaxed (по умолчанию)": "Relaxed (default)",
     "Старая": "Old",
     "Файлы читов (*.json);;Все файлы (*)": "Cheat files (*.json);;All files (*)",
+    "Move right": "Move right",
+    "Touchpad (right half)": "Touchpad (right half)",
+    "Язык": "Language",
+    "Move left": "Move left",
+    "D-pad up": "D-pad up",
+    "Настроить автоматически": "Set automatically",
+    "D-pad left": "D-pad left",
+    "Геймпад через {}: {}": "Gamepad through {}: {}",
+    "Корейский": "Korean",
+    "Клавиша": "Key",
+    "Действие": "Action",
+    "DirectInput": "DirectInput",
+    "Triangle": "Triangle",
+    "Camera left": "Camera left",
+    "Устройство не выбрано": "No device chosen",
+    "Touchpad (left half)": "Touchpad (left half)",
+    "D-pad down": "D-pad down",
+    "Китайский (традиционный)": "Chinese (traditional)",
+    "Cross": "Cross",
+    "D-pad right": "D-pad right",
+    "Options": "Options",
+    "Camera up": "Camera up",
+    "Camera right": "Camera right",
+    "Move forward": "Move forward",
+    "Square": "Square",
+    "Camera down": "Camera down",
+    "Move back": "Move back",
+    "Устройство ввода": "Input device",
+    "XInput": "XInput",
+    "Circle": "Circle",
+    "Кнопка геймпада": "Gamepad button",
 }
 
 
@@ -4711,6 +4866,37 @@ DE = {
     "Relaxed (по умолчанию)": "Relaxed (default)",
     "Старая": "Old",
     "Файлы читов (*.json);;Все файлы (*)": "Cheat files (*.json);;All files (*)",
+    "Move right": "Move right",
+    "Touchpad (right half)": "Touchpad (right half)",
+    "Язык": "Language",
+    "Move left": "Move left",
+    "D-pad up": "D-pad up",
+    "Настроить автоматически": "Set automatically",
+    "D-pad left": "D-pad left",
+    "Геймпад через {}: {}": "Gamepad through {}: {}",
+    "Корейский": "Korean",
+    "Клавиша": "Key",
+    "Действие": "Action",
+    "DirectInput": "DirectInput",
+    "Triangle": "Triangle",
+    "Camera left": "Camera left",
+    "Устройство не выбрано": "No device chosen",
+    "Touchpad (left half)": "Touchpad (left half)",
+    "D-pad down": "D-pad down",
+    "Китайский (традиционный)": "Chinese (traditional)",
+    "Cross": "Cross",
+    "D-pad right": "D-pad right",
+    "Options": "Options",
+    "Camera up": "Camera up",
+    "Camera right": "Camera right",
+    "Move forward": "Move forward",
+    "Square": "Square",
+    "Camera down": "Camera down",
+    "Move back": "Move back",
+    "Устройство ввода": "Input device",
+    "XInput": "XInput",
+    "Circle": "Circle",
+    "Кнопка геймпада": "Gamepad button",
 }
 
 
@@ -5449,6 +5635,37 @@ ZH_CN = {
     "Старая": "旧",
     "Файлы читов (*.json);;Все файлы (*)": "金手指文件 (*.json);;所有文件 (*)",
     "Чит": "金手指",
+    "Move right": "Move right",
+    "Touchpad (right half)": "Touchpad (right half)",
+    "Язык": "语言",
+    "Move left": "Move left",
+    "D-pad up": "D-pad up",
+    "Настроить автоматически": "自动配置",
+    "D-pad left": "D-pad left",
+    "Геймпад через {}: {}": "Gamepad through {}: {}",
+    "Корейский": "韩语",
+    "Клавиша": "键位",
+    "Действие": "动作",
+    "DirectInput": "DirectInput",
+    "Triangle": "Triangle",
+    "Camera left": "Camera left",
+    "Устройство не выбрано": "未选择设备",
+    "Touchpad (left half)": "Touchpad (left half)",
+    "D-pad down": "D-pad down",
+    "Китайский (традиционный)": "繁體中文",
+    "Cross": "Cross",
+    "D-pad right": "D-pad right",
+    "Options": "Options",
+    "Camera up": "Camera up",
+    "Camera right": "Camera right",
+    "Move forward": "Move forward",
+    "Square": "Square",
+    "Camera down": "Camera down",
+    "Move back": "Move back",
+    "Устройство ввода": "输入设备",
+    "XInput": "XInput",
+    "Circle": "Circle",
+    "Кнопка геймпада": "手柄按键",
 }
 
 
@@ -6049,6 +6266,37 @@ ZH_TW = {
     "Старая": "舊",
     "Файлы читов (*.json);;Все файлы (*)": "金手指檔案 (*.json);;所有檔案 (*)",
     "Чит": "金手指",
+    "Move right": "Move right",
+    "Touchpad (right half)": "Touchpad (right half)",
+    "Язык": "語言",
+    "Move left": "Move left",
+    "D-pad up": "D-pad up",
+    "Настроить автоматически": "自動配置",
+    "D-pad left": "D-pad left",
+    "Геймпад через {}: {}": "Gamepad through {}: {}",
+    "Корейский": "韓語",
+    "Клавиша": "鍵位",
+    "Действие": "動作",
+    "DirectInput": "DirectInput",
+    "Triangle": "Triangle",
+    "Camera left": "Camera left",
+    "Устройство не выбрано": "未選擇裝置",
+    "Touchpad (left half)": "Touchpad (left half)",
+    "D-pad down": "D-pad down",
+    "Китайский (традиционный)": "繁體中文",
+    "Cross": "Cross",
+    "D-pad right": "D-pad right",
+    "Options": "Options",
+    "Camera up": "Camera up",
+    "Camera right": "Camera right",
+    "Move forward": "Move forward",
+    "Square": "Square",
+    "Camera down": "Camera down",
+    "Move back": "Move back",
+    "Устройство ввода": "輸入裝置",
+    "XInput": "XInput",
+    "Circle": "Circle",
+    "Кнопка геймпада": "手柄按鍵",
 }
 
 # Translations by language code; Russian is the key itself. Strings missing in a translation
@@ -6111,11 +6359,46 @@ def system_language(env=os.environ, prefer_env=False):
 
 # The PS4 system language (sceSystemServiceParamGetInt) the game picks its text and voices by,
 # for the languages the game has; anything else gets English.
-GAME_LANGUAGES = {"ja": 0, "en": 1, "fr": 2, "es": 3, "de": 4, "it": 5, "ru": 8}
+GAME_LANGUAGES = {"ja": 0, "en": 1, "fr": 2, "es": 3, "de": 4, "it": 5, "ru": 8,
+                  "zh": 9, "ko": 11}
 
 
 def system_game_language(env=os.environ, prefer_env=False):
     return GAME_LANGUAGES.get(system_locale(env, prefer_env)[:2], 1)
+
+
+# The languages each release of the game has, as the PS4's language ids. The North
+# American one (CUSA18758) is in English; the Hong Kong / Chinese deluxe soundtrack
+# edition (CUSA15006) has the traditional Chinese and the Korean.
+RELEASE_LANGUAGES = {
+    "CUSA18758": (1,),
+    "CUSA15006": (10, 11),
+}
+
+
+def game_language(chosen, title, wanted=None):
+    """The PS4 language id the game runs in.
+
+    The chosen one when there is one; otherwise the system's, but only when the game has
+    that language: the North American release is in English, the Hong Kong one in the
+    traditional Chinese and the Korean (a Chinese system that plays the Hong Kong
+    release gets the traditional Chinese)."""
+    if chosen:
+        return int(chosen)
+    if wanted is None:
+        wanted = system_game_language()
+    allowed = RELEASE_LANGUAGES.get(title)
+    if not allowed:
+        return wanted
+    if wanted in allowed:
+        return wanted
+    # The system speaks a language the game does not have: the game's own is used.
+    if title == "CUSA15006":
+        # The Hong Kong release: the traditional Chinese, then the Korean.
+        for candidate in (10, 11):
+            if candidate in allowed:
+                return candidate
+    return allowed[0]
 
 
 _language = "ru"

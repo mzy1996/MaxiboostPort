@@ -72,6 +72,7 @@ sys.path.insert(0, str(PORT_DIR / "launcher"))
 sys.path.insert(0, str(PORT_DIR / "scripts"))
 
 from bbport_i18n import language, set_language, system_game_language, tr  # noqa: E402
+from bbport_i18n import game_language as i18n_game_language  # noqa: E402
 
 import game_check  # noqa: E402
 import cheats  # noqa: E402
@@ -107,8 +108,12 @@ def choice_label(label, value):
 UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("English", "en"), ("Português (Brasil)", "pt_BR"),
                 ("Español", "es"), ("Italiano", "it"), ("Français", "fr"), ("Deutsch", "de"),
                 ("简体中文", "zh_CN"), ("繁體中文", "zh_TW")]
-# The game's own language (the two the game has).
-GAME_LANGUAGES = [("Как в системе", ""), ("English", "1"), ("日本語", "2")]
+# The game's own language, as the PS4's language ids (sceSystemServiceParamGetInt with
+# the parameter 1): 0 Japanese, 1 English, 9 Chinese (simplified), 10 Chinese
+# (traditional), 11 Korean. The game decides which of them it has: the North American
+# release is in English, the Hong Kong one in the traditional Chinese and the Korean.
+GAME_LANGUAGE_NAMES = {0: "日本語", 1: "English", 9: "简体中文", 10: "繁體中文", 11: "한국어"}
+GAME_LANGUAGES = [("Как в системе", ""), ("English", "1"), ("繁體中文", "10"), ("한국어", "11")]
 FPS_MODES = [("Как в системе", ""), ("30", "30"), ("60", "60"), ("120", "120")]
 
 DEFAULTS = {
@@ -154,6 +159,12 @@ def load_settings():
 def save_settings(settings):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def game_language(settings):
+    """The PS4 language id the game runs in (the common rule, in bbport_i18n)."""
+    title = game_check.game_title(settings.get("game_dir", ""))
+    return i18n_game_language(settings.get("language", ""), title)
 
 
 def default_game_dir():
@@ -203,7 +214,8 @@ def game_environment(s):
     if s.get("cheats_file"):
         env["BB_CHEATS"] = str(Path(s["cheats_file"]).expanduser())
         env["BB_CHEATS_CONFIG"] = str(CHEATS_CONFIG)
-    env["BB_LANGUAGE"] = s["language"] or str(system_game_language())
+    # The game's own language: the chosen one, or the system's, when the game has it.
+    env["BB_LANGUAGE"] = s["language"] or str(game_language(s))
     env["BB_MENU_LANGUAGE"] = language()
     env["BB_FULLSCREEN"] = "1" if s["fullscreen"] else "0"
     env["BB_PRESENT_MODE"] = s["present_mode"]
@@ -450,9 +462,7 @@ class Window(QMainWindow):
         row += 1
 
         self.game_language = QComboBox()
-        for label, value in GAME_LANGUAGES:
-            self.game_language.addItem(choice_label(label, value), value)
-        self.select(self.game_language, self.settings.get("language", ""))
+        self.fill_game_languages()
         self.game_language.currentIndexChanged.connect(self.on_game_language)
         form.addWidget(Row(tr("Язык игры"), self.game_language), row, 0)
         row += 1
@@ -578,6 +588,8 @@ class Window(QMainWindow):
             self.game_dir.setText(folder)
             self.store()
             self.update_game_status()
+            # The game in that folder decides the languages it has.
+            self.fill_game_languages()
 
     def on_choose_dlc(self):
         folder = QFileDialog.getExistingDirectory(self, tr("Папка DLC"), self.settings.get("dlc_dir", ""))
@@ -682,6 +694,24 @@ class Window(QMainWindow):
         self.settings["ui_language"] = self.ui_language.currentData()
         self.store()
         self.apply_language()
+
+    def fill_game_languages(self):
+        """The languages the game has, which depend on the release.
+
+        The North American one (CUSA18758) is in English; the Hong Kong / Chinese deluxe
+        soundtrack edition (CUSA15006) has the traditional Chinese and the Korean. The
+        list holds the languages of the game in the folder that is chosen; when the folder
+        is not known yet, all of them are there."""
+        title = game_check.game_title(self.settings.get("game_dir", ""))
+        allowed = game_check.GAME_LANGUAGES.get(title)
+        self.game_language.blockSignals(True)
+        self.game_language.clear()
+        for label, value in GAME_LANGUAGES:
+            if allowed is not None and value and int(value) not in allowed:
+                continue
+            self.game_language.addItem(choice_label(label, value), value)
+        self.select(self.game_language, self.settings.get("language", ""))
+        self.game_language.blockSignals(False)
 
     def on_game_language(self):
         self.settings["language"] = self.game_language.currentData()

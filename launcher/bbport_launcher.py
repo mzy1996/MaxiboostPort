@@ -28,6 +28,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from bbport_assets import fsr411_problem
 from bbport_i18n import language, set_language, system_game_language, tr
+from bbport_i18n import game_language as i18n_game_language
 import bbport_cache
 import bbport_defaults
 import bbport_steam
@@ -134,10 +135,17 @@ PRESENT_MODES = [("Mailbox", "Mailbox"), ("FIFO (VSync)", "Fifo"),
 # choice labels stay short, so the selected one is shown in full.
 DRAW_PIPE = [("Авто", "", "Включён при 8 и более потоках процессора"), ("Включён", "1"),
              ("Выключен", "0", "Стабильнее, но медленнее")]
-# The game's language: the PS4 system language ("": from the desktop's locale). The North American
-# release (CUSA18758) is played in English; which other text languages its archives hold is not
-# checked yet, so only English is offered by name.
-LANGUAGES = [("Как в системе", ""), ("Английский", "1")]
+# The game's language: the PS4 system language ("": from the desktop's locale). The
+# languages are the PS4's ids (sceSystemServiceParamGetInt with the parameter 1):
+# 0 Japanese, 1 English, 9 Chinese (simplified), 10 Chinese (traditional), 11 Korean.
+# The release decides which of them the game has: the North American one (CUSA18758) is in
+# English, the Hong Kong / Chinese deluxe soundtrack edition (CUSA15006) has the traditional
+# Chinese and the Korean.
+LANGUAGES = [("Как в системе", ""), ("Английский", "1"), ("Китайский (традиционный)", "10"),
+             ("Корейский", "11")]
+# The languages each release has (scripts/game_check.py GAME_LANGUAGES). The list in the
+# launcher holds the ones of the game in the folder that is chosen.
+GAME_LANGUAGE_NAMES = {0: "日本語", 1: "English", 9: "简体中文", 10: "繁體中文", 11: "한국어"}
 LIVE_RESOLUTION = [("Авто (по видеокарте)", "auto"), ("Выключена (быстрее)", "0"), ("Включена", "1")]
 # "" leaves it to run.sh: precise (MAXIBOOST ON's beams and explosions, like GUNDAM VERSUS', are drawn
 # from GPU-written data).
@@ -390,7 +398,9 @@ def game_environment(s):
     if s.get("cheats_file"):
         env["BB_CHEATS"] = str(Path(s["cheats_file"]).expanduser())
         env["BB_CHEATS_CONFIG"] = str(DATA_DIR / "cheats.json")
-    env["BB_LANGUAGE"] = s["language"] or str(system_game_language())
+    # The game's own language: the chosen one, or the system's, when the game has it.
+    env["BB_LANGUAGE"] = str(i18n_game_language(s.get("language", ""),
+                                              game_check.game_title(s.get("game_dir", ""))))
     # The in-game menu speaks the launcher's language until one is chosen in it (menu_language).
     env["BB_MENU_LANGUAGE"] = language()
     env["BB_FULLSCREEN"] = "1" if s["fullscreen"] else "0"
@@ -487,6 +497,19 @@ def open_folder(window, path):
     except OSError:
         return
     Gtk.FileLauncher.new(Gio.File.new_for_path(str(path))).launch(window, None, None)
+
+
+def game_languages(game_dir):
+    """The languages the game in the folder has, as the launcher's list.
+
+    The North American release is in English, the Hong Kong one in the traditional
+    Chinese and the Korean; when the folder is not known yet, all of them are there."""
+    title = game_check.game_title(game_dir)
+    allowed = game_check.GAME_LANGUAGES.get(title)
+    if not allowed:
+        return LANGUAGES
+    return [choice for choice in LANGUAGES
+            if not choice[1] or int(choice[1]) in allowed]
 
 
 def combo_row(title, subtitle, choices, current):
@@ -803,7 +826,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.dlc_reset = flat_button("edit-undo-symbolic", tr("Не использовать DLC"), self.on_reset_dlc)
         self.dlc_row.add_suffix(self.dlc_reset)
         game.add(self.dlc_row)
-        self.language_row = combo_row(tr("Язык системы"), None, LANGUAGES, self.settings["language"])
+        self.language_row = combo_row(tr("Язык игры"), None,
+                                      game_languages(self.settings["game_dir"]), self.settings["language"])
         game.add(self.language_row)
         steam = Adw.ActionRow(title=tr("Добавить в Steam"),
                               subtitle=tr("Игра в библиотеке Steam запускается сразу, с настройками "
@@ -1451,7 +1475,21 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.update_game_status()
             self.update_dlc_status()
             self.store()
+            self.fill_game_languages()
         self.choose_folder(tr("Папка игры (с eboot.bin)"), self.game_dir(), chosen)
+
+    def fill_game_languages(self):
+        """The language row holds the languages of the game in the folder that is chosen."""
+        if not hasattr(self, "language_row"):
+            return
+        choices = game_languages(self.settings["game_dir"])
+        self.language_row.set_model(Gtk.StringList.new([tr(choice[0]) for choice in choices]))
+        self.language_row.values = [choice[1] for choice in choices]
+        current = self.settings["language"]
+        if current in self.language_row.values:
+            self.language_row.set_selected(self.language_row.values.index(current))
+        else:
+            self.language_row.set_selected(0)
 
     def show_control(self, kind, name):
         row, default = self.control_rows[(kind, name)]

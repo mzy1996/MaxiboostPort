@@ -117,12 +117,42 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
+    /* The picture is 16:9 and must not be stretched or squashed. A window of another shape
+     * would stretch it, so the window is made 16:9: the size is fitted to the picture's
+     * ratio, and the fullscreen takes the display's 16:9 part (the rest is black). */
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
-    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
+    const bool want_fullscreen = fullscreen && fullscreen[0] == '1';
+    if (want_fullscreen) {
+        SDL_Rect area{};
+        if (SDL_GetDisplayUsableBounds(display, &area) && area.w > 0 && area.h > 0) {
+            /* The 16:9 part of the display: the width is the whole of it when the display
+             * is wider than 16:9, else the height is the whole of it. */
+            int w = area.w;
+            int h = w * 9 / 16;
+            if (h > area.h) {
+                h = area.h;
+                w = h * 16 / 9;
+            }
+            SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, area.x + (area.w - w) / 2);
+            SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, area.y + (area.h - h) / 2);
+            SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
+            SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
+        }
+    }
+    /* The window is not a fullscreen one: the 16:9 part of the display is taken, and the
+     * rest stays black (SDL's borderless window). A real fullscreen would be the whole
+     * display, and the picture would be stretched to it. */
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, false);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN, want_fullscreen);
     base_title = title;
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+    if (want_fullscreen) {
+        /* The window is placed over the display's 16:9 part; it stays there when the
+         * display's shape changes. */
+        SDL_SetWindowFullscreenMode(window, nullptr);
+    }
 
     const char* driver = SDL_GetCurrentVideoDriver();
     const SDL_PropertiesID wp = SDL_GetWindowProperties(window);
@@ -309,6 +339,17 @@ bool WindowSDL::PollEvents() {
         case SDL_EVENT_WINDOW_RESIZED: {
             int w = 0, h = 0;
             SDL_GetWindowSizeInPixels(window, &w, &h);
+            /* The picture is 16:9: a window of another shape would stretch it. The
+             * window keeps the shape it has, and the picture is drawn in its 16:9 part
+             * (the rest is black) - the renderer reads the size from here. */
+            if (w > 0 && h > 0 && w * 9 != h * 16) {
+                const int by_height = h * 16 / 9;
+                if (by_height <= w) {
+                    w = by_height;
+                } else {
+                    h = w * 9 / 16;
+                }
+            }
             width = w;
             height = h;
             break;

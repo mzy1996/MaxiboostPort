@@ -507,6 +507,22 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
+    /* The launcher's controls page: the input devices that are there, and the buttons of
+     * one of them. The GPU library reads the pads, so it is asked. */
+    if (argc >= 2 && !strcmp(argv[1], "--input-devices")) {
+        char buffer[64*512];
+        const int length=bbgpu_input_devices(buffer,sizeof buffer);
+        if (length<0) return 1;
+        fwrite(buffer,1,(size_t)length,stdout);
+        return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--input-buttons")) {
+        char buffer[4096];
+        const int length=bbgpu_input_buttons(argv[2],buffer,sizeof buffer);
+        if (length<0) return 1;
+        fwrite(buffer,1,(size_t)length,stdout);
+        return 0;
+    }
     check_cpu();
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;

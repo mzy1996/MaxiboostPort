@@ -63,6 +63,27 @@ def missing_files(game):
     return [name for name in REQUIRED_FILES if not (root / name).exists()]
 
 
+def game_title(game):
+    """The title id of the game in the folder ("CUSA18758", "CUSA15006"), or "" when it
+    cannot be read."""
+    from prepare import sfo
+    try:
+        info = sfo((Path(game) / 'sce_sys/param.sfo').read_bytes())
+    except (OSError, ValueError, IndexError):
+        return ""
+    return info.get('TITLE_ID', '')
+
+
+# The languages the game has, by release. The North American one (CUSA18758) is in English
+# only; the Hong Kong / Chinese deluxe soundtrack edition (CUSA15006) has the traditional
+# Chinese and the Korean. These are the PS4's language ids (sceSystemServiceParamGetInt
+# with the parameter 1).
+GAME_LANGUAGES = {
+    'CUSA18758': (1,),
+    'CUSA15006': (10, 11),
+}
+
+
 def problem(game, image_hash=None):
     """None for the supported game, else (kind, title, version): kind is 'missing_update' (the
     base game), 'wrong_eboot' (param.sfo says 1.15, eboot.bin is another version), 'other_title',

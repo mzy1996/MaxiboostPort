@@ -44,6 +44,23 @@ void bbgpu_mouse_look_enable(int enabled);
 void bbgpu_patch_image(unsigned char *image, uint64_t size);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
+
+/* The input devices the launcher shows (the controls page): the connected gamepads and the
+ * keyboard. The launcher asks before the game starts, so the list is built here (the SDL
+ * that reads the pads is here too).
+ *
+ * A device is written into the buffer as a line:
+ *   <kind>\t<guid>\t<name>\t<architecture>
+ * kind: "pad" or "keyboard"; architecture: "xinput", "directinput" or "" (a keyboard has
+ * none). The buffer is filled with the lines and its length is returned; the caller
+ * gives a buffer of 64 lines of 512 bytes. */
+int bbgpu_input_devices(char *buffer, int size);
+/* The buttons a gamepad has, as the names the runtime's configuration uses (SDL's:
+ * "a", "b", "x", "y", "back", "start", "leftstick", "rightstick", "leftshoulder",
+ * "rightshoulder", "dpup", "dpdown", "dpleft", "dpright", "touchpad", "misc1",
+ * "paddle1" ... "paddle4", "lefttrigger", "righttrigger"), comma-separated, in the
+ * buffer. Returns the length written, or 0 when the device has no gamepad buttons. */
+int bbgpu_input_buttons(const char *guid, char *buffer, int size);
 #ifdef __cplusplus
 }
 #endif
