@@ -15,12 +15,12 @@
 #include <mutex>
 #include <unordered_set>
 #include <sys/mman.h>
-#include <ucontext.h>
 #include <map>
 #include <tuple>
 #include <string>
 #include <cstdio>
 #include <fmt/format.h>
+#include "host_services.h"
 #include "bbport_guest_memory.h"
 #include "bbport_sections.h"
 #include "bbport_toggles.h"
@@ -1421,8 +1421,8 @@ bool LayerTrapHandler(void* context, void* fault_address) {
         if (!layer_trap_armed.erase(block)) {
             return false;
         }
-        const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
-        layer_trap_hits.emplace_back(block, u64(g[REG_RIP]));
+        const uint64_t rip = ContextRip(context);
+        layer_trap_hits.emplace_back(block, rip);
     }
     LayerUnprotect(block); // the write runs again, now through
     layer_trap_faults.fetch_add(1, std::memory_order_relaxed);

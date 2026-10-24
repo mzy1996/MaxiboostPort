@@ -1,9 +1,12 @@
 <?xml version="1.0"?>
-<!-- mbport's built-in patches for MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) 1.15, in
-     the shadPS4/GoldHEN format. Addresses are PS4 virtual addresses (eboot base 0x400000). -->
+<!-- mbport's built-in patches for MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON 1.15 (the North
+     American CUSA18758 and the Hong Kong / Chinese deluxe soundtrack edition CUSA15006), in the
+     shadPS4/GoldHEN format. Addresses are PS4 virtual addresses (eboot base 0x400000). Both
+     releases share the same code at these addresses, so one patch serves both. -->
 <Patch>
     <TitleID>
         <ID>CUSA18758</ID>
+        <ID>CUSA15006</ID>
     </TitleID>
     <!-- An installed add-on is owned. The game takes an add-on (Barbatos Lupus Rex,
          GUNDAMVSMBDLC001) as owned when the entitlement key sceAppContentGetEntitlementKey gives

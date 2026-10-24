@@ -11,15 +11,25 @@
 namespace Core {
 using AccessViolationHandler = bool (*)(void* context, void* fault_address);
 using IllegalInstructionHandler = bool (*)(void* context);
+// bbport: the breakpoints the guest hooks put in the game's code. On Linux they arrive as
+// SIGTRAP, on Windows as the breakpoint exception; both go through this registry.
+using BreakpointHandler = bool (*)(void* context);
 
 class SignalDispatch {
 public:
-    void RemoveHandlers() { access_violation_handlers.clear(); illegal_instruction_handlers.clear(); }
+    void RemoveHandlers() {
+        access_violation_handlers.clear();
+        illegal_instruction_handlers.clear();
+        breakpoint_handlers.clear();
+    }
     void RegisterAccessViolationHandler(const AccessViolationHandler& handler, u32 priority) {
         access_violation_handlers.emplace(handler, priority);
     }
     void RegisterIllegalInstructionHandler(const IllegalInstructionHandler& handler, u32 priority) {
         illegal_instruction_handlers.emplace(handler, priority);
+    }
+    void RegisterBreakpointHandler(const BreakpointHandler& handler, u32 priority) {
+        breakpoint_handlers.emplace(handler, priority);
     }
     bool DispatchAccessViolation(void* context, void* fault_address) const {
         for (const auto& entry : access_violation_handlers)
@@ -28,6 +38,11 @@ public:
     }
     bool DispatchIllegalInstruction(void* context) const {
         for (const auto& entry : illegal_instruction_handlers)
+            if (entry.handler(context)) return true;
+        return false;
+    }
+    bool DispatchBreakpoint(void* context) const {
+        for (const auto& entry : breakpoint_handlers)
             if (entry.handler(context)) return true;
         return false;
     }
@@ -45,6 +60,7 @@ private:
     };
     std::set<HandlerEntry<AccessViolationHandler>> access_violation_handlers;
     std::set<HandlerEntry<IllegalInstructionHandler>> illegal_instruction_handlers;
+    std::set<HandlerEntry<BreakpointHandler>> breakpoint_handlers;
 };
 using Signals = Common::Singleton<SignalDispatch>;
 } // namespace Core

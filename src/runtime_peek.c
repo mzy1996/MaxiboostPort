@@ -10,21 +10,22 @@
  * Addresses are hexadecimal; a read of unmapped memory says so instead of faulting. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "platform.h"
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/uio.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 /* Memory the GPU layer has read-protected (to see the GPU's writes first) is read through the
  * pool's second view, as the protection leaves it. */
 void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size);
 static int peek(uint64_t address, void *out, size_t size) {
-    struct iovec local={out,size}, remote={(void *)(uintptr_t)address,size};
-    if (process_vm_readv(getpid(),&local,1,&remote,1,0)==(ssize_t)size) return 1;
+    if (!platform_read_memory((void *)(uintptr_t)address,out,size)) return 1;
     if (!runtime_memory_is_mapped(address,size)) return 0;
     runtime_memory_read_backing(address,out,size);
     printf("Peek: %#" PRIx64 " is protected; read through the backing view\n",address);

@@ -68,6 +68,42 @@ class GameCheckTests(unittest.TestCase):
         with mock.patch.object(game_check, 'SUPPORTED_IMAGE', game_check.image_sha256(game)):
             self.assertIsNone(game_check.problem(game))
 
+    def test_the_hong_kong_release_passes(self):
+        """CUSA15006, the deluxe soundtrack edition: its 1.15 eboot is a known one."""
+        game = self.game('CUSA15006', '01.15')
+        digest = game_check.image_sha256(game)
+        with mock.patch.dict(game_check.SUPPORTED_IMAGES, {'CUSA15006': (digest,)}, clear=False):
+            self.assertIsNone(game_check.problem(game))
+
+    def test_the_hong_kong_release_with_the_cheat_trainer_passes(self):
+        """The same release with the cheat trainer injected into the eboot: another known image."""
+        game = self.game('CUSA15006', '01.15')
+        digest = game_check.image_sha256(game)
+        with mock.patch.dict(game_check.SUPPORTED_IMAGES, {'CUSA15006': ('other', digest)}, clear=False):
+            self.assertIsNone(game_check.problem(game))
+
+    def test_the_hong_kong_release_keeps_01_00_in_the_param_sfo(self):
+        """Its dump carries the base game's APP_VER (01.00) and the update's version in
+        VERSION, so the version is read from there."""
+        game = self.game('CUSA15006', '01.15')
+        (game / 'sce_sys/param.sfo').write_bytes(
+            param_sfo({'APP_VER': '01.00', 'VERSION': '01.15', 'TITLE_ID': 'CUSA15006'}))
+        digest = game_check.image_sha256(game)
+        with mock.patch.dict(game_check.SUPPORTED_IMAGES, {'CUSA15006': (digest,)}, clear=False):
+            self.assertIsNone(game_check.problem(game))
+
+    def test_the_hong_kong_release_without_its_update_is_asked_for_it(self):
+        """Its base game 1.00: the eboot is not the 1.15 one, so the update is asked for."""
+        game = self.game('CUSA15006', '01.15')
+        (game / 'sce_sys/param.sfo').write_bytes(
+            param_sfo({'APP_VER': '01.00', 'VERSION': '01.00', 'TITLE_ID': 'CUSA15006'}))
+        with mock.patch.object(game_check, 'BASE_IMAGE', game_check.image_sha256(game)):
+            self.assertEqual(game_check.problem(game)[0], 'missing_update')
+
+    def test_the_title_of_an_image(self):
+        self.assertEqual(game_check.title_of_image(game_check.SUPPORTED_IMAGE), 'CUSA18758')
+        self.assertIsNone(game_check.title_of_image('0' * 64))
+
     def test_incomplete_folder(self):
         game = self.game('CUSA18758', '01.15', files=False)
         with mock.patch.object(game_check, 'SUPPORTED_IMAGE', game_check.image_sha256(game)):

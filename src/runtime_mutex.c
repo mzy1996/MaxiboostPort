@@ -1,10 +1,15 @@
-/* Linux pthread-backed opaque PS4 mutex handles. No guest threads yet. */
+/* pthread-backed opaque PS4 mutex handles. No guest threads yet. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* The Windows build uses the same pthreads (MinGW-w64's winpthreads), so the implementation
+ * below is shared: only the clock and the error numbers differ. */
 #ifndef _WIN32
+#define _GNU_SOURCE
+#endif
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
@@ -122,11 +127,12 @@ static ABI int32_t mutex_destroy(GuestMutex **mutex) {
     if (!e) { free(*mutex); *mutex = (GuestMutex *)(uintptr_t)2; }
     return orbis_error(e);
 }
+/* The deadline the timed waits use: the host's wall clock, which the pthread timed waits
+ * take (CLOCK_REALTIME, like FreeBSD's default). */
 static int deadline_after(struct timespec *end, uint64_t usec) {
-    if (clock_gettime(CLOCK_REALTIME, end)) return errno;
-    uint64_t ns = (uint64_t)end->tv_nsec + (usec % 1000000) * 1000;
-    end->tv_sec += (time_t)(usec / 1000000 + ns / 1000000000);
-    end->tv_nsec = (long)(ns % 1000000000);
+    uint64_t ns = platform_realtime_ns() + usec * 1000ull;
+    end->tv_sec = (time_t)(ns / 1000000000ull);
+    end->tv_nsec = (long)(ns % 1000000000ull);
     return 0;
 }
 static int32_t timed_error(int e) { return e == ETIMEDOUT ? (int32_t)UINT32_C(0x8002003c) : orbis_error(e); }
@@ -135,9 +141,23 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     if (e) return e;
     struct timespec end;
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
+#ifdef _WIN32
+    /* MinGW's winpthreads has no timed lock: the lock is taken in a loop with a short wait,
+     * which is what the timed lock means to the guest anyway. */
+    uint64_t deadline = platform_realtime_ns() + usec * 1000ull;
+    for (;;) {
+        e = pthread_mutex_trylock(&(*mutex)->native);
+        if (!e) { ++locks; return 0; }
+        if (e != EBUSY) return timed_error(e);
+        if (platform_realtime_ns() >= deadline) return timed_error(ETIMEDOUT);
+        struct timespec pause = {0, 1000000};  /* 1 ms */
+        platform_sleep_ns(1000000ull);
+    }
+#else
     e = timed_error(pthread_mutex_timedlock(&(*mutex)->native, &end));
     if (!e) ++locks;
     return e;
+#endif
 }
 /* Condition variables: opaque handles over host pthread_cond (CLOCK_REALTIME,
  * like FreeBSD's default), sharing the host mutex behind GuestMutex. */
@@ -278,26 +298,3 @@ void runtime_mutex_report(void) {
     printf("Runtime: mutexes created=%zu, locks=%zu, unlocks=%zu\n", created, locks, unlocks);
     printf("Runtime: condition variables created=%zu, waits=%zu, wakeups=%zu\n", conds, waits, wakeups);
 }
-#else
-static ABI int32_t posix_cond_init(GuestCond **c, void **a) { return posix_result(cond_init(c, a, NULL)); }
-static ABI int32_t posix_cond_destroy(GuestCond **c) { return posix_result(cond_destroy(c)); }
-static ABI int32_t posix_cond_wait(GuestCond **c, GuestMutex **m) { return posix_result(cond_wait(c, m)); }
-static ABI int32_t posix_cond_timedwait(GuestCond **c, GuestMutex **m, const GuestTimespec *t) { return posix_result(cond_abs_timedwait(c, m, t)); }
-static ABI int32_t posix_cond_signal(GuestCond **c) { return posix_result(cond_signal(c)); }
-static ABI int32_t posix_cond_broadcast(GuestCond **c) { return posix_result(cond_broadcast(c)); }
-uintptr_t runtime_mutex_resolve(const char *name) {
-    if (runtime_nid_is(name,"0TyVk4MSLt0#I#J")) return (uintptr_t)posix_cond_init;
-    if (runtime_nid_is(name,"RXXqi4CtF8w#I#J")) return (uintptr_t)posix_cond_destroy;
-    if (runtime_nid_is(name,"Op8TBGY5KHg#I#J")) return (uintptr_t)posix_cond_wait;
-    if (runtime_nid_is(name,"27bAgiJmOh0#I#J")) return (uintptr_t)posix_cond_timedwait;
-    if (runtime_nid_is(name,"2MOy+rUfuhQ#I#J")) return (uintptr_t)posix_cond_signal;
-    if (runtime_nid_is(name,"mkx2fVhNMsg#I#J")) return (uintptr_t)posix_cond_broadcast;
-    if (runtime_nid_is(name,"2Tb92quprl0#p#J")) return (uintptr_t)cond_init;
-    if (runtime_nid_is(name,"g+PZd2hiacg#p#J")) return (uintptr_t)cond_destroy;
-    if (runtime_nid_is(name,"WKAXJ4XBPQ4#p#J")) return (uintptr_t)cond_wait;
-    if (runtime_nid_is(name,"BmMjYxmew1w#p#J")) return (uintptr_t)cond_timedwait;
-    if (runtime_nid_is(name,"kDh-NfxgMtE#p#J")) return (uintptr_t)cond_signal;
-    if (runtime_nid_is(name,"JGgj7Uvrl+A#p#J")) return (uintptr_t)cond_broadcast;
-    if (runtime_nid_is(name,"IafI2PxcPnQ#p#J")) return (uintptr_t)mutex_timedlock; (void)name; return 0; }
-void runtime_mutex_report(void) { puts("Runtime: Windows mutex backend not implemented"); }
-#endif

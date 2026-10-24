@@ -9,6 +9,7 @@
 #include <bit>
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
+#include "host_services.h"
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
 #include "bbport_sections.h"
@@ -35,11 +36,8 @@
 #include <pthread.h>
 #include <x86intrin.h>
 #include <cstring>
-#include <dlfcn.h>
 #include <string>
 #include <fmt/format.h>
-#include <sys/mman.h>
-#include <ucontext.h>
 #include "common/signal_context.h"
 #include "core/signals.h"
 #include <vk_mem_alloc.h>
@@ -3035,11 +3033,10 @@ bool VramTrapHandler(void* context, void* fault_address) {
             return false;
         }
     }
-    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
-    const u64 rip = u64(g[REG_RIP]);
+    const uint64_t rip = ContextRip(context);
     constexpr u64 Image = 0x800000000ull, ImageEnd = 0x810000000ull;
     u64 caller = 0;
-    const auto* stack = reinterpret_cast<const u64*>(g[REG_RSP]);
+    const auto* stack = reinterpret_cast<const u64*>(ContextRsp(context));
     for (u32 i = 0; i < 48; ++i) {
         if (stack[i] >= Image && stack[i] < ImageEnd) {
             caller = stack[i] - Image;
@@ -3073,7 +3070,8 @@ bool VramTrapHandler(void* context, void* fault_address) {
             trap.address = address;
         }
     }
-    mprotect(reinterpret_cast<void*>(block), vram_trap_block_size, PROT_READ | PROT_WRITE);
+    Core::MProtect(reinterpret_cast<void*>(block), vram_trap_block_size,
+                   Core::ProtRead | Core::ProtWrite);
     return true;
 }
 
@@ -3081,12 +3079,17 @@ std::string VramTrapSiteName(u64 rip) {
     if (!(rip >> 63)) {
         return fmt::format("+{:#x}", rip);
     }
-    Dl_info info{};
     const u64 address = rip & ~(1ull << 63);
-    dladdr(reinterpret_cast<void*>(address), &info);
-    const char* name = info.dli_fname ? std::strrchr(info.dli_fname, '/') : nullptr;
-    return fmt::format("host {}+{:#x}", name ? name + 1 : "?",
-                       address - reinterpret_cast<u64>(info.dli_fbase));
+    char module[512] = "?";
+    uint64_t offset = 0;
+    if (Core::SymbolOf(reinterpret_cast<void*>(address), module, sizeof(module), &offset)) {
+        const char* name = std::strrchr(module, '/');
+        if (!name) {
+            name = std::strrchr(module, '\\');
+        }
+        return fmt::format("host {}+{:#x}", name ? name + 1 : module, offset);
+    }
+    return fmt::format("host ?+{:#x}", address);
 }
 
 void ReportVramTraps() {
@@ -3101,7 +3104,8 @@ void ReportVramTraps() {
             }
         }
         for (const u64 block : blocks) {
-            mprotect(reinterpret_cast<void*>(block), vram_trap_block_size, PROT_NONE);
+            Core::MProtect(reinterpret_cast<void*>(block), vram_trap_block_size,
+                   Core::ProtRead | Core::ProtWrite);
         }
         static auto last = std::chrono::steady_clock::now();
         if (std::chrono::steady_clock::now() - last < std::chrono::seconds(3)) {
@@ -3273,7 +3277,7 @@ void BufferCache::QueuePromotions(u64 submitted) {
             vram_trap_block_size = block_size;
             std::scoped_lock lk{vram_trapped_mutex};
             vram_trapped[address] = block_size;
-            mprotect(reinterpret_cast<void*>(address), block_size, PROT_NONE);
+            Core::MProtect(reinterpret_cast<void*>(address), block_size, Core::ProtNone);
         }
     }
     if (moved == 0) {

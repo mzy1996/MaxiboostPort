@@ -5,12 +5,15 @@
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbnet/bbnet.h"
-#include <dlfcn.h>
+#include "platform.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <dlfcn.h>
 #include <unistd.h>
+#endif
 
 static char game_folder[PATH_MAX], game_serial[16], game_title[128], game_version[16];
 
@@ -40,7 +43,8 @@ int runtime_net_symbol(const char *symbol) {
     return match;
 }
 
-/* The module: BB_NET_MODULE, else gpu/libbbnet.so beside bb-probe (where libbbgpu.so is). */
+/* The module: BB_NET_MODULE, else gpu/libbbnet.so (or bbnet.dll) beside bb-probe (where
+ * libbbgpu.so is). */
 static BbNetResolveFn module_resolve(void) {
     static int tried;
     static BbNetResolveFn resolve;
@@ -52,21 +56,22 @@ static BbNetResolveFn module_resolve(void) {
         snprintf(path,sizeof(path),"%s",forced);
     } else {
         char exe[PATH_MAX-32];
-        const ssize_t n=readlink("/proc/self/exe",exe,sizeof(exe)-1);
-        if (n<=0) return NULL;
-        exe[n]=0;
-        char *slash=strrchr(exe,'/');
-        if (slash) *slash=0;
+        platform_program_directory(exe,sizeof(exe));
+        if (!exe[0]) return NULL;
+#ifdef _WIN32
+        snprintf(path,sizeof(path),"%s\\gpu\\bbnet.dll",exe);
+#else
         snprintf(path,sizeof(path),"%s/gpu/libbbnet.so",exe);
+#endif
     }
-    /* RTLD_LOCAL: its C++ (network and NP libraries) stays out of the process's symbol scope. */
-    void *module=dlopen(path,RTLD_NOW|RTLD_LOCAL);
+    char error[256]={0};
+    PlatformLibrary *module=platform_library_open(path,error,sizeof(error));
     if (!module) {
-        printf("Online: the online module is not available (%s): offline play\n",dlerror());
+        printf("Online: the online module is not available (%s): offline play\n",error);
         return NULL;
     }
-    const BbNetInitFn init=(BbNetInitFn)dlsym(module,"bbnet_init");
-    const BbNetResolveFn found=(BbNetResolveFn)dlsym(module,"bbnet_resolve");
+    const BbNetInitFn init=(BbNetInitFn)platform_library_symbol(module,"bbnet_init");
+    const BbNetResolveFn found=(BbNetResolveFn)platform_library_symbol(module,"bbnet_resolve");
     const BbNetHost host={
         .abi=BBNET_ABI_VERSION, .app0=game_folder, .serial=game_serial, .title=game_title,
         .app_ver=game_version, .thread_spawn=runtime_thread_spawn,
@@ -74,6 +79,7 @@ static BbNetResolveFn module_resolve(void) {
     };
     if (!init || !found || init(&host)!=0) {
         printf("Online: %s did not start: offline play\n",path);
+        platform_library_close(module);
         return NULL;
     }
     printf("Online: module %s\n",path);

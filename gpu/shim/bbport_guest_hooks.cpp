@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "host_services.h"
 #include "bbport_guest_hooks.h"
 #include "bbport_heap_sites.h"
 #include "bbport_toggles.h"
@@ -12,7 +13,6 @@
 #include <cstring>
 #include <sys/mman.h>
 #include <sys/uio.h>
-#include <ucontext.h>
 #include <unistd.h>
 
 extern "C" void runtime_memory_note_write(uintptr_t address, uint64_t size);
@@ -88,9 +88,8 @@ constexpr std::size_t StubPageSize = 4096;
 u8* MapStubPage() {
     for (u64 k = 1; k <= 64; ++k) {
         const u64 hint = ImageBase - k * (16ull << 20);
-        void* p = mmap(reinterpret_cast<void*>(hint), StubPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (p != MAP_FAILED) {
+        void* p = HostMapAt(reinterpret_cast<void*>(hint), StubPageSize, HostProtRead | HostProtWrite | HostProtExec);
+        if (p) {
             return static_cast<u8*>(p);
         }
     }
@@ -154,16 +153,16 @@ bool Rel32To(u64 from_next, u64 to, std::uint32_t& rel) {
 
 /// Replaces bytes [1, 5) at `address` (byte 0 is the trap already there), then byte 0.
 void WriteJumpOverTrap(u64 address, u8 opcode, std::uint32_t rel) {
-    const long page_size = sysconf(_SC_PAGESIZE);
+    const long page_size = HostPageSize();
     void* page = reinterpret_cast<void*>(address & ~u64(page_size - 1));
     const std::size_t span = (address + 5) - reinterpret_cast<u64>(page);
-    mprotect(page, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+    HostProtect(page, span, HostProtRead | HostProtWrite | HostProtExec);
     auto* p = reinterpret_cast<u8*>(address);
     for (int i = 0; i < 4; ++i) {
         __atomic_store_n(p + 1 + i, u8(rel >> (8 * i)), __ATOMIC_SEQ_CST);
     }
     __atomic_store_n(p, opcode, __ATOMIC_SEQ_CST);
-    mprotect(page, span, PROT_READ | PROT_EXEC);
+    HostProtect(page, span, HostProtRead | HostProtExec);
 }
 
 void AllocHook(u64 node) {
@@ -250,27 +249,27 @@ bool InstallCallDetour(u64 offset) {
     WriteJumpOverTrap(address, 0xe8, rel);
     return true;
 }
-struct sigaction previous_action {};
-
-void OnTrap(int sig, siginfo_t* info, void* context) {
-    auto* g = static_cast<ucontext_t*>(context)->uc_mcontext.gregs;
-    const u64 rip = u64(g[REG_RIP]) - 1; // past the int3
+// The trap handler: the sites the guest hooks watch. It answers with true when it took
+// the trap; the host's own handler (the signal on Linux, the vectored exception handler
+// on Windows) then lets the thread continue where the handler sent it.
+static bool HandleTrap(void* context) {
+    const u64 rip = ContextRip(context) - 1; // past the int3
     for (const auto& site : native_sites) {
         if (rip == ImageBase + site.offset) {
             if (const u64 stub = site.stub.load(std::memory_order_acquire)) {
-                g[REG_RIP] = greg_t(stub); // the detour is going in: its stub runs the site
-                return;
+                ContextSet(context, RegRip, stub); // the detour is going in: its stub runs the site
+                return true;
             }
         }
     }
     if (rip == ImageBase + ReleaseCheck) {
-        const auto result = static_cast<std::int32_t>(g[REG_RAX] & 0xffffffff);
+        const auto result = static_cast<std::int32_t>(ContextGet(context, RegRax) & 0xffffffff);
         BbHeapSites::NoteReleaseCheck(std::uint32_t(result));
-        g[REG_RIP] = greg_t(ImageBase + (result < 0 ? 0xbb5fc7 : ReleaseCheck + 2));
-        return;
+        ContextSet(context, RegRip, ImageBase + (result < 0 ? 0xbb5fc7 : ReleaseCheck + 2));
+        return true;
     }
     if (rip == ImageBase + CollectorEntry) {
-        const u64 allocator = u64(g[REG_RDI]);
+        const u64 allocator = ContextGet(context, RegRdi);
         for (std::size_t i = 0; i < BbStats::range_allocators.size(); ++i) {
             u64 expected = 0;
             if (BbStats::range_allocators[i].load(std::memory_order_relaxed) == allocator ||
@@ -282,26 +281,26 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
                 break;
             }
         }
-        g[REG_RSP] -= 8; // push rbp
-        *reinterpret_cast<u64*>(g[REG_RSP]) = u64(g[REG_RBP]);
-        g[REG_RIP] = greg_t(ImageBase + CollectorEntry + 1);
-        return;
+        ContextSet(context, RegRsp, ContextGet(context, RegRsp) - 8); // push rbp
+        *reinterpret_cast<u64*>(ContextGet(context, RegRsp)) = ContextGet(context, RegRbp);
+        ContextSet(context, RegRip, ImageBase + CollectorEntry + 1);
+        return true;
     }
     for (const u64 site : HeapAllocReturns) {
         if (rip != ImageBase + site) {
             continue;
         }
-        const u64 address = u64(g[REG_RAX]);
-        const u64 size = *reinterpret_cast<const u64*>(u64(g[REG_RBP]) - 0x50);
+        const u64 address = ContextGet(context, RegRax);
+        const u64 size = *reinterpret_cast<const u64*>(ContextGet(context, RegRbp) - 0x50);
         if (address != 0 && size != 0 && size < (u64(1) << 32)) {
             on_range_allocated(address, size);
         }
-        g[REG_RBX] = g[REG_RAX];
-        g[REG_RIP] = greg_t(ImageBase + site + sizeof(HeapAllocReturnCode));
-        return;
+        ContextSet(context, RegRbx, ContextGet(context, RegRax));
+        ContextSet(context, RegRip, ImageBase + site + sizeof(HeapAllocReturnCode));
+        return true;
     }
     if (rip == ImageBase + AllocReturn) {
-        if (const u64 node = u64(g[REG_RAX])) {
+        if (const u64 node = ContextGet(context, RegRax)) {
             const u64 start = *reinterpret_cast<const u64*>(node + 8);
             const u64 next = *reinterpret_cast<const u64*>(node + 0x18);
             const u64 end = next ? *reinterpret_cast<const u64*>(next + 8) : start;
@@ -309,9 +308,9 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
                 on_range_allocated(start, end - start);
             }
         }
-        g[REG_RSP] += 0x18;
-        g[REG_RIP] = greg_t(ImageBase + AllocReturn + sizeof(AllocReturnCode));
-        return;
+        ContextSet(context, RegRsp, ContextGet(context, RegRsp) + 0x18);
+        ContextSet(context, RegRip, ImageBase + AllocReturn + sizeof(AllocReturnCode));
+        return true;
     }
     for (std::size_t i = 0; i < MemcpySites.size(); ++i) {
         const auto& site = MemcpySites[i];
@@ -321,9 +320,34 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
         hits[i].fetch_add(1, std::memory_order_relaxed);
         // The call, to LoaderCopy instead of the game's memcpy: push the return address, jump.
         const u64 ret = ImageBase + site.offset + 5;
-        g[REG_RSP] -= 8;
-        *reinterpret_cast<u64*>(g[REG_RSP]) = ret;
-        g[REG_RIP] = greg_t(reinterpret_cast<u64>(&LoaderCopy));
+        ContextSet(context, RegRsp, ContextGet(context, RegRsp) - 8);
+        *reinterpret_cast<u64*>(ContextGet(context, RegRsp)) = ret;
+        ContextSet(context, RegRip, reinterpret_cast<u64>(&LoaderCopy));
+        return true;
+    }
+    return false;
+}
+
+#ifdef _WIN32
+// The Windows build: the breakpoints arrive as the breakpoint exception. The handler sends
+// the thread to the site's detour by moving its instruction pointer.
+LONG CALLBACK OnVectoredException(PEXCEPTION_POINTERS exception) {
+    if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // The interrupted thread's context: the record holds it.
+    auto* context = exception->ContextRecord;
+    if (!HandleTrap(context)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // The instruction pointer was moved: the thread continues where the handler sent it.
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#else
+struct sigaction previous_action {};
+
+void OnTrap(int sig, siginfo_t* info, void* context) {
+    if (HandleTrap(context)) {
         return;
     }
     if (previous_action.sa_flags & SA_SIGINFO) {
@@ -339,23 +363,27 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
     signal(SIGTRAP, SIG_DFL);
     raise(SIGTRAP);
 }
+#endif
+
 
 bool Patch(u64 address, const unsigned char* expected, std::size_t size) {
     unsigned char bytes[16]{};
-    iovec local{bytes, size}, remote{reinterpret_cast<void*>(address), size};
-    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != ssize_t(size) ||
+    const void* local_base = bytes; const size_t local_size = size;
+    struct { void* iov_base; size_t iov_len; } local{const_cast<void*>(local_base), local_size};
+    struct { void* iov_base; size_t iov_len; } remote{reinterpret_cast<void*>(address), size};
+    if (!Core::ReadProcessMemory(remote.iov_base, local.iov_base, local.iov_len) || local.iov_len != (size) ||
         std::memcmp(bytes, expected, size) != 0) {
         return false;
     }
-    const long page_size = sysconf(_SC_PAGESIZE);
+    const long page_size = HostPageSize();
     void* page = reinterpret_cast<void*>(address & ~u64(page_size - 1));
     const std::size_t span = (address + size) - reinterpret_cast<u64>(page);
-    if (mprotect(page, span, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    if (HostProtect(page, span, HostProtRead | HostProtWrite | HostProtExec) != 0) {
         return false;
     }
     __atomic_store_n(reinterpret_cast<unsigned char*>(address), static_cast<unsigned char>(0xcc),
                      __ATOMIC_SEQ_CST);
-    mprotect(page, span, PROT_READ | PROT_EXEC);
+    HostProtect(page, span, HostProtRead | HostProtExec);
     return true;
 }
 } // namespace
@@ -365,11 +393,17 @@ void Install(RangeCallback on_gpu_range_allocated) {
     if (installed.exchange(true)) {
         return;
     }
+#ifdef _WIN32
+    // The vectored exception handler: it sees the breakpoints before the runtime's own
+    // handler (the runtime's handler is registered later, so it comes second).
+    AddVectoredExceptionHandler(1, reinterpret_cast<PVECTORED_EXCEPTION_HANDLER>(OnVectoredException));
+#else
     struct sigaction action {};
     action.sa_sigaction = OnTrap;
     action.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&action.sa_mask);
     sigaction(SIGTRAP, &action, &previous_action);
+#endif
     int patched = 0;
     for (const auto& site : MemcpySites) {
         patched += Patch(ImageBase + site.offset, site.code, sizeof(site.code));
@@ -408,7 +442,7 @@ void Install(RangeCallback on_gpu_range_allocated) {
                 detours += InstallDetour(site);
             }
         }
-        mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
+        HostProtect(stub_page, StubPageSize, HostProtRead | HostProtExec);
         std::printf("Guest hooks: %d native detours (no traps; BB_GUEST_HOOK_TRAPS=1: int3)\n",
                     detours);
     }

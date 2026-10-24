@@ -6,22 +6,42 @@
  * steps over it is not counted, and every hit costs two signals. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "platform.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
-#include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
+#endif
 
 #define MAX_SITES 256
 #define TRAP_FLAG 0x100ull
+/* The registers the runtime reads, in the x86-64 numbering (platform_context_register). */
+#define REG_RAX 0
+#define REG_RCX 1
+#define REG_RDX 2
+#define REG_RBX 3
+#define REG_RSP 4
+#define REG_RBP 5
+#define REG_RSI 6
+#define REG_RDI 7
+#define REG_R8 8
+#define REG_R9 9
+#define REG_R10 10
+#define REG_R11 11
+#define REG_R12 12
+#define REG_R13 13
+#define REG_R14 14
+#define REG_R15 15
 
 #define MAX_CALLERS 8
 static struct {
@@ -58,9 +78,9 @@ static uint64_t trans_offset; static int trans_key = -1, trans_value = -1;
 #define MAX_TRANS_KEYS 256
 static _Atomic uint64_t trans_keys[MAX_TRANS_KEYS], trans_values[MAX_TRANS_KEYS];
 static _Atomic int trans_printed;
-static void note_transition(const ucontext_t *uc) {
-    const uint64_t key = (uint64_t)uc->uc_mcontext.gregs[trans_key];
-    const uint64_t value = (uint64_t)uc->uc_mcontext.gregs[trans_value];
+static void note_transition(const PlatformContext *uc) {
+    const uint64_t key = platform_context_register(uc,trans_key);
+    const uint64_t value = platform_context_register(uc,trans_value);
     for (int i = 0; i < MAX_TRANS_KEYS; ++i) {
         const int k = (int)((key * 0x9e3779b97f4a7c15ull >> 56) + (uint64_t)i) % MAX_TRANS_KEYS;
         uint64_t seen = atomic_load(&trans_keys[k]);
@@ -72,13 +92,15 @@ static void note_transition(const ucontext_t *uc) {
             char line[160];
             snprintf(line, sizeof(line), "Guest transition +%#" PRIx64 ": %#" PRIx64 " +%#" PRIx64 " -> +%#" PRIx64 "\n",
                      trans_offset, key, old ? old - base : 0, value - base);
-            ssize_t w = write(1, line, strlen(line)); (void)w;
+            platform_write_stdout(line, strlen(line));
         }
         return;
     }
 }
 static int site_count;
+#ifndef _WIN32
 static struct sigaction previous;
+#endif
 /* The site each thread is stepping over, by thread id: no thread-local storage in the handler
  * (the game's threads run with the guest's TLS register setup). */
 #define MAX_STEPPERS 256
@@ -103,6 +125,12 @@ static void write_byte(unsigned char *code, unsigned char value) {
     *(volatile unsigned char *)code = value;
 }
 
+/* The trap that interrupted the thread: an int3 the runtime put in the game's code, or the
+ * single step that followed it. Linux tells them apart by the signal's code; Windows has no
+ * such code, so the thread's own state says which one it is. */
+enum { TRAP_NONE=0, TRAP_BREAKPOINT, TRAP_STEP };
+
+#ifndef _WIN32
 static void on_trap_body(int sig, siginfo_t *info, void *context);
 static void on_trap(int sig, siginfo_t *info, void *context) {
     const int saved_errno = errno;
@@ -110,24 +138,25 @@ static void on_trap(int sig, siginfo_t *info, void *context) {
     errno = saved_errno;
 }
 static void on_trap_body(int sig, siginfo_t *info, void *context) {
-    ucontext_t *uc = (ucontext_t *)context;
-    uint64_t *rip = (uint64_t *)&uc->uc_mcontext.gregs[REG_RIP];
-    uint64_t *flags = (uint64_t *)&uc->uc_mcontext.gregs[REG_EFL];
-    const int tid = (int)syscall(SYS_gettid);
+    ucontext_t *raw = (ucontext_t *)context;
+    PlatformContext uc = { context };
+    uint64_t rip = platform_context_rip(&uc);
+    const int tid = (int)platform_thread_id();
     int *stepping = stepper_slot(tid, 0);
     /* The kernel tells a single step (TRAP_TRACE) from an int3 (SI_KERNEL): a thread can meet a
      * site's int3 re-armed by another thread while it steps over it. */
-    if (info->si_code == TRAP_TRACE && stepping && *stepping >= 0) { /* the instruction ran */
+    const int kind = (info->si_code == TRAP_TRACE && stepping && *stepping >= 0) ? TRAP_STEP : TRAP_BREAKPOINT;
+    if (kind == TRAP_STEP) { /* the instruction ran */
         write_byte(sites[*stepping].code, 0xcc);
         *stepping = -1;
-        *flags &= ~TRAP_FLAG;
+        platform_context_clear_trap(&uc);
         return;
     }
     for (int i = 0; i < site_count; ++i) {
-        if ((uint64_t)(uintptr_t)sites[i].code == *rip - 1) {
+        if ((uint64_t)(uintptr_t)sites[i].code == rip - 1) {
             atomic_fetch_add_explicit(&sites[i].hits, 1, memory_order_relaxed);
             if (reg_index >= 0 && sites[i].offset == reg_offset) {
-                uint64_t v = (uint64_t)uc->uc_mcontext.gregs[reg_index];
+                uint64_t v = platform_context_register(&uc,reg_index);
                 if (reg_low) v &= 0xffffffffull;
                 for (int k = 0; k < 16; ++k) {
                     uint64_t seen = atomic_load(&reg_values[k]);
@@ -138,16 +167,15 @@ static void on_trap_body(int sig, siginfo_t *info, void *context) {
                 }
             }
             if (list_index >= 0 && sites[i].offset == list_offset) {
-                const uint32_t *e = (const uint32_t *)(uintptr_t)uc->uc_mcontext.gregs[list_index];
+                const uint32_t *e = (const uint32_t *)(uintptr_t)platform_context_register(&uc,list_index);
                 int n = 0;
                 while (n < 0x4000 && e[n * 8] <= 0xfff && e[n * 8 + 1] != 0) ++n;
                 atomic_fetch_add(&list_hist[n == 0 ? 0 : n == 1 ? 1 : n <= 4 ? 2 : n <= 16 ? 3 : n <= 64 ? 4 : 5], 1);
                 memcpy(list_last, e, sizeof(list_last));
             }
-            if (trans_key >= 0 && trans_value >= 0 && sites[i].offset == trans_offset) note_transition(uc);
+            if (trans_key >= 0 && trans_value >= 0 && sites[i].offset == trans_offset) note_transition(&uc);
             if (delay_us && sites[i].offset == delay_offset) {
-                struct timespec t = {(time_t)(delay_us / 1000000), (long)(delay_us % 1000000) * 1000};
-                nanosleep(&t, NULL);
+                platform_sleep_ns((uint64_t)delay_us * 1000ull);
             }
             /* BB_GUEST_BACKTRACE=1: at a site that is a function's first instruction, the chain of
              * callers (the game keeps frame pointers: rbp is still the caller's), the first 8 hits. */
@@ -158,8 +186,8 @@ static void on_trap_body(int sig, siginfo_t *info, void *context) {
                 if (atomic_fetch_add(&printed, 1) < 8) {
                     char line[512]; int n = snprintf(line, sizeof(line), "Guest backtrace +%#" PRIx64 ":", sites[i].offset);
                     const uint64_t base = (uint64_t)(uintptr_t)image_base;
-                    uint64_t r = *(const uint64_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
-                    const uint64_t *frame = (const uint64_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+                    uint64_t r = *(const uint64_t *)(uintptr_t)platform_context_stack(&uc);
+                    const uint64_t *frame = (const uint64_t *)(uintptr_t)platform_context_frame(&uc);
                     for (int d = 0; d < 14 && n < (int)sizeof(line) - 24; ++d) {
                         n += snprintf(line + n, sizeof(line) - (size_t)n, " +%#" PRIx64, r - base);
                         if (!frame || (uintptr_t)frame & 7 || !runtime_memory_is_mapped((uintptr_t)frame, 16)) break;
@@ -167,29 +195,32 @@ static void on_trap_body(int sig, siginfo_t *info, void *context) {
                         if (r < base || r >= base + 0x5000000) break;
                     }
                     snprintf(line + n, sizeof(line) - (size_t)n, "\n");
-                    ssize_t w = write(1, line, strlen(line)); (void)w;
+                    platform_write_stdout(line, strlen(line));
                 }
             }
-            const uint64_t ret = *(const uint64_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+            const uint64_t ret = *(const uint64_t *)(uintptr_t)platform_context_stack(&uc);
             for (int k = 0; k < MAX_CALLERS; ++k) {
                 uint64_t seen = atomic_load(&sites[i].callers[k]);
                 if (seen == ret) break;
                 if (seen == 0 && atomic_compare_exchange_strong(&sites[i].callers[k], &seen, ret)) break;
             }
-            const uint64_t rdi = (uint64_t)uc->uc_mcontext.gregs[REG_RDI];
+            const uint64_t rdi = platform_context_register(&uc,REG_RDI);
             for (int k = 0; k < MAX_CALLERS; ++k) {
                 uint64_t seen = atomic_load(&sites[i].rdis[k]);
                 if (seen == rdi) break;
                 if (seen == 0 && atomic_compare_exchange_strong(&sites[i].rdis[k], &seen, rdi)) break;
             }
             write_byte(sites[i].code, sites[i].original);
-            *rip -= 1;
-            *flags |= TRAP_FLAG;
+            /* The instruction is run again with the trap flag set, so the host stops right
+             * after it and the int3 is put back. */
+            platform_context_set_rip(&uc, rip - 1);
+            platform_context_set_trap(&uc);
             if (!stepping) stepping = stepper_slot(tid, 1);
             if (stepping) *stepping = i;
             return;
         }
     }
+#ifndef _WIN32
     if (previous.sa_flags & SA_SIGINFO) {
         if (previous.sa_sigaction) previous.sa_sigaction(sig, info, context);
     } else if (previous.sa_handler != SIG_IGN && previous.sa_handler != SIG_DFL && previous.sa_handler) {
@@ -198,13 +229,14 @@ static void on_trap_body(int sig, siginfo_t *info, void *context) {
         signal(SIGTRAP, SIG_DFL);
         raise(SIGTRAP);
     }
+#endif
 }
+#endif /* !_WIN32 */
 
 static void *report(void *arg) {
     (void)arg;
     for (;;) {
-        struct timespec t = {2, 0};
-        nanosleep(&t, NULL);
+        platform_sleep_ns(2000000000ull);
         printf("Guest counts (2 s):");
         for (int i = 0; i < site_count; ++i)
             printf(" +%#" PRIx64 "=%" PRIu64, sites[i].offset, atomic_exchange(&sites[i].hits, 0));
@@ -255,6 +287,54 @@ static void *report(void *arg) {
     return NULL;
 }
 
+#ifdef _WIN32
+/* The Windows build has no signals: the exception handler (probe.c) hands the interrupt to
+ * the runtime, which tells whether it was an int3 the runtime put in the game's code or the
+ * single step that followed one. */
+int runtime_count_trap(void *exception_context) {
+    if (!site_count) return 0;
+    PlatformContext context = { (EXCEPTION_POINTERS *)exception_context, NULL };
+    /* The CONTEXT the exception carries. */
+    context.context = ((EXCEPTION_POINTERS *)exception_context)->ContextRecord;
+    const int tid = (int)platform_context_thread_id(&context);
+    int *stepping = stepper_slot(tid, 0);
+    const uint64_t rip = platform_context_rip(&context);
+    /* A single step leaves the trap flag set in the flags: that is how it is told from an
+     * int3 (Windows does not say which one it was). */
+    const int single_step = (platform_context_flags(&context) & TRAP_FLAG) != 0;
+    if (single_step && stepping && *stepping >= 0) {
+        write_byte(sites[*stepping].code, 0xcc);
+        *stepping = -1;
+        platform_context_clear_trap(&context);
+        return 1;
+    }
+    for (int i = 0; i < site_count; ++i) {
+        if ((uint64_t)(uintptr_t)sites[i].code != rip - 1) continue;
+        atomic_fetch_add_explicit(&sites[i].hits, 1, memory_order_relaxed);
+        if (reg_index >= 0 && sites[i].offset == reg_offset) {
+            uint64_t v = platform_context_register(&context, reg_index);
+            if (reg_low) v &= 0xffffffffull;
+            for (int k = 0; k < 16; ++k) {
+                uint64_t seen = atomic_load(&reg_values[k]);
+                if (seen == v + 1) { atomic_fetch_add(&reg_counts[k], 1); break; }
+                if (seen == 0 && atomic_compare_exchange_strong(&reg_values[k], &seen, v + 1)) {
+                    atomic_fetch_add(&reg_counts[k], 1); break;
+                }
+            }
+        }
+        if (trans_key >= 0 && trans_value >= 0 && sites[i].offset == trans_offset) note_transition(&context);
+        if (delay_us && sites[i].offset == delay_offset) platform_sleep_ns((uint64_t)delay_us * 1000ull);
+        write_byte(sites[i].code, sites[i].original);
+        platform_context_set_rip(&context, rip - 1);
+        platform_context_set_trap(&context);
+        if (!stepping) stepping = stepper_slot(tid, 1);
+        if (stepping) *stepping = i;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 void runtime_count_install(unsigned char *image) {
     const char *list = getenv("BB_GUEST_COUNT");
     if (!list || !*list) return;
@@ -297,15 +377,17 @@ void runtime_count_install(unsigned char *image) {
         ++site_count;
         at = end && *end == ',' ? end + 1 : NULL;
     }
+#ifndef _WIN32
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = on_trap;
     action.sa_flags = SA_SIGINFO | SA_RESTART;
     sigemptyset(&action.sa_mask);
     sigaction(SIGTRAP, &action, &previous);
+#endif
     for (int i = 0; i < site_count; ++i) {
         const uintptr_t page = (uintptr_t)sites[i].code & ~(uintptr_t)4095;
-        mprotect((void *)page, 8192, PROT_READ | PROT_WRITE | PROT_EXEC);
+        platform_protect((void *)page, 8192, BB_PROT_READ | BB_PROT_WRITE | BB_PROT_EXEC);
         write_byte(sites[i].code, 0xcc);
     }
     pthread_t thread;

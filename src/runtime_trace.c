@@ -13,14 +13,16 @@
  * run, e.g. one menu choice with BB_IMPORT_TRACE=*). */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "platform.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <sys/mman.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #define MAX_TRACED 4096
 #define THUNK_SIZE 192
@@ -48,9 +50,8 @@ static int listed(const char *list, const char *symbol, int whole) {
 static volatile int gate_open=1;
 static void *gate_watch(void *path) {
     for (;;) {
-        gate_open=access(path,F_OK)==0;
-        struct timespec t={0,100000000};
-        nanosleep(&t,NULL);
+        gate_open=platform_file_exists(path);
+        platform_sleep_ns(100000000ull);
     }
     return NULL;
 }
@@ -115,8 +116,8 @@ uintptr_t runtime_trace_wrap(const char *symbol, uintptr_t target) {
     for (unsigned i=0;i<traced;++i) if (!strcmp(names[i],symbol)) return (uintptr_t)(code+i*THUNK_SIZE);
     if (traced==MAX_TRACED) return target;
     if (!code) {
-        code=mmap(NULL,(size_t)MAX_TRACED*THUNK_SIZE,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-        if (code==MAP_FAILED) { code=NULL; return target; }
+        code=platform_alloc_executable((size_t)MAX_TRACED*THUNK_SIZE);
+        if (!code) return target;
         exit_trampoline=(uintptr_t)runtime_trace_exit_stub;
     }
     const unsigned index=traced++;

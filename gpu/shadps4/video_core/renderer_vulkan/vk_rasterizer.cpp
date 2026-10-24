@@ -1382,8 +1382,8 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
             std::memcpy(flat.data(), snapshot.user_data,
                         std::min(snapshot.user_data_size, snapshot.flat_size) * sizeof(u32));
             // Pointers in the tables may be stale by now: a fault only skips the check.
-            sigjmp_buf recover;
-            if (sigsetjmp(recover, 0)) {
+            BbJumpBuffer recover;
+            if (bb_setjmp(recover)) {
                 runtime_fault_recover = nullptr;
                 continue;
             }

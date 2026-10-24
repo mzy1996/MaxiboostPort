@@ -16,6 +16,8 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import cheats  # same directory
+
 EBOOT_BASE=0x400000
 APP_VERSION='01.15'
 BUILTIN_XML=Path(__file__).resolve().parent.parent/'patches/Maxiboost.xml'
@@ -307,7 +309,7 @@ def compile_patches(xml, names, app_version, segments):
 
 # Third-party patch files (shadPS4/GoldHEN XML) in the data directory's patches/ folder.
 # A file for any retail release applies when it has the same executable (game_check.py).
-GAME_IDS={'CUSA18758'}
+GAME_IDS={'CUSA18758', 'CUSA15006'}
 
 
 def same_app_version(value, app_version):
@@ -351,6 +353,34 @@ def external_selection(found, config):
             if key in enabled or (key not in disabled and meta.get('isEnabled','false').lower()=='true')]
 
 
+def game_title(game_dir):
+    """The title id of the game in the folder (its param.sfo), or None."""
+    try:
+        from prepare import sfo
+        return str(sfo((Path(game_dir)/'sce_sys/param.sfo').read_bytes()).get('TITLE_ID','')) or None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def compile_cheats(path, config, image, title_id=None, app_version=None):
+    """The writes of the JSON cheat table (scripts/cheats.py): the cheats the configuration
+    enables. A table made for another build of the game is reported, not applied."""
+    data=cheats.load(path)
+    if data is None:
+        print(f'Cheats: {path} is not a cheat table',file=sys.stderr)
+        return []
+    try:
+        names=[name for name,_ in cheats.entries(data)]
+        enabled=cheats.enabled_from_config(config,names)
+        writes=cheats.compile_writes(data,enabled,image,title_id,app_version)
+    except cheats.CheatError as error:
+        print(f'Cheats: {error}',file=sys.stderr)
+        return []
+    if writes:
+        print(f'Cheats: {len(writes)} writes from {len(enabled)} cheats of {Path(path).name}')
+    return writes
+
+
 def compile_external(selected, segments):
     """Writes of the selected external patches; a patch with unsupported lines is skipped whole."""
     writes=[]
@@ -375,6 +405,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--patches-dir',type=Path,help='third-party patch XML files (shadPS4 format)')
     p.add_argument('--patches-config',type=Path,help='patches.json: enabled/disabled external patches')
+    p.add_argument('--cheats',type=Path,help='JSON cheat table (scripts/cheats.py)')
+    p.add_argument('--cheats-config',type=Path,help='cheats.json: the enabled cheats')
     p.add_argument('--xml',type=Path,default=BUILTIN_XML)
     p.add_argument('--fps',choices=sorted(FPS_PRESETS),default='60')
     p.add_argument('--extra',default='',help='additional patch names, separated by ";"')
@@ -413,6 +445,11 @@ def main():
         # After the built-in ones: an external patch of the same bytes wins.
         writes+=compile_external(external_selection(external_patches(a.patches_dir,a.app_version,a.xml),
                                                     a.patches_config),segments)
+    if a.cheats:
+        # The JSON cheats (scripts/cheats.py) after the patches: the bytes they write are
+        # checked against the executable, so a table of another build is refused.
+        writes+=compile_cheats(a.cheats,a.cheats_config,boot_image(a.out),
+                                game_title(a.game_dir),a.app_version)
     # BBPATCH2: the patch base, so the loader can rebase pointers the patches write into
     # relocated slots.
     blob=struct.pack('<8sQQ',b'BBPATCH2',EBOOT_BASE,len(writes))

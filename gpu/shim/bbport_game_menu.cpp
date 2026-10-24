@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "host_memory.h"
+#include "host_services.h"
 #include "bbport_game_menu.h"
 
-#include <sys/mman.h>
 #include <unistd.h>
 #include <algorithm>
 #include <array>
@@ -378,7 +379,7 @@ void AddRows(void* page, const std::vector<Row>& rows) {
         }
         if (row.kind == Kind::Toggle) {
             using PairRowFn = void (*)(void*, void*, u8*, void*, const u8*);
-            u8* two = static_cast<u8*>(std::aligned_alloc(16, PairListSize));
+            u8* two = static_cast<u8*>(bb_aligned_alloc(16, PairListSize));
             std::memset(two, 0, PairListSize);
             for (std::size_t i = 0; i < 2; ++i) {
                 alignas(16) u8 value[ValueSize] = {};
@@ -393,7 +394,7 @@ void AddRows(void* page, const std::vector<Row>& rows) {
             DestroyTexts(pair);
             continue;
         }
-        u8* list = static_cast<u8*>(std::aligned_alloc(16, ListSize));
+        u8* list = static_cast<u8*>(bb_aligned_alloc(16, ListSize));
         std::memset(list, 0, ListSize);
         for (std::size_t i = 0; i < row.choices.size(); ++i) {
             if (row.field == Upscaler && !UpscalerAvailable(int(i))) {
@@ -569,9 +570,8 @@ u8* MapNear(unsigned char* image, u64 image_size, std::size_t size) {
     const u64 base = reinterpret_cast<u64>(image);
     for (u64 k = 1; k <= 64; ++k) {
         for (const u64 hint : {base - k * (24ull << 20), base + image_size + k * (24ull << 20)}) {
-            void* p = mmap(reinterpret_cast<void*>(hint), size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-            if (p != MAP_FAILED) {
+            void* p = HostMapAt(reinterpret_cast<void*>(hint), size, HostProtRead | HostProtWrite);
+            if (p) {
                 return static_cast<u8*>(p);
             }
         }
@@ -586,7 +586,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         return;
     }
     image_base = reinterpret_cast<u64>(image);
-    const std::size_t page = std::size_t(sysconf(_SC_PAGESIZE));
+    const std::size_t page = std::size_t(HostPageSize());
     u8* stubs = MapNear(image, size, page);
     if (!stubs) {
         std::printf("Game menu: no memory near the image, the port's pages are off\n");
@@ -615,7 +615,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
                reinterpret_cast<void*>(&LookupHook), reinterpret_cast<void**>(&lookup_original), cursor) &&
         Detour(image, AddPageItem, AddPageItemPrologue, sizeof(AddPageItemPrologue),
                reinterpret_cast<void*>(&AddHook), reinterpret_cast<void**>(&add_original), cursor);
-    mprotect(stubs, page, PROT_READ | PROT_EXEC);
+    Core::MProtect(stubs, page, Core::ProtRead | Core::ProtExec);
     std::printf("Game menu: %s (%zu pages in System)\n", ok ? "the port's pages are in" : "hooks failed, off",
                 pages.size());
 }

@@ -12,9 +12,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/uio.h>
+#include "platform.h"
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #define KERNEL_ENOENT ((int32_t)0x80020002)
 #define KERNEL_ESRCH ((int32_t)0x80020003)
@@ -88,8 +90,7 @@ void runtime_guest_backtrace(FILE *out) {
     uintptr_t rbp=(uintptr_t)__builtin_frame_address(0);
     for (int depth=0; depth<40 && rbp; ++depth) {
         uintptr_t frame[2];
-        struct iovec local={frame,sizeof(frame)}, remote={(void *)rbp,sizeof(frame)};
-        if (process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(frame) || frame[0]<=rbp) break;
+        if (platform_read_memory((void *)rbp,frame,sizeof(frame)) || frame[0]<=rbp) break;
         const UnwindModule *m=unwind_module_at(frame[1]);
         if (m) fprintf(out,"  #%d %s+%#llx\n",depth,m->name,(unsigned long long)(frame[1]-m->start));
         else fprintf(out,"  #%d %#llx\n",depth,(unsigned long long)frame[1]);
@@ -160,10 +161,11 @@ static ABI void cxa_finalize(void *dso) { (void)dso; } /* atexit handlers run at
 typedef struct { int64_t time; uint32_t west_sec, dst_sec; } Timesec;
 typedef struct { int32_t minutes_west, dst_time; } Timezone;
 static void zone(int64_t utc, int32_t *offset, int32_t *dst) {
-    time_t t=(time_t)utc; struct tm local;
-    localtime_r(&t,&local);
-    *dst=local.tm_isdst>0 ? 3600 : 0;
-    *offset=(int32_t)local.tm_gmtoff-*dst;
+    (void)utc;
+    /* The host's offset from the universal time; the daylight saving part is not told apart
+     * here (the host's offset already accounts for it). */
+    *dst=0;
+    *offset=(int32_t)platform_utc_offset_seconds();
 }
 static ABI int32_t utc_to_local(int64_t utc, int64_t *local, Timesec *st, uint64_t *dst_seconds) {
     int32_t offset, dst;

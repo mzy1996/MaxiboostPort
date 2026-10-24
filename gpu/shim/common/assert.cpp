@@ -1,4 +1,12 @@
 // bbport: GPU-side assertion failures stop the port with exit code 23.
+#ifdef _WIN32
+#include <windows.h>
+#define bb_pause() YieldProcessor()
+#else
+#include <unistd.h>
+#define bb_pause() pause()
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -21,7 +29,7 @@ void (*g_assert_speculative_exit)() = nullptr;
 void assert_fail_impl() {
     if (&runtime_restarting && runtime_restarting) {
         for (;;) {
-            pause();
+            bb_pause();
         }
     }
     if (g_assert_speculative_exit) {

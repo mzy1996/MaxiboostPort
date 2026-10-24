@@ -11,8 +11,9 @@
 
 namespace Game {
 namespace {
-/// The retail releases (scripts/game_check.py SUPPORTED_TITLES).
-constexpr const char* Serials[] = {"CUSA18758"};
+/// The retail releases (scripts/game_check.py SUPPORTED_TITLES): the North American one and the
+/// Hong Kong / Chinese deluxe soundtrack edition (豪華原聲版).
+constexpr const char* Serials[] = {"CUSA18758", "CUSA15006"};
 
 /// The view-projection the scene's static geometry is drawn with (64 bytes, row vectors:
 /// clip = (p, 1) * m). Its world is the identity, so view and projection separate: the

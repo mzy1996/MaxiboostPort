@@ -6,13 +6,32 @@
 #pragma once
 
 #include <algorithm>
+#include <thread>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sched.h>
 #include <sys/resource.h>
-#include <thread>
 #include <unistd.h>
+#endif
 
 namespace BbThreads {
 
+#ifdef _WIN32
+/// Hardware threads available to the process.
+inline unsigned Available() {
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return std::max(1u, static_cast<unsigned>(info.dwNumberOfProcessors));
+}
+
+/// The calling thread only runs on otherwise idle cores: Windows has no idle class, so the
+/// thread's priority is lowered to the idle one.
+inline void MakeBackground() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+}
+#else
 /// Hardware threads available to the process.
 inline unsigned Available() {
     cpu_set_t set;
@@ -30,5 +49,6 @@ inline void MakeBackground() {
         setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 19);
     }
 }
+#endif
 
 } // namespace BbThreads

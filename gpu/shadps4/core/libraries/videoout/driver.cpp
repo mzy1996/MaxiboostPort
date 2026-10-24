@@ -12,6 +12,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <unistd.h>
+#include "host_services.h"
 #include "common/assert.h"
 #include "bbport_toggles.h"
 #include "bbport_heap_sites.h"
@@ -352,7 +353,7 @@ static void PrintMemory() {
         }
         std::fclose(statm);
     }
-    const u64 rss = u64(rss_pages) * u64(sysconf(_SC_PAGESIZE));
+    const u64 rss = u64(rss_pages) * u64(HostPageSize());
     const u64 device = BbStats::device_alloc_bytes.load() - BbStats::device_free_bytes.load();
     u64 vma_blocks = 0, vma_used = 0;
     Vulkan::VmaDeviceUsage(vma_blocks, vma_used);
@@ -448,8 +449,9 @@ void VideoOutDriver::Flip(const Request& req) {
         last_twf = twf;
         const u64 copy_ns = BbStats::t_copy.load(), copy_bytes = BbStats::copy_bytes.load();
         u64 proc_flt = 0;
-        if (rusage usage{}; getrusage(RUSAGE_SELF, &usage) == 0) {
-            proc_flt = usage.ru_minflt;
+        if (uint64_t voluntary = 0, involuntary = 0, minor_faults = 0;
+            Core::ThreadCounters(&voluntary, &involuntary, &minor_faults)) {
+            proc_flt = minor_faults;
         }
         const u64 t_now[6] = {BbStats::t_resident.load(), BbStats::t_protect.load(),
                               BbStats::t_image_create.load(), BbStats::t_refresh.load(),

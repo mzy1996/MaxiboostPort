@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <shlobj.h>
 #include <fstream>
 #include <unordered_map>
 #include "common/logging/log.h"
@@ -102,9 +103,14 @@ static auto UserPaths = [] {
             user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadPS4";
         }
 #elif _WIN32
-        TCHAR appdata[MAX_PATH] = {0};
-        SHGetFolderPath(NULL, CSIDL_APPDATA, NULL, 0, appdata);
-        user_dir = std::filesystem::path(appdata) / "shadPS4";
+        // The user's roaming application data (the known folder's API; the shell's helper
+        // needs the shell library, which the port does not link).
+        PWSTR appdata = nullptr;
+        user_dir = std::filesystem::path(getenv("LOCALAPPDATA") ? getenv("LOCALAPPDATA") : ".") / "shadPS4";
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &appdata))) {
+            user_dir = std::filesystem::path(appdata) / "shadPS4";
+            CoTaskMemFree(appdata);
+        }
 #endif
     }
 

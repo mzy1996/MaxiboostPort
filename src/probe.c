@@ -7,6 +7,8 @@
 #include <inttypes.h>
 #include <cpuid.h>
 #include "runtime.h"
+#include "asm.h"
+#include "platform.h"
 #include "gpu/bbgpu.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
@@ -28,6 +30,11 @@
 #include <sys/prctl.h>
 #endif
 
+#ifdef _WIN32
+/* The single-step counter's trap (the Windows build counts the int3s in the exception
+ * handler, not in a signal handler). */
+int runtime_count_trap(void *exception_context);
+#endif
 typedef struct { uint64_t address, size, flags; } Segment;
 typedef struct { uint64_t target, kind, value, addend; } Reloc;
 static char (*names)[128];
@@ -129,14 +136,12 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     fflush(NULL);
     _exit(20); /* no destructors: GPU, audio and guest threads are still running */
 }
-#ifndef _WIN32
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
-__asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
+__asm__(BB_ASM_TEXT BB_ASM_GLOBAL("enter_on_stack") "enter_on_stack:\n"
         " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
         " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
-#endif
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
 #ifndef _WIN32
 /* BB_FAULT_WAIT=1: a fatal fault or a GPU-library assertion leaves the process alive, stopped
@@ -157,6 +162,119 @@ void bb_fault_wait(const char *what) {
     }
     for (;;) pause();
 }
+#else
+#define BB_FAULT_WAIT_UNAVAILABLE 1
+#endif
+/* The fault report, shared by both hosts: the guest's offset, the registers, the thread and the
+ * host's call chain. The context is the host's own (a ucontext on Linux, a CONTEXT on
+ * Windows); the address is the one the fault was about. */
+void bb_fault_wait(const char *what);
+static void report_fault(void *context, void *fault_address, int sig) {
+    PlatformContext uc = { context };
+    const uintptr_t rip = (uintptr_t)platform_context_rip(&uc);
+    char line[512];
+    char module[256] = {0};
+    uint64_t module_offset = 0;
+    const int in_module = platform_symbol_of((void *)rip, module, sizeof(module), &module_offset);
+    if (rip - (uintptr_t)image < 0x10000000)
+        snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p\n",
+                 sig, (unsigned long)(rip - (uintptr_t)image), fault_address);
+    else if (in_module)
+        snprintf(line, sizeof(line), "Host fault (signal %d) in %s+0x%lx, address %p\n", sig, module,
+                 (unsigned long)module_offset, fault_address);
+    else
+        snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, fault_address);
+    platform_write_stdout(line, strlen(line));
+    /* The thread, its stack pointer and the stack's host mapping: a stack overflow shows as a
+     * fault just below the mapping that holds rsp. */
+    {
+        char thread[32] = "?";
+        platform_thread_name_get(thread, sizeof(thread));
+        const uintptr_t rsp = (uintptr_t)platform_context_stack(&uc);
+        snprintf(line, sizeof(line), "  thread %s, rsp %p, rbp %p; stack mapping: ", thread, (void *)rsp,
+                 (void *)(uintptr_t)platform_context_frame(&uc));
+        platform_write_stdout(line, strlen(line));
+        char mapping[512];
+        if (platform_mapping_of((void *)rsp, mapping, sizeof(mapping)) && mapping[0]) {
+            platform_write_stdout(mapping, strlen(mapping));
+        } else {
+            platform_write_stdout("none\n", 5);
+        }
+    }
+    snprintf(line, sizeof(line),
+             "  rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx r12 %llx r13 %llx r14 %llx r15 %llx\n",
+             (unsigned long long)platform_context_register(&uc, 0), (unsigned long long)platform_context_register(&uc, 3),
+             (unsigned long long)platform_context_register(&uc, 1), (unsigned long long)platform_context_register(&uc, 2),
+             (unsigned long long)platform_context_register(&uc, 6), (unsigned long long)platform_context_register(&uc, 7),
+             (unsigned long long)platform_context_register(&uc, 12), (unsigned long long)platform_context_register(&uc, 13),
+             (unsigned long long)platform_context_register(&uc, 14), (unsigned long long)platform_context_register(&uc, 15));
+    platform_write_stdout(line, strlen(line));
+    /* Outside the image and any shared object (generated code, a freed mapping): the mapping
+     * the address is in, and the thread. */
+    if (rip - (uintptr_t)image >= 0x10000000 && !in_module) {
+        char thread[32] = "?";
+        platform_thread_name_get(thread, sizeof(thread));
+        snprintf(line, sizeof(line), "  thread %s; mapping of RIP: ", thread);
+        platform_write_stdout(line, strlen(line));
+        char mapping[512];
+        if (platform_mapping_of((void *)rip, mapping, sizeof(mapping)) && mapping[0]) {
+            platform_write_stdout(mapping, strlen(mapping));
+        } else {
+            platform_write_stdout("none\n", 5);
+        }
+    }
+    /* Host call chain (frames with unwind info; guest frames end it). */
+    void *frames[32];
+    int depth = platform_backtrace(frames, 32);
+    for (int i = 2; i < depth; ++i) {
+        char frame_module[256] = {0};
+        uint64_t frame_offset = 0;
+        if (platform_symbol_of(frames[i], frame_module, sizeof(frame_module), &frame_offset))
+            snprintf(line, sizeof(line), "  #%d %s+0x%lx\n", i, frame_module, (unsigned long)frame_offset);
+        else
+            snprintf(line, sizeof(line), "  #%d %p\n", i, frames[i]);
+        platform_write_stdout(line, strlen(line));
+    }
+    snprintf(line, sizeof(line), "fault (signal %d)", sig);
+    bb_fault_wait(line);
+    _exit(128 + sig);
+}
+#ifdef _WIN32
+/* The Windows build has no signals: the vectored exception handler sees the access violations,
+ * the illegal instructions and the breakpoints the runtime and the game cause. */
+void bb_fault_wait(const char *what) {
+    /* There is no debugger to attach to on Windows: the process stops with the fault's report. */
+    (void)what;
+}
+static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
+    const DWORD code = exception->ExceptionRecord->ExceptionCode;
+    if (code!=EXCEPTION_ACCESS_VIOLATION && code!=EXCEPTION_IN_PAGE_ERROR &&
+        code!=EXCEPTION_ILLEGAL_INSTRUCTION && code!=EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code!=EXCEPTION_PRIV_INSTRUCTION && code!=EXCEPTION_STACK_OVERFLOW) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    /* The guest's code is counted first (the single-step counter's int3s). */
+    if (runtime_count_trap(exception)) return EXCEPTION_CONTINUE_EXECUTION;
+    /* GPU page tracking (write-protected guest pages) is resolved next. */
+    PlatformContext uc = { exception, exception->ContextRecord };
+    if (gpu_enabled && bbgpu_handle_fault(exception, (void *)platform_context_fault_address(&uc)))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
+    if (runtime_fault_recover) {
+#ifdef _WIN32
+        runtime_jmp_buf *recover = runtime_fault_recover;
+        runtime_fault_recover = NULL;
+        longjmp(*recover, 1);
+#else
+        sigjmp_buf *recover = runtime_fault_recover;
+        runtime_fault_recover = NULL;
+        siglongjmp(*recover, 1);
+#endif
+    }
+    report_fault(exception, (void *)platform_context_fault_address(&uc), (int)code);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
 /* BB_CPU_WATCH=<image offset>[:<length>] (diagnostics): the game's code that writes those bytes of
  * its image (data, bss). Their page is write-protected; a write anywhere in it is let through by
  * single-stepping that one instruction (the page is closed again after it); writes into the range
@@ -164,12 +282,14 @@ void bb_fault_wait(const char *what) {
 static unsigned char *cpu_watch_page;
 static uintptr_t cpu_watch_lo, cpu_watch_hi;
 static _Atomic int cpu_watch_hits;
+#ifndef _WIN32
 static void cpu_watch_step(int sig, siginfo_t *info, void *context) {
     (void)sig; (void)info;
     ucontext_t *uc = context;
     uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
     mprotect(cpu_watch_page, 4096, PROT_READ);
 }
+#endif
 static void cpu_watch_install(void) {
     const char *env = getenv("BB_CPU_WATCH");
     if (!env || !*env) return;
@@ -179,12 +299,15 @@ static void cpu_watch_install(void) {
     cpu_watch_lo = (uintptr_t)(image + at); cpu_watch_hi = cpu_watch_lo + length;
     cpu_watch_page = image + (at & ~0xfffull);
     { extern uintptr_t runtime_cpu_watch_lo, runtime_cpu_watch_hi; runtime_cpu_watch_lo = cpu_watch_lo; runtime_cpu_watch_hi = cpu_watch_hi; }
+#ifndef _WIN32
     struct sigaction step = {0};
     step.sa_sigaction = cpu_watch_step; step.sa_flags = SA_SIGINFO;
     sigaction(SIGTRAP, &step, NULL);
-    mprotect(cpu_watch_page, 4096, PROT_READ);
+#endif
+    platform_protect(cpu_watch_page, 4096, BB_PROT_READ);
     printf("CPU watch: writes to image+%#llx (%llu bytes)\n", at, length);
 }
+#ifndef _WIN32
 static void fault(int sig, siginfo_t *info, void *context) {
     if (cpu_watch_page && sig == SIGSEGV && (unsigned char *)info->si_addr >= cpu_watch_page &&
         (unsigned char *)info->si_addr < cpu_watch_page + 4096) {
@@ -214,86 +337,8 @@ static void fault(int sig, siginfo_t *info, void *context) {
         pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
         siglongjmp(*recover, 1);
     }
-    /* The process is terminating: dladdr/snprintf are acceptable here. */
-    ucontext_t *uc = context;
-    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
-    char line[512];
-    Dl_info where;
-    if (rip - (uintptr_t)image < 0x10000000)
-        snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p\n",
-                 sig, (unsigned long)(rip - (uintptr_t)image), info->si_addr);
-    else if (dladdr((void *)rip, &where) && where.dli_fname)
-        snprintf(line, sizeof(line), "Host fault (signal %d) in %s+0x%lx (%s), address %p\n", sig, where.dli_fname,
-                 (unsigned long)(rip - (uintptr_t)where.dli_fbase), where.dli_sname ? where.dli_sname : "?", info->si_addr);
-    else
-        snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
-    { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-    /* The thread, its stack pointer and the stack's host mapping: a stack overflow shows as a
-     * fault just below the mapping that holds rsp. */
-    {
-        char thread[32] = "?";
-        pthread_getname_np(pthread_self(), thread, sizeof(thread));
-        uintptr_t rsp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
-        snprintf(line, sizeof(line), "  thread %s, rsp %p, rbp %p; stack mapping: ", thread, (void *)rsp,
-                 (void *)(uintptr_t)uc->uc_mcontext.gregs[REG_RBP]);
-        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-        FILE *maps = fopen("/proc/self/maps", "r");
-        int found = 0;
-        while (maps && fgets(line, sizeof(line), maps)) {
-            unsigned long from, to;
-            if (sscanf(line, "%lx-%lx", &from, &to) == 2 && rsp >= from && rsp < to) {
-                ssize_t written_=write(2, line, strlen(line)); (void)written_; found = 1; break;
-            }
-        }
-        if (maps) fclose(maps);
-        if (!found) { ssize_t written_=write(2, "none\n", 5); (void)written_; }
-    }
-    {
-        const greg_t *g = uc->uc_mcontext.gregs;
-        snprintf(line, sizeof(line), "  rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx r12 %llx r13 %llx r14 %llx r15 %llx\n",
-                 (unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX],
-                 (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI],
-                 (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14],
-                 (unsigned long long)g[REG_R15]);
-        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-    }
-    if (gpu_enabled) bbgpu_dump_guest_writes(context);
-    /* Outside the image and any shared object (generated code, a freed mapping): the mapping
-     * from /proc/self/maps, and the thread. */
-    if (rip - (uintptr_t)image >= 0x10000000 && !(dladdr((void *)rip, &where) && where.dli_fname)) {
-        char thread[32] = "?";
-        pthread_getname_np(pthread_self(), thread, sizeof(thread));
-        snprintf(line, sizeof(line), "  thread %s; mapping of RIP: ", thread);
-        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-        FILE *maps = fopen("/proc/self/maps", "r");
-        int found = 0;
-        while (maps && fgets(line, sizeof(line), maps)) {
-            unsigned long from, to;
-            if (sscanf(line, "%lx-%lx", &from, &to) == 2 && rip >= from && rip < to) {
-                ssize_t written_=write(2, line, strlen(line)); (void)written_;
-                found = 1;
-                break;
-            }
-        }
-        if (maps) fclose(maps);
-        if (!found) { ssize_t written_=write(2, "none\n", 5); (void)written_; }
-    }
-    /* Host call chain (frames with unwind info; guest frames end it). */
-    void *frames[32];
-    int depth = backtrace(frames, 32);
-    for (int i = 2; i < depth; ++i) {
-        if (dladdr(frames[i], &where) && where.dli_fname)
-            snprintf(line, sizeof(line), "  #%d %s+0x%lx (%s)\n", i, where.dli_fname,
-                     (unsigned long)((uintptr_t)frames[i] - (uintptr_t)where.dli_fbase), where.dli_sname ? where.dli_sname : "?");
-        else
-            snprintf(line, sizeof(line), "  #%d %p\n", i, frames[i]);
-        ssize_t written_=write(2, line, strlen(line)); (void)written_;
-    }
-    snprintf(line, sizeof(line), "fault (signal %d)", sig);
-    bb_fault_wait(line);
-    _exit(128 + sig);
+    report_fault(context, info->si_addr, sig);
 }
-#endif
 /* Watchdog: dump RIP and the rbp frame chain of every thread (guest offsets
  * when inside the image). Reads use process_vm_readv so bad frames cannot fault. */
 static uintptr_t exe_base;
@@ -368,6 +413,7 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     usleep(100000);
     _exit(128 + sig);
 }
+#endif
 /* param.sfo lookup: string or integer value of key, 0 when absent. */
 static int sfo_value(const char *path, const char *key, char *text, size_t text_size, uint32_t *number) {
     FILE *f=fopen(path,"rb");
@@ -461,6 +507,22 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
+    /* The launcher's controls page: the input devices that are there, and the buttons of
+     * one of them. The GPU library reads the pads, so it is asked. */
+    if (argc >= 2 && !strcmp(argv[1], "--input-devices")) {
+        char buffer[64*512];
+        const int length=bbgpu_input_devices(buffer,sizeof buffer);
+        if (length<0) return 1;
+        fwrite(buffer,1,(size_t)length,stdout);
+        return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--input-buttons")) {
+        char buffer[4096];
+        const int length=bbgpu_input_buttons(argv[2],buffer,sizeof buffer);
+        if (length<0) return 1;
+        fwrite(buffer,1,(size_t)length,stdout);
+        return 0;
+    }
     check_cpu();
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
@@ -507,6 +569,9 @@ int main(int argc, char **argv) {
     bbgpu_register_kernel();
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
+    /* The fault handler: the vectored exception handler sees the access violations, the illegal
+     * instructions and the breakpoints before the process is torn down. */
+    AddVectoredExceptionHandler(1, fault_handler);
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;

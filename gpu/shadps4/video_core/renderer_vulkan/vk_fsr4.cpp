@@ -230,7 +230,6 @@ struct Fsr4Upscaler::Impl {
             .restoreLayout = VK_IMAGE_LAYOUT_GENERAL,
             .restoreStageMask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             .restoreAccessMask = access,
-            .aspectMask = aspect,
         };
         return ffxFsr4VkSetExternalImageState(&backend, &state);
     }

@@ -28,6 +28,21 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
+//
+// The assembler's dialect differs between the two targets: ELF knows ".hidden" (the symbol
+// stays out of the dynamic table) and ".previous" (back to the section the compiler left),
+// while the COFF assembler of Windows knows neither. There the symbol is simply global (the
+// DLL's exports are listed by hand) and ".text" takes the place of ".previous".
+#if defined(_WIN32)
+asm(".section .rodata\n"
+    ".balign 16\n"
+    ".global bb_font_ttf\n"
+    "bb_font_ttf:\n"
+    ".incbin \"" BB_FONT_PATH "\"\n"
+    ".global bb_font_ttf_end\n"
+    "bb_font_ttf_end:\n"
+    ".text\n");
+#else
 asm(".section .rodata\n"
     ".balign 16\n"
     ".hidden bb_font_ttf\n"
@@ -38,6 +53,7 @@ asm(".section .rodata\n"
     ".global bb_font_ttf_end\n"
     "bb_font_ttf_end:\n"
     ".previous\n");
+#endif
 extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include "host_services.h"
 #include "bbport_toggles.h"
 #include "bblayer_write_traps.h"
 #include "common/assert.h"
@@ -18,10 +19,8 @@
 #include <atomic>
 #include <cstdio>
 #include <sys/uio.h>
-#include <dlfcn.h>
 #include <string>
 #include <fmt/format.h>
-#include <ucontext.h>
 #include <unistd.h>
 #include "core/signals.h"
 #include "video_core/page_manager.h"
@@ -49,6 +48,7 @@
 #include <sys/syscall.h>
 #else
 #include "common/spin_lock.h"
+using namespace Core;
 #endif
 
 extern "C" void runtime_memory_set_write_watch(uintptr_t address, uint64_t size, int watch);
@@ -81,12 +81,10 @@ std::string SiteName(u64 key) {
         return fmt::format("{}+{:#x}", access, key);
     }
     const u64 address = key & ~HostSite;
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<void*>(address), &info) && info.dli_sname) {
-        return fmt::format("{}host:{}+{:#x}", access, info.dli_sname, address - u64(info.dli_saddr));
-    }
-    if (info.dli_fname) {
-        return fmt::format("{}host:{}+{:#x}", access, info.dli_fname, address - u64(info.dli_fbase));
+    char module[512] = "?";
+    uint64_t offset = 0;
+    if (SymbolOf(reinterpret_cast<void*>(address), module, sizeof(module), &offset)) {
+        return fmt::format("{}host:{}+{:#x}", access, module, offset);
     }
     return fmt::format("{}host:{:#x}", access, address);
 }
@@ -103,16 +101,14 @@ struct ImageFaultSite {
 std::array<ImageFaultSite, 256> image_fault_sites;
 
 void NoteFaultSite(void* context, VAddr address) {
-    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
+    const u64 rip = ContextRip(context);
     current_fault_rip = 0;
-    const u64 rip = u64(g[REG_RIP]);
     const bool guest_code = rip >= GuestImage && rip < GuestImageEnd;
     u64 caller = 0;
     if (guest_code) {
         // The caller: [rbp + 8] when the guest code keeps frames (its memcpy-like leaves do not).
         u64 saved[2] = {};
-        iovec local{saved, sizeof(saved)}, remote{reinterpret_cast<void*>(g[REG_RBP]), sizeof(saved)};
-        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(sizeof(saved)) &&
+        if (Core::ReadStack(reinterpret_cast<void*>(ContextRbp(context)), saved, sizeof(saved)) &&
             saved[1] >= GuestImage && saved[1] < GuestImageEnd) {
             caller = saved[1];
         }
@@ -120,10 +116,11 @@ void NoteFaultSite(void* context, VAddr address) {
         // Host code (a libc import the port runs natively, the runtime): the first guest return
         // address on the stack is its guest caller.
         std::array<u64, 64> stack{};
-        iovec local{stack.data(), sizeof(stack)},
-            remote{reinterpret_cast<void*>(g[REG_RSP]), sizeof(stack)};
-        const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-        for (ssize_t i = 0; i < got / 8; ++i) {
+        const size_t got = Core::ReadStack(reinterpret_cast<void*>(ContextRsp(context)),
+                                            stack.data(), sizeof(stack))
+                               ? sizeof(stack)
+                               : 0;
+        for (size_t i = 0; i < got / 8; ++i) {
             if (stack[i] >= GuestImage && stack[i] < GuestImageEnd) {
                 caller = stack[i];
                 break;
@@ -320,7 +317,7 @@ struct PageManager::Impl {
         }
         if (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::QueryReads) {
             return rasterizer->OnOcclusionPageAccess(
-                addr, u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]),
+                addr, u64(ContextRip(context)),
                 Common::IsWriteError(context), is_gpu_thread);
         }
         if (Common::IsWriteError(context)) {
@@ -335,7 +332,7 @@ struct PageManager::Impl {
             BbStats::Timer timer{BbStats::t_write_faults};
             const bool handled = rasterizer->OnWriteFault(
                 addr, is_gpu_thread,
-                u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]));
+                u64(ContextRip(context)));
             current_fault_rip = 0;
             return handled;
         } else {
@@ -489,9 +486,8 @@ struct PageManager::Impl {
     template <bool track>
     void UpdateImageTraps(VAddr addr, u64 size) {
         std::call_once(image_watchers_once, [this] {
-            void* mem = mmap(nullptr, NUM_ADDRESS_PAGES * sizeof(u16), PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-            ASSERT_MSG(mem != MAP_FAILED, "image watcher table");
+            void* mem = HostAllocate(NUM_ADDRESS_PAGES * sizeof(u16));
+            ASSERT_MSG(mem != nullptr, "image watcher table");
             image_watchers = static_cast<u16*>(mem);
         });
         size_t page = addr >> PM_PAGE_BITS;

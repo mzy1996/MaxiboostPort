@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#include <cstdlib>
+#endif
+
 #include "bbport_write_log.h"
 #include "bbport_game_menu.h"
 #include "bbport_gnm_hooks.h"
@@ -274,7 +278,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     StartProfileWriter();
 #endif
     g_sdk_version = config->sdk_version;
-    if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
+    if (config->user_dir) HostSetEnv("BB_GPU_USER_DIR", config->user_dir, 0);
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "MAXIBOOST ON";
     const s32 width = config->width, height = config->height;
@@ -386,6 +390,130 @@ extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
 
 extern "C" unsigned bbgpu_symbol_count(void) {
     return unsigned(g_symbols.size());
+}
+
+/* The architecture of a pad: an Xbox pad is read through XInput, the others through
+ * DirectInput (SDL's own driver for them). The launcher shows it, so that the person
+ * knows which of the two their pad is.
+ *
+ * SDL gives the XInput pads the GUID that starts with "03000000" (the bus number of the
+ * XInput controller is 0x03, and the vendor is Microsoft's 0x045E); the DirectInput ones
+ * have the HID's bus. The name is a second hint: SDL calls the pads it reads through
+ * XInput "XInput ...". */
+static const char* pad_architecture(const char* guid, const char* name) {
+    if (guid && strncmp(guid, "03000000", 8) == 0) {
+        return "xinput";
+    }
+    if (name && (strstr(name, "XInput") != nullptr || strstr(name, "Xbox") != nullptr)) {
+        return "xinput";
+    }
+    return "directinput";
+}
+
+/* The input devices the launcher shows (the controls page). The SDL that reads the pads
+ * is here, so the list is built here too; the launcher asks before the game starts, and
+ * the runtime opens the pads afterwards. */
+extern "C" int bbgpu_input_devices(char* buffer, int size) {
+    if (!buffer || size <= 0) return 0;
+    buffer[0] = '\0';
+    /* The gamepads are read with SDL; the subsystem is started on its own (the video one
+     * is the window's, and there is no window yet). */
+    if (!SDL_WasInit(SDL_INIT_GAMEPAD)) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
+        if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+            /* No gamepad subsystem: the keyboard is still an input. */
+            const int length = snprintf(buffer, size, "keyboard\t\tKeyboard\t\n");
+            return length > 0 ? length : 0;
+        }
+    }
+    int written = 0;
+    int count = 0;
+    if (SDL_JoystickID* ids = SDL_GetJoysticks(&count)) {
+        /* A pad that is read through two drivers (the Xbox one is seen by the XInput and
+         * the DirectInput drivers) is listed once: the launcher shows the devices, not the
+         * drivers. */
+        std::vector<std::string> seen;
+        for (int i = 0; i < count; ++i) {
+            const SDL_JoystickID id = ids[i];
+            char guid[64] = {0};
+            SDL_GUIDToString(SDL_GetJoystickGUIDForID(id), guid, sizeof(guid));
+            const char* name = SDL_GetJoystickNameForID(id);
+            bool duplicate = false;
+            for (const std::string& guid_seen : seen) {
+                if (guid_seen == guid) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            seen.emplace_back(guid);
+            const int length = snprintf(buffer + written, size - written, "pad\t%s\t%s\t%s\n",
+                                        guid, name ? name : "",
+                                        pad_architecture(guid, name));
+            if (length <= 0 || written + length >= size) break;
+            written += length;
+        }
+        SDL_free(ids);
+    }
+    /* The keyboard is always there: a person with only a keyboard plays too. */
+    const int length = snprintf(buffer + written, size - written, "keyboard\t\tKeyboard\t\n");
+    if (length > 0 && written + length < size) written += length;
+    return written;
+}
+
+/* The buttons a gamepad has, in the names the runtime's configuration uses (SDL's). */
+extern "C" int bbgpu_input_buttons(const char* guid_text, char* buffer, int size) {
+    if (!buffer || size <= 0) return 0;
+    buffer[0] = '\0';
+    if (!SDL_WasInit(SDL_INIT_GAMEPAD)) {
+        if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) return 0;
+    }
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetJoysticks(&count);
+    if (!ids) return 0;
+    int written = 0;
+    for (int i = 0; i < count; ++i) {
+        char guid[64] = {0};
+        SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, sizeof(guid));
+        if (guid_text && *guid_text && strcmp(guid, guid_text) != 0) continue;
+        /* The buttons of the gamepad, as the runtime's configuration names them. The
+         * names are the ones SDL knows; the ones the pad does not have are left out (a
+         * pad without a touch surface has no "touchpad"). */
+        static const char* const names[] = {
+            "a", "b", "x", "y", "back", "guide", "start", "leftstick", "rightstick",
+            "leftshoulder", "rightshoulder", "dpup", "dpdown", "dpleft", "dpright",
+            "touchpad", "misc1", "paddle1", "paddle2", "paddle3", "paddle4",
+            "lefttrigger", "righttrigger",
+        };
+        SDL_Gamepad* gamepad = SDL_GetGamepadFromID(ids[i]);
+        for (const char* name : names) {
+            const SDL_GamepadButton button = SDL_GetGamepadButtonFromString(name);
+            if (button == SDL_GAMEPAD_BUTTON_INVALID) continue;
+            /* The pad has the button when SDL says so; when the pad is not opened as a
+             * gamepad (the gamepad subsystem is not started yet), the button is taken as
+             * it is: a binding that names a button the pad does not have never fires. */
+            if (gamepad && !SDL_GamepadHasButton(gamepad, button)) continue;
+            const int length = snprintf(buffer + written, size - written, "%s%s",
+                                        written ? "," : "", name);
+            if (length <= 0 || written + length >= size) break;
+            written += length;
+        }
+        /* The triggers are axes, not buttons; the runtime takes them as buttons, so they
+         * are named as well. SDL does not say whether a pad has them (a pad without
+         * triggers has no axis at that place), and a binding that names a button the pad
+         * does not have simply never fires - the person can change it on the page. */
+        {
+            for (const char* name : {"lefttrigger", "righttrigger"}) {
+                const int length = snprintf(buffer + written, size - written, "%s%s",
+                                            written ? "," : "", name);
+                if (length <= 0 || written + length >= size) break;
+                written += length;
+            }
+        }
+        break;
+    }
+    SDL_free(ids);
+    return written;
 }
 
 // Kernel service thread: runs boost::asio timers for equeue timer events.

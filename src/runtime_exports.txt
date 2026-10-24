@@ -1,0 +1,42 @@
+# The runtime symbols the GPU library (bbgpu.dll) calls.
+#
+# The runtime (bb-probe.exe) exports them (tools/runtime_exports.py turns this list into the
+# module definition file the linker needs); the GPU library imports them. On Linux the same
+# sharing is done by the dynamic linker (the runtime is linked with -rdynamic).
+runtime_disabled_optimizations
+runtime_errno
+runtime_experiment_bits
+runtime_fault_recover
+runtime_file_translate
+runtime_heap_growths
+runtime_memory_backing_pointer
+runtime_memory_clamp
+runtime_memory_direct_phys
+runtime_memory_generation
+runtime_memory_gpu_protect
+runtime_memory_note_write
+runtime_memory_read_backing
+runtime_memory_region
+runtime_memory_resolve
+runtime_memory_restore_access
+runtime_memory_set_cpu_write_hook
+runtime_memory_set_gpu_hooks
+runtime_memory_set_guest_chunk_allocator
+runtime_memory_set_guest_chunk_whole
+runtime_memory_set_note_write_hook
+runtime_memory_set_write_watch
+runtime_memory_trap
+runtime_memory_trap_reasons
+runtime_memory_vma_info
+runtime_memory_write_backing
+runtime_neo_mode
+runtime_process_time_counter
+runtime_process_time_us
+runtime_restart
+runtime_restarting
+runtime_sleep_stats
+runtime_thread_attach_host
+runtime_tsc_frequency
+runtime_wait_report
+bbgpu_input_devices
+bbgpu_input_buttons
