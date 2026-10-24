@@ -1,13 +1,39 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+#include <cstring>
+#ifdef _WIN32
+#include <string.h>
+#define strncasecmp _strnicmp
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <string.h>
+#define strncasecmp _strnicmp
+#endif
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "sdl_window.h"
 #include "bbport_overlay.h"
+namespace {
+/// The case-insensitive search of a substring (the C library's is a GNU extension).
+bool bb_strcasestr(const char* haystack, const char* needle) {
+    if (!haystack || !needle || !*needle) {
+        return false;
+    }
+    const size_t length = strlen(needle);
+    for (const char* at = haystack; *at; ++at) {
+        if (!strncasecmp(at, needle, length)) {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+
 
 namespace Frontend {
 
@@ -32,7 +58,7 @@ SDL_DisplayID ChooseDisplay() {
         } else {
             for (int i = 0; i < count && !chosen; ++i) {
                 const char* name = SDL_GetDisplayName(ids[i]);
-                if (name && strcasestr(name, wanted)) {
+                if (name && bb_strcasestr(name, wanted)) {
                     chosen = ids[i];
                 }
             }
@@ -108,6 +134,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         window_info.type = WindowSystemType::Wayland;
         window_info.display_connection = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr);
         window_info.render_surface = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr);
+    } else if (driver && !std::strcmp(driver, "windows")) {
+        // The Vulkan surface is created from the window's handle (vk_platform.cpp has the
+        // VK_USE_PLATFORM_WIN32_KHR branch).
+        window_info.type = WindowSystemType::Windows;
+        window_info.render_surface = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
     } else {
         UNREACHABLE_MSG("Unsupported SDL video driver {}", driver ? driver : "(none)");
     }

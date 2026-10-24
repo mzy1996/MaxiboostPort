@@ -4,6 +4,9 @@
 #include <array>
 #include <atomic>
 #include <csetjmp>
+#ifndef _WIN32
+#include <csignal>
+#endif
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -12,7 +15,18 @@ extern "C" std::uint64_t runtime_disabled_optimizations;
 /// Temporary experiment bits: the second number in BB_TOGGLE_FILE (runtime_memory.c).
 extern "C" std::uint64_t runtime_experiment_bits;
 /// Recovery point for speculative guest memory reads on this thread (runtime_memory.c).
-extern "C" __thread sigjmp_buf* runtime_fault_recover;
+/// The type is the runtime's (src/runtime.h): on Windows the plain jump buffer, on Linux the
+/// signal-aware one. The GPU library and the runtime share it.
+#ifdef _WIN32
+using BbJumpBuffer = jmp_buf;
+#define bb_setjmp(buffer) setjmp(buffer)
+#define bb_longjmp(buffer, value) longjmp(buffer, value)
+#else
+using BbJumpBuffer = sigjmp_buf;
+#define bb_setjmp(buffer) sigsetjmp(buffer, 0)
+#define bb_longjmp(buffer, value) siglongjmp(buffer, value)
+#endif
+extern "C" __thread BbJumpBuffer* runtime_fault_recover;
 
 namespace BbToggle {
 enum : std::uint64_t {

@@ -16,11 +16,12 @@
  * like the PS4's thread stacks) the first time it runs. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "asm.h"
+#include "platform.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 
 #define FIBER_ERROR_NULL ((int32_t)0x80590001)
 #define FIBER_ERROR_ALIGNMENT ((int32_t)0x80590002)
@@ -78,9 +79,9 @@ static __attribute__((noinline)) ThreadFibers *here(void) {
 void fiber_swap(void **save, void *next);
 void fiber_start(void);
 __asm__(
-    ".text\n"
-    ".globl fiber_swap\n"
-    ".type fiber_swap,@function\n"
+    BB_ASM_TEXT
+    BB_ASM_GLOBAL("fiber_swap")
+    BB_ASM_TYPE("fiber_swap")
     "fiber_swap:\n"
     "    pushq %rbp\n"
     "    pushq %rbx\n"
@@ -103,15 +104,15 @@ __asm__(
     "    popq %rbx\n"
     "    popq %rbp\n"
     "    ret\n"
-    ".size fiber_swap,.-fiber_swap\n"
+    BB_ASM_SIZE("fiber_swap")
     /* First entry into a fiber: fiber_swap's ret lands here on the fiber's fresh stack. */
-    ".globl fiber_start\n"
-    ".type fiber_start,@function\n"
+    BB_ASM_GLOBAL("fiber_start")
+    BB_ASM_TYPE("fiber_start")
     "fiber_start:\n"
     "    andq $-16,%rsp\n"
     "    call fiber_main\n"
     "    ud2\n"
-    ".size fiber_start,.-fiber_start\n");
+    BB_ASM_SIZE("fiber_start"));
 
 __attribute__((used, noreturn)) void fiber_main(void) {
     ThreadFibers *t=here();
@@ -128,7 +129,7 @@ static void *first_frame(Fiber *fiber) {
     if (fiber->context) top=fiber->context+fiber->context_size;
     else {
         if (!fiber->own_stack) {
-            fiber->own_stack=runtime_low_map(OWN_STACK,PROT_READ|PROT_WRITE);
+            fiber->own_stack=runtime_low_map(OWN_STACK,BB_PROT_READ|BB_PROT_WRITE);
             if (!fiber->own_stack) { fputs("STOP: no memory for a fiber stack\n",stderr); exit(23); }
         }
         top=fiber->own_stack+OWN_STACK;
@@ -186,7 +187,7 @@ static ABI int32_t fiber_finalize(Fiber *fiber) {
     if (!valid(fiber)) return FIBER_ERROR_INVALID;
     uint32_t idle=STATE_IDLE;
     if (!atomic_compare_exchange_strong(&fiber->state,&idle,STATE_TERMINATED)) return FIBER_ERROR_STATE;
-    if (fiber->own_stack) { munmap(fiber->own_stack,OWN_STACK); fiber->own_stack=NULL; }
+    if (fiber->own_stack) { platform_mapping_unmap(fiber->own_stack,OWN_STACK); fiber->own_stack=NULL; }
     return 0;
 }
 

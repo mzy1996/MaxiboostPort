@@ -57,6 +57,7 @@ import game_check  # noqa: E402
 import save_import  # noqa: E402
 from patches import APP_VERSION as PATCH_APP_VERSION, BUILTIN_XML, FPS_PRESETS  # noqa: E402
 from patches import EFFECTS as PATCH_EFFECTS, external_patches  # noqa: E402
+import cheats  # noqa: E402
 import trophies  # noqa: E402
 # Packaged (AppImage): generated files, saves and bbport.ini live in BB_DATA_DIR.
 PACKAGED = bool(os.environ.get("BB_PREBUILT"))
@@ -150,9 +151,12 @@ PREUPLOAD = [("Обычная", "", "Без лишней видеопамяти"
 
 def default_game_dir():
     """From a checkout: the dump beside it or inside it (gitignored), else where run.sh looks."""
-    # CUSA18758-full: the base game with the 1.15 update hardlinked over it (the README).
+    # CUSA18758-full / CUSA15006-full: the base game with the 1.15 update hardlinked over it
+    # (the README). The second one is the Hong Kong / Chinese deluxe soundtrack edition.
     for folder in (PORT_DIR / "CUSA18758-full", PORT_DIR.parent / "CUSA18758-full",
-                   PORT_DIR.parent / "CUSA18758", PORT_DIR / "CUSA18758"):
+                   PORT_DIR.parent / "CUSA18758", PORT_DIR / "CUSA18758",
+                   PORT_DIR / "CUSA15006-full", PORT_DIR.parent / "CUSA15006-full",
+                   PORT_DIR.parent / "CUSA15006", PORT_DIR / "CUSA15006"):
         if (folder / "eboot.bin").is_file():
             return folder
     return PORT_DIR / "CUSA18758-full"
@@ -164,6 +168,7 @@ DEFAULTS = {
     "user_dir": "",
     "dlc_dir": "",
     "patches_dir": "",
+    "cheats_file": "",
     "language": "",
     "fullscreen": False,
     "hdr": False,
@@ -381,6 +386,10 @@ def game_environment(s):
     env["BB_MODS_ENABLED"] = "0"
     env["BB_PATCHES_DIR"] = str(patches_dir(s))
     env["BB_PATCHES_CONFIG"] = str(DATA_DIR / "patches.json")
+    # The JSON cheat table (scripts/cheats.py) and the cheats switched on in it.
+    if s.get("cheats_file"):
+        env["BB_CHEATS"] = str(Path(s["cheats_file"]).expanduser())
+        env["BB_CHEATS_CONFIG"] = str(DATA_DIR / "cheats.json")
     env["BB_LANGUAGE"] = s["language"] or str(system_game_language())
     # The in-game menu speaks the launcher's language until one is chosen in it (menu_language).
     env["BB_MENU_LANGUAGE"] = language()
@@ -829,6 +838,22 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.patch_list = FolderList(self.patches_group)
         self.refresh_patches()
         page.add(self.patches_group)
+
+        # The JSON cheat tables (scripts/cheats.py): a file is picked, then each of its cheats
+        # is switched on or off. The bytes are written into the executable when the game starts.
+        self.cheats_group = Adw.PreferencesGroup(
+            title=tr("Читы"),
+            description=tr("JSON-файл с читами (формат shadPS4). Каждый чит включается "
+                           "отдельно; байты пишутся в исполняемый файл при запуске игры."))
+        self.cheats_file_row = Adw.ActionRow(title=tr("Файл читов"))
+        self.cheats_file_row.add_suffix(flat_button("document-open-symbolic", tr("Выбрать файл читов"),
+                                                    self.on_choose_cheats))
+        self.cheats_file_row.add_suffix(flat_button("view-refresh-symbolic", tr("Обновить список"),
+                                                    self.on_refresh_cheats))
+        self.cheats_group.add(self.cheats_file_row)
+        self.cheat_list = FolderList(self.cheats_group)
+        self.refresh_cheats()
+        page.add(self.cheats_group)
 
         screen = Adw.PreferencesGroup(title=tr("Экран"))
         # A size written by hand in bbport.ini (5120x2160, ...) stays a choice instead of 720p.
@@ -1335,7 +1360,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             tooltip = {
                 "missing_update": tr("Нужно обновление 1.15: скопируйте файлы дампа обновления 1.15 в папку игры с заменой (найдена версия {})").format(version),
                 "wrong_eboot": tr("eboot.bin не от версии 1.15: скопируйте eboot.bin из дампа обновления 1.15 в папку игры с заменой"),
-                "other_title": tr("Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) с обновлением 1.15").format(title),
+                "other_title": tr("Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 или CUSA15006) с обновлением 1.15").format(title),
                 "unreadable": tr("eboot.bin не читается как расшифрованный исполняемый файл PS4: сделайте дамп заново"),
                 "damaged_files": tr("В папке игры нет: {}. Распакуйте игру и обновление 1.15 заново").format(missing),
             }.get(kind) or game_check.explain(kind, title, version)
@@ -1548,6 +1573,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         s["lan_server"] = self.lan_server_row.get_text().strip()
         s["player_name"] = player_name(self.player_name_row.get_text(), "Player1")
         self.save_patch_profile()
+        self.save_cheat_profile()
         save_settings(s)
         self.ini.update({
             "upscaler": combo_value(self.upscaler_row) if UPSCALERS_AVAILABLE else "off",
@@ -1806,6 +1832,87 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.refresh_patches()
             self.store()
         self.choose_folder(tr("Папка патчей"), patches_dir(self.settings), chosen)
+
+    # --- JSON cheats ---------------------------------------------------------------------
+
+    def save_cheat_profile(self):
+        """cheats.json: the cheats that are switched on."""
+        enabled = [name for name, check in self.cheat_checks.items() if check.get_active()]
+        path = DATA_DIR / "cheats.json"
+        try:
+            profile = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            profile = {}
+        # The cheats of a file that is not the chosen one now keep their choice.
+        shown = set(self.cheat_checks)
+        kept = {k for k in profile.get("enabled", []) if k not in shown}
+        profile = {"enabled": sorted(kept | set(enabled))}
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def refresh_cheats(self):
+        """The cheats of the chosen file, one checkbox each."""
+        self.cheat_list.clear()
+        self.cheat_checks = {}
+        path = self.settings.get("cheats_file") or ""
+        if not path:
+            self.cheats_file_row.set_subtitle(tr("не выбран"))
+            return
+        data = cheats.load(path)
+        if data is None:
+            self.cheats_file_row.set_subtitle(f"{path} — {tr('Это не файл читов')}")
+            return
+        try:
+            names = [name for name, _ in cheats.entries(data)]
+        except cheats.CheatError as error:
+            self.cheats_file_row.set_subtitle(f"{path} — {error}")
+            return
+        enabled = set()
+        try:
+            profile = json.loads((DATA_DIR / "cheats.json").read_text(encoding='utf-8'))
+            enabled = set(profile.get("enabled", []))
+        except (OSError, ValueError):
+            pass
+        title = data.get("name") or Path(path).name
+        self.cheats_file_row.set_subtitle(GLib.markup_escape_text(f"{Path(path).name} · {title}"))
+        for name in names:
+            row = Adw.ActionRow(title=GLib.markup_escape_text(name))
+            check = Gtk.CheckButton(active=name in enabled)
+            check.set_valign(Gtk.Align.CENTER)
+            check.connect("toggled", lambda _c, n=name: self.on_cheat_toggled(n))
+            row.add_suffix(check)
+            row.default = False
+            self.cheat_checks[name] = check
+            self.cheat_list.add(name, row)
+
+    def on_refresh_cheats(self, _button):
+        self.save_cheat_profile()
+        self.refresh_cheats()
+
+    def on_cheat_toggled(self, name):
+        """A cheat's box was ticked or unticked: the choice is written at once."""
+        self.save_cheat_profile()
+
+    def on_choose_cheats(self, _button):
+        self.save_cheat_profile()
+        dialog = Gtk.FileDialog(title=tr("Файл читов"))
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        cheat_filter = Gtk.FileFilter(name="JSON")
+        cheat_filter.add_pattern("*.json")
+        filters.append(cheat_filter)
+        dialog.set_filters(filters)
+
+        def chosen(dialog, result):
+            try:
+                file = dialog.open_finish(result)
+            except GLib.Error:
+                return
+            if not file or not file.get_path():
+                return
+            self.settings["cheats_file"] = file.get_path()
+            self.refresh_cheats()
+            self.store()
+        dialog.open(self, None, chosen)
 
     # --- about page ----------------------------------------------------------------------
 

@@ -56,6 +56,39 @@ Module LoadModule(const std::filesystem::path& path) {
 void* FindSymbol(Module module, const char* name) {
     return reinterpret_cast<void*>(GetProcAddress(module, name));
 }
+
+/// The player's DLSS folder (<user>/dlss, BB_GPU_USER_DIR; beside bb-probe without it): NGX's
+/// logs, and NVIDIA's library when the player chose one in the launcher.
+std::filesystem::path UserDlssDirectory() {
+    if (const char* user = std::getenv("BB_GPU_USER_DIR"); user && user[0]) {
+        std::error_code error;
+        const auto absolute = std::filesystem::absolute(std::filesystem::path{user} / "dlss", error);
+        return error ? std::filesystem::path{user} / "dlss" : absolute;
+    }
+    return ExecutableDirectory() / "dlss";
+}
+
+/// Where NVIDIA's DLSS library is: the player's own first, then beside bb-probe; empty: nowhere.
+std::filesystem::path NgxDirectory() {
+    for (const auto& directory : {UserDlssDirectory(), ExecutableDirectory()}) {
+        if (HasNgx(directory)) {
+            return directory;
+        }
+    }
+    return {};
+}
+
+/// Where the bridge is: beside bb-probe (the package, a build with DLSS_SDK_ROOT), else the
+/// player's DLSS folder; empty: nowhere.
+std::filesystem::path BridgeDirectory() {
+    for (const auto& directory : {ExecutableDirectory(), UserDlssDirectory()}) {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(directory / BridgeName, error)) {
+            return directory;
+        }
+    }
+    return {};
+}
 #else
 // bbport (Linux): libbbport_dlss.so (gpu/dlss_bridge) and NVIDIA's libnvidia-ngx-dlss.so.<version>
 // next to bb-probe, or in BB_DLSS_DIR (packaged builds whose /proc/self/exe is the dynamic

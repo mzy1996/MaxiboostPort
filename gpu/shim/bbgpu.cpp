@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#include <cstdlib>
+#endif
+
 #include "bbport_write_log.h"
 #include "bbport_game_menu.h"
 #include "bbport_gnm_hooks.h"
@@ -274,7 +278,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     StartProfileWriter();
 #endif
     g_sdk_version = config->sdk_version;
-    if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
+    if (config->user_dir) HostSetEnv("BB_GPU_USER_DIR", config->user_dir, 0);
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "MAXIBOOST ON";
     const s32 width = config->width, height = config->height;

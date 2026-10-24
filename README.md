@@ -1,4 +1,4 @@
-# MAXIBOOST ON for Windows (mbport)
+# MAXIBOOST ON for Linux (mbport)
 
 The PlayStation 4 version of *MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON* (2020, Bandai Namco
 Entertainment) running natively on Linux. The game's own x86-64 code runs directly on the CPU and
@@ -11,12 +11,14 @@ engine). The runtime, the GPU translation, the upscalers and the launcher come f
 points them at MAXIBOOST ON.
 
 > **No game files are included, and none will ever be.** You need your own dump of MAXIBOOST ON,
-> the North American release `CUSA18758` and the HongKong release `CUSA15006`, with update 1.15, made from a copy you own. Don't ask for
-> game files, saves or keys, and don't share them: see [LEGAL.md](LEGAL.md). This project is not
-> affiliated with Bandai Namco Entertainment, SOTSU, SUNRISE or Sony Interactive Entertainment.
+> the North American release `CUSA18758` or the Hong Kong / Chinese deluxe soundtrack edition
+> `CUSA15006`, with update 1.15, made from a copy you own. Don't ask for game files, saves or
+> keys, and don't share them: see [LEGAL.md](LEGAL.md). This project is not affiliated with Bandai
+> Namco Entertainment, SOTSU, SUNRISE or Sony Interactive Entertainment.
 > MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON © SOTSU · SUNRISE.
 
-[Build instructions](BUILD.md) · [Legal notice](LEGAL.md) · [Credits](CREDITS.md)
+[Build instructions](BUILD.md) · [Windows build](BUILD.win.md) · [Legal notice](LEGAL.md) ·
+[Credits](CREDITS.md)
 
 ## Status
 
@@ -82,23 +84,20 @@ executable's library layout.
 
 ### 1. The game folder
 
-Dump the game (`CUSA18758` and `CUSA5006`, version 1.00) and its 1.15 update from your PS4. The game's files are
+Dump the game (`CUSA18758`, version 1.00) and its 1.15 update from your PS4. The game's files are
 at the folder's root: `eboot.bin`, `sce_sys/`, `sce_module/`, `archives/`, `raw/` (the movies and
 sound banks) and `sce_discmap.plt`. Then merge the update into the game. On one filesystem,
 hardlinks keep the 30 GB from being copied:
 
-for CUSA18758:
 ```bash
 cp -al CUSA18758 CUSA18758-full
 cp -al --remove-destination CUSA18758-patch/. CUSA18758-full/
 python3 scripts/game_check.py CUSA18758-full
 ```
-for CUSA15006:
-```bash
-cp -al CUSA15006 CUSA15006-full
-cp -al --remove-destination CUSA15006-patch/. CUSA15006-full/
-python3 scripts/game_check.py CUSA15006-full
-```
+
+The Hong Kong / Chinese deluxe soundtrack edition (`CUSA15006`, 豪華原聲版) works the same way:
+merge its 1.15 update into its game folder and check it with `scripts/game_check.py`. Its dump
+comes with or without the cheat trainer injected into the eboot; both are accepted.
 
 ### 2. Build and run
 
@@ -131,6 +130,21 @@ GUNDAM VERSUS install (`~/.config/bbport-launcher`, `~/.config/gzport-launcher`,
 
 Build it with `bash build.sh && bash packaging/appimage-sharun.sh`, then run
 `dist/MAXIBOOST-ON-mbport-x86_64.AppImage`. Saves and settings go to `~/.local/share/mbport`.
+
+### Windows
+
+The port also builds for Windows, with MinGW-w64 (the guest speaks the SysV ABI and uses
+pthreads, which MSVC does not have). The instructions are in [BUILD.win.md](BUILD.win.md). In
+short:
+
+```bash
+# in MSYS2 (or Git Bash with MSYS2's tools on PATH)
+bash tools/build_windows_all.sh      # the GPU library and the runtime
+bash tools/package_windows.sh        # the folder that can be zipped and unpacked
+```
+
+The launcher for Windows is `launcher/win_launcher.py` (it needs PySide6); it keeps the same
+settings file and the same translations as the Linux one.
 
 ### Two players
 
@@ -175,12 +189,29 @@ verified yet.
 ### DLC
 
 The add-ons are unlock keys: their data is in the game and its update. Put their `.pkg` files
-(for example `UP0700-CUSA18758_00-GUNDAMVSMBDLC001` or `HP0700-CUSA15005_00-GUNDAMVSMBDLC001-A0000-V0100`, Gundam Barbatos Lupus Rex) in a folder and
+(for example `UP0700-CUSA18758_00-GUNDAMVSMBDLC001`, Gundam Barbatos Lupus Rex) in a folder and
 choose it as the launcher's DLC folder; the port reports them to the game as installed.
 Verified with Barbatos Lupus Rex, offline and online: it is in Machine Select (Iron-Blooded
 Orphans) and plays in Free Battle. The game checks an add-on's entitlement key against its own
 data, a key a PS4 reads from the add-on's license; the built-in patch "Installed add-ons" makes an
 installed add-on owned whatever its key. Without the add-on installed the unit is not offered.
+
+The Hong Kong / Chinese edition's add-ons are published as `CUSA15005` (for example
+`HP0700-CUSA15005_00-GUNDAMVSMBDLC001`) and are served to `CUSA15006`; the port takes them for
+that release too.
+
+### Cheats
+
+The games' JSON cheat tables (the shadPS4 format) can be used: choose the file in the
+launcher's **Cheats** group and switch the cheats on one by one. Their bytes are written into the
+executable when the game starts, like the XML patches.
+
+The offsets in a cheat table are offsets into the executable's own image, and the bytes the
+executable holds there are checked before anything is written: a table made for another build of
+the game is reported instead of writing over the game's code.
+
+The Hong Kong / Chinese edition's eboot comes with a cheat trainer in it (a code cave that reads
+a cheat table at run time); with that eboot the table is read by the game itself.
 
 ## Credits
 

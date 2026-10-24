@@ -154,7 +154,8 @@ if [[ -z ${BB_DMEM_MB:-} && ${BB_RENDER_RES:-} =~ ^[[:space:]]*([0-9]+)[[:space:
     echo "Render ${BB_RENDER_RES}: direct memory ${BB_DMEM_MB} MiB"
 fi
 "$PYTHON" scripts/patches.py --out "$out" --fps "$fps" --extra "${BB_PATCHES:-}" --settings "$BB_CONFIG" --game-dir "$game" --render-res "${BB_RENDER_RES:-}" --output-res "${BB_OUTPUT_RES:-}" \
-    --patches-dir "${BB_PATCHES_DIR:-$data/patches}" --patches-config "${BB_PATCHES_CONFIG:-$data/patches.json}"
+    --patches-dir "${BB_PATCHES_DIR:-$data/patches}" --patches-config "${BB_PATCHES_CONFIG:-$data/patches.json}" \
+    --cheats "${BB_CHEATS:-}" --cheats-config "${BB_CHEATS_CONFIG:-$data/cheats.json}"
 # Background upload of the game's GPU memory into VRAM ahead of use (BufferCache::Preupload):
 # 1 = only memory already in VRAM that the game rewrote (no new VRAM), 2 = all of it (~3 GB more
 # VRAM), 0 = off. BB_GUEST_GPU_MEMORY=1 puts guest direct memory in GPU-visible dma-buf chunks

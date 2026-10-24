@@ -11,7 +11,20 @@
 extern __thread sigjmp_buf *runtime_fault_recover;
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
+#else
+#include <setjmp.h>
+/* The recovery point for speculative guest memory reads on this thread (probe.c fault handler).
+ * Windows has no signals, so the plain jump/long jump pair is used (it does not restore a
+ * signal mask, which Windows does not have). */
+typedef jmp_buf runtime_jmp_buf;
+extern __thread runtime_jmp_buf *runtime_fault_recover;
+/* Restarts the game (in-game settings menu, render resolution change). */
+void runtime_restart(void);
 #endif
+/* The GPU library reads these (the guest memory's caching and the fault recovery point). */
+extern uint64_t runtime_disabled_optimizations;
+extern uint64_t runtime_experiment_bits;
+extern volatile int runtime_restarting;
 #define ABI __attribute__((sysv_abi))
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);

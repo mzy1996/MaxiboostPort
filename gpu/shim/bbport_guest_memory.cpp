@@ -358,28 +358,20 @@ bool HostImportWorks(const Vulkan::Instance& instance, const char*& why) {
         why = "import alignment above 4 MiB";
         return false;
     }
-    const int fd = memfd_create("bb-guest-memory-probe", MFD_CLOEXEC);
-    if (fd < 0 || ftruncate(fd, Size) != 0) {
-        why = "memfd";
-        if (fd >= 0) {
-            close(fd);
-        }
-        return false;
-    }
+    // The probe's memory: the host's own (a memfd on Linux, an allocation on Windows).
     auto* view = static_cast<std::uint32_t*>(
-        mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+        HostMapAnywhere(Size, HostProtRead | HostProtWrite));
     auto* guest = static_cast<std::uint32_t*>(
-        mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-    close(fd);
+        HostMapAnywhere(Size, HostProtRead | HostProtWrite));
     bool ok = false;
     vk::Buffer buffer, sparse;
     vk::DeviceMemory memory;
     vk::Result error{};
-    if (view == MAP_FAILED || guest == MAP_FAILED) {
-        why = "mmap of the memfd";
+    if (!view || !guest) {
+        why = "the host's memory";
     } else if (!ImportHost(view, Size, buffer, memory, error)) {
         static std::string text;
-        text = "the import of a memfd mapping failed (" + vk::to_string(error) + ")";
+        text = "the import of the host's memory failed (" + vk::to_string(error) + ")";
         why = text.c_str();
     } else if (LayerMemory()) {
         // The layer's memory module binds the imported buffers themselves (no sparse arena): the
@@ -466,11 +458,11 @@ bool HostImportWorks(const Vulkan::Instance& instance, const char*& why) {
     if (memory) {
         dev.freeMemory(memory);
     }
-    if (view != MAP_FAILED) {
-        munmap(view, Size);
+    if (view) {
+        HostUnmap(view, Size);
     }
-    if (guest != MAP_FAILED) {
-        munmap(guest, Size);
+    if (guest) {
+        HostUnmap(guest, Size);
     }
     return ok;
 }
@@ -601,6 +593,7 @@ bool DmaBufWorks(const Vulkan::Instance& instance) {
                 fd = fd_result == vk::Result::eSuccess ? exported : -1;
             }
         }
+#ifndef _WIN32
         if (fd >= 0) {
             // The whole buffer and one page inside it, writing through one, reading through the other.
             void* whole = mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -645,6 +638,7 @@ bool DmaBufWorks(const Vulkan::Instance& instance) {
             }
             close(fd);
         }
+#endif
         if (memory) {
             dev.freeMemory(memory);
         }
@@ -671,8 +665,14 @@ bool Usable(const Vulkan::Instance& instance) {
         const char* forced = std::getenv("BB_GUEST_MEMORY");
         const bool force_host = forced && std::string_view{forced} == "host";
         const bool force_dmabuf = forced && std::string_view{forced} == "dmabuf";
+#ifdef _WIN32
+        // Windows has no dma-buf: the guest's memory is imported by the GPU from the host's
+        // own address space (VK_EXT_external_memory_host).
+        const bool host_first = true;
+#else
         const bool host_first =
             force_host || (!force_dmabuf && instance.GetVendorID() != 0x1002);
+#endif
         const char* why = "";
         if (host_first && HostImportWorks(instance, why)) {
             mode = Mode::HostImport;
@@ -687,6 +687,11 @@ bool Usable(const Vulkan::Instance& instance) {
                 return false;
             }
         }
+#ifdef _WIN32
+        // Without the host import there is no way to give the GPU the guest's memory.
+        std::printf("Guest memory: no host memory import: the game cannot use the GPU's memory\n");
+        return false;
+#endif
         mode = Mode::DmaBuf;
         return DmaBufWorks(instance);
     }();

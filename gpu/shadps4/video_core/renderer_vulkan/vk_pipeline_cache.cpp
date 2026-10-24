@@ -94,7 +94,7 @@ bool ProgramReadable(const Program& pgm) {
 // be rewriting) ends that attempt like a fault does, and the GPU thread prepares the draw in
 // order. Anywhere else the assertion still stops.
 void SpeculativeAssertExit() {
-    sigjmp_buf* const recover = runtime_fault_recover;
+    BbJumpBuffer* const recover = runtime_fault_recover;
     if (!recover) {
         return;
     }
@@ -102,7 +102,7 @@ void SpeculativeAssertExit() {
     std::fputs("GPU: speculative draw preparation abandoned after the check above; the GPU "
                "thread prepares this draw in order\n",
                stderr);
-    siglongjmp(*recover, 1);
+    bb_longjmp(*recover, 1);
 }
 } // namespace
 
@@ -1210,8 +1210,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         // pointers in the registers; ahead of the GPU thread that memory may already be
         // reused. A fault returns here (runtime_fault_recover) and the draw is left to the GPU
         // thread. A jump out of the specialization leaks its partial allocations (rare).
-        sigjmp_buf recover;
-        if (sigsetjmp(recover, 0)) {
+        BbJumpBuffer recover;
+        if (bb_setjmp(recover)) {
             worker.failed = true;
             return {};
         }

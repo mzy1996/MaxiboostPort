@@ -5,13 +5,16 @@
 #define _GNU_SOURCE
 #endif
 #include "runtime.h"
-#include <dirent.h>
-#include <fcntl.h>
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 #define INVALID_ID ((int32_t)0x805a1000)
 #define NOT_LOADED ((int32_t)0x805a1001)
 #define PARAMETER ((int32_t)0x80d90002)
@@ -108,28 +111,30 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
     uint32_t count=0;
     char root[4096];
     snprintf(root,sizeof(root),"%s/addcont",runtime_file_user_dir());
-    DIR *titles=opendir(root);
-    for (struct dirent *t; titles && (t=readdir(titles));) {
-        if (t->d_name[0]=='.') continue;
-        int title=openat(dirfd(titles),t->d_name,O_RDONLY|O_DIRECTORY);
-        DIR *labels=title>=0 ? fdopendir(title) : NULL;
-        if (!labels && title>=0) close(title);
-        for (struct dirent *l; labels && (l=readdir(labels));) {
-            struct stat entry;
-            size_t n=strlen(l->d_name);
-            if (l->d_name[0]=='.' || n>=LABEL_SIZE || fstatat(dirfd(labels),l->d_name,&entry,0) ||
-                !S_ISDIR(entry.st_mode) || (fill && count>=capacity)) continue;
-            if (fill) {
-                AddonInfo info;
-                memset(&info,'\0',sizeof(info)); memcpy(info.label,l->d_name,n);
-                info.status=ADDON_INSTALLED;
-                memcpy((unsigned char *)list+(size_t)count*sizeof(info),&info,sizeof(info));
+    PlatformDir titles;
+    if (!platform_dir_open(&titles,root)) {
+        for (int next; (next=platform_dir_next(&titles))>0;) {
+            if (titles.name[0]=='.') continue;
+            char title_path[4096];
+            snprintf(title_path,sizeof(title_path),"%s/%s",root,titles.name);
+            PlatformDir labels;
+            if (!platform_dir_open(&labels,title_path)) continue;
+            for (int label_next; (label_next=platform_dir_next(&labels))>0;) {
+                size_t n=strlen(labels.name);
+                if (labels.name[0]=='.' || n>=LABEL_SIZE || !labels.is_dir ||
+                    (fill && count>=capacity)) continue;
+                if (fill) {
+                    AddonInfo info;
+                    memset(&info,'\0',sizeof(info)); memcpy(info.label,labels.name,n);
+                    info.status=ADDON_INSTALLED;
+                    memcpy((unsigned char *)list+(size_t)count*sizeof(info),&info,sizeof(info));
+                }
+                ++count;
             }
-            ++count;
+            platform_dir_close(&labels);
         }
-        if (labels) closedir(labels);
+        platform_dir_close(&titles);
     }
-    if (titles) closedir(titles);
     if (hits) *hits=count;
     if (count) printf("Runtime: AppContent add-ons reported installed (%s): %u\n",root,(unsigned)count);
     ++lists; return 0;
@@ -141,15 +146,17 @@ static ABI int32_t addon_info(uint32_t service_label,const char *label,AddonInfo
     if (!label || !info) return (int32_t)0x80D90002; /* PARAMETER */
     char root[4096];
     snprintf(root,sizeof(root),"%s/addcont",runtime_file_user_dir());
-    DIR *titles=opendir(root);
     int found=0;
-    for (struct dirent *t; titles && !found && (t=readdir(titles));) {
-        if (t->d_name[0]=='.') continue;
-        char path[8192]; struct stat entry;
-        snprintf(path,sizeof(path),"%s/%s/%.16s",root,t->d_name,label);
-        found=!stat(path,&entry) && S_ISDIR(entry.st_mode);
+    PlatformDir titles;
+    if (!platform_dir_open(&titles,root)) {
+        for (int next; (next=platform_dir_next(&titles))>0 && !found;) {
+            if (titles.name[0]=='.') continue;
+            char path[8192];
+            snprintf(path,sizeof(path),"%s/%s/%.16s",root,titles.name,label);
+            found=platform_is_directory(path);
+        }
+        platform_dir_close(&titles);
     }
-    if (titles) closedir(titles);
     ++queries;
     if (!found) return ERR_ADDCONT_NOT_FOUND;
     memset(info,0,sizeof(*info)); memcpy(info->label,label,strnlen(label,LABEL_SIZE-1));

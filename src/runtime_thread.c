@@ -4,18 +4,33 @@
  * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "asm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <errno.h>
 #include <unistd.h>
+#ifndef _WIN32
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <asm/prctl.h>
+#else
+/* The Windows build has no arch_prctl: the guest's TCB lives in the thread's TLS slot
+ * (src/runtime_tls_win32.c). */
+#include <windows.h>
+#include <malloc.h>
+#include "runtime_tls.h"
+/* The protection flags are the Windows ones (the platform layer maps them). */
+#ifndef PROT_READ
+#define PROT_READ 1
+#endif
+#ifndef PROT_WRITE
+#define PROT_WRITE 2
+#endif
+#endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
 #define STACK_MARGIN (256*1024)
@@ -58,14 +73,27 @@ void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;
 }
 static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1); }
+#ifdef _WIN32
+/* Windows keeps the GS base for itself: the program cannot set it. The guest's TCB pointer
+ * lives in the thread's own TLS slot instead (src/runtime_tls_win32.c), and the loader's
+ * rewrite reads that slot. */
+static void set_gs(void *base) { runtime_tls_set_tcb(base); }
+#else
 static void set_gs(void *base) {
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
 }
+#endif
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
     uint64_t offset=tls_offset();
     size_t total=offset+256;
-    unsigned char *block=aligned_alloc(64,(total+63)&~(size_t)63);
+    const size_t rounded=(total+63)&~(size_t)63;
+#ifdef _WIN32
+    /* MinGW has no aligned_alloc (the C11 one), but the Windows one. */
+    unsigned char *block=_aligned_malloc(rounded,64);
+#else
+    unsigned char *block=aligned_alloc(64,rounded);
+#endif
     if (!block) { fputs("Cannot allocate guest TLS\n",stderr); exit(1); }
     memset(block,0,total);
     if (tls_filesz) memcpy(block,tls_template,tls_filesz);
@@ -214,23 +242,32 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
 
 /* Linux thread names hold 15 characters; longer ones would be rejected. */
 static void set_host_name(const char *name) {
+#ifdef _WIN32
+    /* Windows' own names are longer (they are wide strings). */
+    wchar_t wide[64]={0};
+    const size_t length=strnlen(name,sizeof(wide)/sizeof(wide[0])-1);
+    for (size_t i=0;i<length;++i) wide[i]=(wchar_t)(unsigned char)name[i];
+    SetThreadDescription(GetCurrentThread(),wide);
+#else
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
     pthread_setname_np(pthread_self(),host);
+#endif
 }
 /* Calls fn(arg) with rsp at stack_top (16-byte aligned), then returns on the caller's stack: a
  * thread created with a stack of the game's own (scePthreadAttrSetstack) runs its guest code on
  * it, as on a PS4 (MAXIBOOST ON reads its callers' frames there, above the entry's own). The
  * thread's exit (longjmp to host_start) leaves it as any return does. */
 void *runtime_call_on_stack(void *(ABI *fn)(void *),void *arg,uintptr_t stack_top);
-__asm__(".text\n.globl runtime_call_on_stack\n.type runtime_call_on_stack,@function\n"
+__asm__(BB_ASM_TEXT BB_ASM_GLOBAL("runtime_call_on_stack") BB_ASM_TYPE("runtime_call_on_stack")
         "runtime_call_on_stack:\n"
         "  push %rbp\n  mov %rsp,%rbp\n"
         "  mov %rdx,%rsp\n  and $-16,%rsp\n"
         "  mov %rdi,%rax\n  mov %rsi,%rdi\n"
         "  call *%rax\n"
         "  mov %rbp,%rsp\n  pop %rbp\n  ret\n"
-        ".size runtime_call_on_stack,.-runtime_call_on_stack\n");
+        BB_ASM_SIZE("runtime_call_on_stack")
+);
 /* libc.prx's thread-exit hook (_sceKernelSetThreadDtors): its thread_local destructors. A
  * newer libc (MAXIBOOST ON's) registers it with libkernel, which calls it as a thread ends. */
 static void (ABI *thread_dtors)(void);
@@ -419,9 +456,3 @@ void runtime_thread_report(void) {
     printf("Runtime: guest threads created=%zu, exited=%zu, joined=%zu\n",created,exited,joined_count);
     pthread_mutex_unlock(&lock);
 }
-#else
-uintptr_t runtime_thread_resolve(const char *name) { (void)name; return 0; }
-void runtime_thread_report(void) {}
-void runtime_thread_attach_main(void) {}
-void runtime_set_main_tls(const void *d,uint64_t f,uint64_t m,uint64_t a) { (void)d;(void)f;(void)m;(void)a; }
-#endif

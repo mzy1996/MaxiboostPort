@@ -95,3 +95,14 @@ frames.csv
 /tests/test_menu_prompts.py
 /tools/extract_prompt_assets.py
 /tools/shadnet-server/
+
+# --- The Windows build's vendored dependencies ----------------------------------------------------
+# The header-only libraries and the incomplete Boost of the package manager are fetched by
+# tools/build_windows_all.sh (the scripts say which); they are not part of the repository.
+/gpu/third_party/boost/
+/gpu/third_party/Zydis/
+/gpu/third_party/miniz/
+/gpu/third_party/magic_enum/
+/gpu/third_party/tsl-robin-map/
+/gpu/third_party/VulkanMemoryAllocator/
+/gpu/third_party/xbyak/

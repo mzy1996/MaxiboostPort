@@ -17,6 +17,7 @@
 #include <optional>
 #include <utility>
 #include <time.h>
+#include "host_services.h"
 #include "bbport_threads.h"
 #include "bbport_ce_stats.h"
 #include "bbport_timeline.h"
@@ -45,6 +46,7 @@
 #include "cp_decoder.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+using namespace Core;
 
 extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
 
@@ -135,7 +137,7 @@ void Liverpool::Process(std::stop_token stoken) {
     }
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
-    gpu_tid = gettid();
+    gpu_tid = u32(ThreadId());
 #endif
 
     while (!stoken.stop_requested()) {
@@ -2458,14 +2460,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     if (seq != NoSeq && BbStats::enabled) {
         BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
-        if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
-            BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,
+        if (uint64_t user_us = 0, system_us = 0; Core::ThreadTimes(&user_us, &system_us)) {
+            BbStats::gpu_user_us.store(u64(user_us),
                                        std::memory_order_relaxed);
-            BbStats::gpu_sys_us.store(u64(usage.ru_stime.tv_sec) * 1000000 + usage.ru_stime.tv_usec,
+            BbStats::gpu_sys_us.store(u64(system_us),
                                       std::memory_order_relaxed);
-            BbStats::gpu_invol_switches.store(usage.ru_nivcsw, std::memory_order_relaxed);
-            BbStats::gpu_vol_switches.store(usage.ru_nvcsw, std::memory_order_relaxed);
-            BbStats::gpu_minor_faults.store(usage.ru_minflt, std::memory_order_relaxed);
+        }
+        if (uint64_t voluntary = 0, involuntary = 0, minor_faults = 0;
+            Core::ThreadCounters(&voluntary, &involuntary, &minor_faults)) {
+            BbStats::gpu_invol_switches.store(involuntary, std::memory_order_relaxed);
+            BbStats::gpu_vol_switches.store(voluntary, std::memory_order_relaxed);
+            BbStats::gpu_minor_faults.store(minor_faults, std::memory_order_relaxed);
         }
     }
 
@@ -3144,8 +3149,10 @@ void Liverpool::CheckSubmittedCopy(const SubmittedCopy& copy, u64 seq) {
         std::array<u32, 1024> buf;
         for (std::size_t at = 0; at < dwords; at += buf.size()) {
             const std::size_t n = std::min(buf.size(), dwords - at);
-            iovec local{buf.data(), n * 4}, remote{const_cast<u32*>(guest + at), n * 4};
-            if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != ssize_t(n * 4)) {
+            const void* local_base = buf.data(); const size_t local_size = n * 4;
+    struct { void* iov_base; size_t iov_len; } local{const_cast<void*>(local_base), local_size};
+    struct { void* iov_base; size_t iov_len; } remote{const_cast<u32*>(guest + at), n * 4};
+            if (!Core::ReadProcessMemory(remote.iov_base, local.iov_base, local.iov_len) || local.iov_len != (n * 4)) {
                 // bbport BB_GUEST_IN_PLACE: dma-buf guest memory is not readable that way; still
                 // mapped, it is read directly.
                 int prot = 0, type = -1;
@@ -3197,8 +3204,10 @@ void Liverpool::CheckSubmittedCopy(const SubmittedCopy& copy, u64 seq) {
     const std::size_t dwords = dcb_change != -1 ? copy.dcb_dwords : copy.ccb_dwords;
     const std::size_t from = at >= 8 ? at - 8 : 0, to = std::min<std::size_t>(dwords, at + 8);
     std::array<u32, 16> now{};
-    iovec local{now.data(), (to - from) * 4}, remote{const_cast<u32*>(guest + from), (to - from) * 4};
-    const bool readable = process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t((to - from) * 4);
+    const void* local_base = now.data(); const size_t local_size = (to - from) * 4;
+    struct { void* iov_base; size_t iov_len; } local{const_cast<void*>(local_base), local_size};
+    struct { void* iov_base; size_t iov_len; } remote{const_cast<u32*>(guest + from), (to - from) * 4};
+    const bool readable = Core::ReadProcessMemory(remote.iov_base, local.iov_base, local.iov_len) && local.iov_len == ((to - from) * 4);
     std::printf("  submitted:");
     for (std::size_t i = from; i < to; ++i) {
         std::printf(i == std::size_t(at) ? " [%08x]" : " %08x", kept[i]);

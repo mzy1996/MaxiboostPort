@@ -11,7 +11,7 @@
 namespace Vulkan {
 
 // bbport: waits go in 10 s slices so a GPU that never finishes is reported, not waited on silently.
-constexpr u64 WAIT_TIMEOUT = 10'000'000'000ULL;
+constexpr u64 WAIT_SLICE_NS = 10'000'000'000ULL;
 
 Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     const vk::StructureChain semaphore_chain = {
@@ -71,7 +71,7 @@ void Semaphore::Wait(u64 tick) {
     // submission still not finished after 10 s says so once with the GPU breadcrumbs.
     bool told = false;
     while (true) {
-        const vk::Result result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT);
+        const vk::Result result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_SLICE_NS);
         if (result == vk::Result::eSuccess) {
             if (told) {
                 std::printf("GPU: submission %llu finished after all\n", (unsigned long long)tick);

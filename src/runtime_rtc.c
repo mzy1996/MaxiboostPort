@@ -3,6 +3,7 @@
  * and the host time zone supplies local time. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "platform.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -63,15 +64,13 @@ static void from_tick(uint64_t tick, DateTime *t) {
     t->microsecond=(uint32_t)(us%1000000u);
 }
 static uint64_t now_utc(void) {
-    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-    return UNIX_EPOCH_TICKS+(uint64_t)ts.tv_sec*1000000u+(uint64_t)ts.tv_nsec/1000u;
+    uint64_t ns=platform_realtime_ns();
+    return UNIX_EPOCH_TICKS+ns/1000u;
 }
 /* Offset of local time from UTC at the given UTC tick, in microseconds. */
 static int64_t local_offset(uint64_t utc) {
-    time_t seconds=(time_t)((int64_t)(utc-UNIX_EPOCH_TICKS)/1000000);
-    struct tm local;
-    localtime_r(&seconds,&local);
-    return (int64_t)local.tm_gmtoff*1000000;
+    (void)utc;
+    return platform_utc_offset_seconds()*1000000;
 }
 
 static ABI int32_t rtc_current_local(DateTime *t) {

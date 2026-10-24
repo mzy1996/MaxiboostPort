@@ -16,6 +16,11 @@ add_compile_options(-fno-omit-frame-pointer)
 # profile). Covers bbgpu and the static libraries linked into it. No -march: the same build
 # runs on the Steam Deck.
 option(BB_LTO "Link-time optimization of bbgpu" ON)
+if (WIN32)
+    # The link-time optimization's generated assembly carries the ELF directives (.hidden,
+    # .previous) that Boost's visibility attributes add; the COFF assembler does not know them.
+    set(BB_LTO OFF)
+endif()
 set(BB_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
 set(BB_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
 if (BB_LTO)
@@ -41,17 +46,155 @@ elseif (BB_PGO STREQUAL "use")
 endif()
 
 find_package(Vulkan REQUIRED)
-find_package(fmt REQUIRED)
-find_package(Boost REQUIRED)
-find_package(magic_enum REQUIRED)
-find_package(tsl-robin-map REQUIRED)
-find_package(VulkanMemoryAllocator CONFIG REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
-pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
-find_package(miniz REQUIRED)
-find_package(Zydis REQUIRED)
+if (WIN32)
+    # The root of the MinGW-w64 environment (the toolchain file sets it).
+    if (NOT MSYS2_ROOT)
+        if (DEFINED ENV{MSYS2_ROOT})
+            set(MSYS2_ROOT "$ENV{MSYS2_ROOT}")
+        else()
+            set(MSYS2_ROOT "C:/devkitPro/msys2")
+        endif()
+    endif()
+    # fmt and Boost are used header-only (the code takes their headers, not their libraries).
+    # The Windows build takes them from the MinGW-w64 environment directly: the CMake modules
+    # for them expect an installation layout the package manager's headers do not have.
+    # fmt itself is not header-only (the formatting machinery is in the library), so the
+    # Windows build links the toolchain's copy of it (BB_FMT, below).
+    add_library(bb_fmt INTERFACE)
+    target_include_directories(bb_fmt INTERFACE "${MSYS2_ROOT}/mingw64/include")
+    add_library(bb_boost INTERFACE)
+    # The vendored Boost headers (the package manager's are incomplete). The compiler's own
+    # include path has the incomplete ones too, so they are taken out of the way.
+    target_include_directories(bb_boost BEFORE INTERFACE third_party/boost/include)
+else()
+    find_package(fmt REQUIRED)
+    find_package(Boost REQUIRED)
+endif()
+# The header-only libraries: magic_enum, tsl-robin-map, miniz and Zydis. They are vendored
+# (gpu/third_party) so that the Windows build does not need a package manager for them.
+add_library(bb_magic_enum INTERFACE)
+target_include_directories(bb_magic_enum INTERFACE third_party/magic_enum/include)
+add_library(bb_tsl_robin_map INTERFACE)
+target_include_directories(bb_tsl_robin_map INTERFACE third_party/tsl-robin-map/include)
+add_library(bb_miniz INTERFACE)
+target_include_directories(bb_miniz INTERFACE third_party/miniz)
+# xbyak: the x86 assembler the shader recompiler uses (header-only, vendored).
+add_library(bb_xbyak INTERFACE)
+target_include_directories(bb_xbyak INTERFACE third_party/xbyak)
+# Zydis is not header-only (the decoder's tables are in the library). The Linux build takes
+# the one the system has installed; the Windows build compiles the vendored sources.
+if (WIN32)
+    set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+    set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(ZYDIS_BUILD_MAN OFF CACHE BOOL "" FORCE)
+    set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+    set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/Zydis EXCLUDE_FROM_ALL)
+    # Zydis::Zydis is an alias of Zydis already; the name bb_zydis is the one the rest of
+    # the file uses, so it points at the same target.
+    add_library(bb_zydis INTERFACE)
+    target_link_libraries(bb_zydis INTERFACE Zydis::Zydis)
+else()
+    add_library(bb_zydis INTERFACE)
+    target_include_directories(bb_zydis INTERFACE third_party/Zydis/include third_party/Zydis/dependencies/zycore/include)
+endif()
+add_library(bb_vma INTERFACE)
+target_include_directories(bb_vma INTERFACE third_party/VulkanMemoryAllocator/include)
+if (NOT WIN32)
+    find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+endif()
+if (WIN32)
+    # The Windows build finds the libraries of the MinGW-w64 environment directly: its
+    # pkg-config is a POSIX program whose output (the MSYS paths) the Windows linker
+    # does not understand. The root comes from the toolchain file.
+    if (NOT MSYS2_ROOT)
+        if (DEFINED ENV{MSYS2_ROOT})
+            set(MSYS2_ROOT "$ENV{MSYS2_ROOT}")
+        else()
+            set(MSYS2_ROOT "C:/devkitPro/msys2")
+        endif()
+    endif()
+    function(bb_import_library target)
+        find_library(${target}_LIB NAMES ${ARGN} REQUIRED
+                     PATHS "${MSYS2_ROOT}/mingw64/lib" NO_DEFAULT_PATH)
+        add_library(${target} UNKNOWN IMPORTED)
+        set_target_properties(${target} PROPERTIES IMPORTED_LOCATION "${${target}_LIB}")
+        target_include_directories(${target} INTERFACE "${MSYS2_ROOT}/mingw64/include")
+    endfunction()
+    # The static library: the shared one would drag in the codecs' own DLLs (a hundred of
+    # them, for the video the game hardly plays). The file is named directly, because
+    # find_library would pick the import library (the ".dll.a") instead.
+    function(bb_static_library target)
+        set(location "")
+        foreach(name ${ARGN})
+            if (location)
+                continue()
+            endif()
+            if (EXISTS "${MSYS2_ROOT}/mingw64/lib/lib${name}.a")
+                set(location "${MSYS2_ROOT}/mingw64/lib/lib${name}.a")
+            endif()
+        endforeach()
+        if (NOT location)
+            message(FATAL_ERROR "The static library ${ARGN} was not found in ${MSYS2_ROOT}/mingw64/lib")
+        endif()
+        add_library(${target} STATIC IMPORTED)
+        set_target_properties(${target} PROPERTIES IMPORTED_LOCATION "${location}")
+        target_include_directories(${target} INTERFACE "${MSYS2_ROOT}/mingw64/include")
+    endfunction()
+    bb_import_library(BB_XXHASH xxhash)
+    bb_import_library(BB_SDL3 SDL3)
+    # The ffmpeg: the shared libraries by default. The static ones would need every codec's
+    # own library (a hundred of them, and the list keeps growing), while the shared ones
+    # are collected for the package by tools/collect_dlls.py.
+    # BB_FFMPEG_STATIC=1 links the static libraries instead, for a smaller package.
+    option(BB_FFMPEG_STATIC "Link the ffmpeg statically (no ffmpeg DLLs to ship)" OFF)
+    if (BB_FFMPEG_STATIC)
+        bb_static_library(BB_AVFORMAT avformat)
+        bb_static_library(BB_AVCODEC avcodec)
+        bb_static_library(BB_AVUTIL avutil)
+        bb_static_library(BB_SWSCALE swscale)
+        bb_static_library(BB_SWRESAMPLE swresample)
+        # The libraries the static ffmpeg needs. The list is the "Libs.private" of the
+        # ffmpeg's own pkg-config files: every library they mention, in one place.
+        set(BB_FFMPEG_DEPENDENCIES
+            m atomic xml2 bz2 gme modplug bluray z gnutls rtmp gmp hogweed nettle srt ws2_32 ssh
+            vpx webpmux iconv lzma dav1d opencore-amrwb rsvg-2 gdk_pixbuf-2.0 gio-2.0 cairo
+            gobject-2.0 glib-2.0 intl zvbi pthread png aom gsm jxl jxl_threads lc3 mp3lame
+            opencore-amrnb openjp2 opus rav1e speex SvtAv1Enc theoraenc theoradec ogg vorbis
+            vorbisenc webp x264 x265 xvidcore mfuuid ole32 strmiids user32 va dl vpl gdi32 uuid
+            va_win32 bcrypt soxr gomp hwy ntdll crypto ssl gcrypt gpg-error crypt32)
+        foreach(dependency ${BB_FFMPEG_DEPENDENCIES})
+            if (EXISTS "${MSYS2_ROOT}/mingw64/lib/lib${dependency}.a")
+                bb_static_library(BB_DEP_${dependency} ${dependency})
+            endif()
+        endforeach()
+    else()
+        bb_import_library(BB_AVFORMAT avformat)
+        bb_import_library(BB_AVCODEC avcodec)
+        bb_import_library(BB_AVUTIL avutil)
+        bb_import_library(BB_SWSCALE swscale)
+        bb_import_library(BB_SWRESAMPLE swresample)
+        set(BB_FFMPEG_DEPENDENCIES "")
+    endif()
+    # fmt: the formatting machinery is not header-only, so the library is linked.
+    bb_import_library(BB_FMT fmt)
+    # The sockets (Boost.Asio's Winsock initialization).
+    bb_import_library(BB_WS2_32 ws2_32)
+    # The ffmpeg headers and the SDL3's.
+    set(FFMPEG_INCLUDE_DIRS "${MSYS2_ROOT}/mingw64/include" CACHE PATH "")
+    set(SDL3_INCLUDE_DIRS "${MSYS2_ROOT}/mingw64/include" CACHE PATH "")
+    set(XXHASH_INCLUDE_DIRS "${MSYS2_ROOT}/mingw64/include" CACHE PATH "")
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
+    pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+    if (NOT WIN32)
+        # The X11 display connection the Vulkan surface is created with (Windows uses the
+        # window's handle instead, gpu/shim/window.cpp).
+        pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+    endif()
+endif()
 find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
@@ -119,9 +262,24 @@ set(COMMON
     shadps4/common/path_util.cpp shadps4/common/rdtsc.cpp shadps4/common/spin_lock.cpp shadps4/common/recursive_lock.cpp
     shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
     shim/common/logging/log.cpp)
+if (WIN32)
+    # The NT API the file handling uses (the whole file is Windows-only).
+    list(APPEND COMMON shadps4/common/ntapi.cpp)
+endif()
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+if (NOT WIN32)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+endif()
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
+# The host services and the host memory have one implementation per platform; the one of the
+# other platform would define the same symbols twice.
+if (WIN32)
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "host_services_posix\\.cpp$")
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "host_memory_posix\\.cpp$")
+else()
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "host_services_win32\\.cpp$")
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "host_memory_win32\\.cpp$")
+endif()
 # The layer's own modules (independent of the shadPS4 code): layer/.
 file(GLOB LAYER_SOURCES CONFIGURE_DEPENDS layer/*.cpp)
 # Game profiles (what the translator knows about one game, out of its core): games/.
@@ -153,16 +311,76 @@ target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
 target_include_directories(bbgpu PRIVATE shim layer games cp shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
+if (WIN32)
+    # The Windows build's stand-ins for the POSIX headers the code includes.
+    target_include_directories(bbgpu PRIVATE third_party/win_compat)
+    # The headers of Windows define the ancient "near" and "far" keywords as macros, and the
+    # code uses "near" as a name; the compatibility header takes them out of the way for
+    # every file of the library.
+    target_compile_options(bbgpu PRIVATE -include${CMAKE_CURRENT_SOURCE_DIR}/third_party/win_compat/windows_compat.h)
+    # The Boost headers (the code uses them header-only).
+    target_include_directories(bbgpu PRIVATE third_party/boost/include)
+    # The runtime symbols (the guest's memory, the fault recovery) live in bb-probe.exe.
+    # Windows resolves a DLL's imports from another module's exports, so the library links
+    # against the import library made from the runtime's module definition file.
+    set(RUNTIME_EXPORTS "${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime_exports.txt")
+    set(RUNTIME_DEF "${CMAKE_CURRENT_BINARY_DIR}/bbgpu_runtime.def")
+    file(STRINGS "${RUNTIME_EXPORTS}" RUNTIME_EXPORT_LINES REGEX "^runtime_")
+    set(RUNTIME_DEF_CONTENT "EXPORTS\n")
+    foreach(symbol ${RUNTIME_EXPORT_LINES})
+        string(APPEND RUNTIME_DEF_CONTENT "    ${symbol}\n")
+    endforeach()
+    file(WRITE "${RUNTIME_DEF}" "${RUNTIME_DEF_CONTENT}")
+    find_program(DLLTOOL NAMES dlltool REQUIRED)
+    set(RUNTIME_IMPORT_LIB "${CMAKE_CURRENT_BINARY_DIR}/libbbruntime.a")
+    add_custom_command(OUTPUT "${RUNTIME_IMPORT_LIB}"
+        COMMAND "${DLLTOOL}" -d "${RUNTIME_DEF}" -D "bb-probe.exe" -l "${RUNTIME_IMPORT_LIB}"
+        DEPENDS "${RUNTIME_DEF}"
+        COMMENT "The import library of the runtime's exports (bb-probe.exe)"
+        VERBATIM)
+    add_custom_target(bbgpu_runtime_imports DEPENDS "${RUNTIME_IMPORT_LIB}")
+    add_dependencies(bbgpu bbgpu_runtime_imports)
+    target_link_libraries(bbgpu PRIVATE "${RUNTIME_IMPORT_LIB}")
+    # The library is bbgpu.dll, not libbbgpu.dll: the "lib" prefix is the Unix convention.
+    # The import library has the same name as the DLL, or the program that links against it
+    # would look for "libbbgpu.dll" at the run time.
+    set_target_properties(bbgpu PROPERTIES PREFIX "" OUTPUT_NAME "bbgpu"
+        IMPORT_IMPLIB "${CMAKE_CURRENT_BINARY_DIR}/bbgpu.dll.a")
+endif()
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
-target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
+if (NOT MSVC)
+    target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
+endif()
 # Loaded with bb-probe at startup (DT_NEEDED, never dlopen): thread_local access without a
 # TLS descriptor call (_dl_tlsdesc_return was ~2% of the draw recording thread).
-target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
+if (NOT WIN32)
+    target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
+endif()
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+if (NOT WIN32)
+    # The runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
+    target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
-target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+if (WIN32)
+    target_link_libraries(bbgpu PUBLIC Vulkan::Headers bb_fmt bb_boost bb_magic_enum
+        bb_tsl_robin_map bb_vma BB_XXHASH BB_SDL3 BB_AVFORMAT BB_AVCODEC BB_AVUTIL BB_SWSCALE BB_SWRESAMPLE
+        BB_FMT BB_WS2_32
+        bb_miniz bb_zydis bb_xbyak sirit)
+    # The static ffmpeg's own dependencies (the order matters: the linker reads them once).
+    set(BB_FFMPEG_LINK "")
+    foreach(dependency ${BB_FFMPEG_DEPENDENCIES})
+        if (TARGET BB_DEP_${dependency})
+            list(APPEND BB_FFMPEG_LINK BB_DEP_${dependency})
+        endif()
+    endforeach()
+    if (BB_FFMPEG_LINK)
+        target_link_libraries(bbgpu PUBLIC ${BB_FFMPEG_LINK})
+    endif()
+else()
+    target_link_libraries(bbgpu PUBLIC Vulkan::Headers bb_fmt bb_boost bb_magic_enum
+        bb_tsl_robin_map bb_vma PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG bb_miniz bb_zydis bb_xbyak sirit)
+endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)

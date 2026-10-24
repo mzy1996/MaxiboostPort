@@ -74,6 +74,23 @@ class DlcTests(unittest.TestCase):
         self.assertTrue(own.is_dir())
         self.assertFalse((self.user / 'addcont/CUSA18758/GUNDAMVSMBDLC001').exists())
 
+    def test_the_hong_kong_release_takes_the_add_ons_published_as_cusa15005(self):
+        """The Hong Kong / Chinese deluxe soundtrack edition (CUSA15006) is served the add-ons
+        published as CUSA15005: their packages carry that title id."""
+        unlock_key(self.dlc / 'HP0700-CUSA15005_00-GUNDAMVSMBDLC001-A0000-V0100.pkg',
+                   'HP0700-CUSA15005_00-GUNDAMVSMBDLC001')
+        self.assertEqual(sorted(dlc.addons(self.dlc, 'CUSA15006')), ['GUNDAMVSMBDLC001'])
+        # The North American release does not take them.
+        self.assertEqual(dlc.addons(self.dlc, 'CUSA18758'), {})
+
+    def test_the_hong_kong_add_ons_are_reported_for_the_hong_kong_release(self):
+        unlock_key(self.dlc / 'HP0700-CUSA15005_00-GUNDAMVSMBDLC001-A0000-V0100.pkg',
+                   'HP0700-CUSA15005_00-GUNDAMVSMBDLC001')
+        (self.game / 'sce_sys/param.sfo').write_bytes(
+            param_sfo({'TITLE_ID': 'CUSA15006', 'CATEGORY': 'gd'}))
+        self.assertEqual(dlc.link(self.dlc, self.game, self.user), 1)
+        self.assertTrue((self.user / 'addcont/CUSA15006/GUNDAMVSMBDLC001').is_dir())
+
 
 if __name__ == '__main__':
     unittest.main()

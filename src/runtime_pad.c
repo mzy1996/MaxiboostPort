@@ -29,10 +29,12 @@
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
+#include "platform.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <time.h>
 #include <SDL3/SDL.h>
@@ -248,7 +250,18 @@ static int is_preferred(SDL_JoystickID id, const char *want) {
     char guid[33];
     SDL_GUIDToString(SDL_GetGamepadGUIDForID(id),guid,sizeof guid);
     const char *name=SDL_GetGamepadNameForID(id);
-    return !strcasecmp(guid,want) || (name && strcasestr(name,want));
+    if (!strcasecmp(guid,want)) return 1;
+    if (!name) return 0;
+    /* The name that contains the wanted text, ignoring the case (strcasestr is a GNU
+     * extension, so it is written out here). */
+    size_t wanted=strlen(want);
+    if (!wanted) return 1;
+    for (const char *at=name; *at; ++at) {
+        size_t i=0;
+        while (i<wanted && at[i] && tolower((unsigned char)at[i])==tolower((unsigned char)want[i])) ++i;
+        if (i==wanted) return 1;
+    }
+    return 0;
 }
 /* BB_GAMEPAD_SLOT=n (couch versus, run.sh BB_COOP: one game per player): this game takes the
  * n-th gamepad and no other, so two games never read the same one. Both games order the gamepads
@@ -738,9 +751,9 @@ static void sample_host(PadData *d) {
  * the sticks. An empty file releases everything. */
 typedef struct {
     uint32_t buttons; int stick[4]; int touch_side;
-    uint64_t last_check; struct timespec mtime;
+    uint64_t last_check; uint64_t mtime;
 } Inject;
-static Inject injected={0,{-1,-1,-1,-1},-1,0,{0,0}};
+static Inject injected={0,{-1,-1,-1,-1},-1,0,0};
 static int replay_armed;      /* 1 while a BB_PAD_REPLAY recording plays, 2 once it ended */
 static uint64_t replay_start; /* 0: (re)start at the next sample */
 /* Reads a pad file into *in when it changed (BB_PAD_FILE for player 1, BB_PAD2_FILE for player
@@ -750,10 +763,10 @@ static void read_inject_file(const char *path, Inject *in, const char *who) {
     uint64_t now=now_us();
     if (now-in->last_check<20000) return;
     in->last_check=now;
-    struct stat st;
-    if (stat(path,&st)!=0) return;
-    if (st.st_mtim.tv_sec==in->mtime.tv_sec && st.st_mtim.tv_nsec==in->mtime.tv_nsec) return;
-    in->mtime=st.st_mtim;
+    uint64_t mtime=platform_file_mtime_ns(path);
+    if (!mtime) return;
+    if (mtime==in->mtime) return;
+    in->mtime=mtime;
     FILE *f=fopen(path,"r");
     if (!f) return;
     static const struct { const char *name; uint32_t ps; } names[]={

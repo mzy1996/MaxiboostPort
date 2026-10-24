@@ -388,8 +388,14 @@ bool Instance::CreateDevice() {
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     // bbport: guest direct memory allocated here and mapped by the runtime (BbGuestMemory).
+#ifdef _WIN32
+    // Windows has no dma-buf: the guest's memory is imported from the host's address space
+    // (VK_EXT_external_memory_host), so there is nothing to export.
+    guest_memory_export = false;
+#else
     guest_memory_export = add_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
                           add_extension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+#endif
     // bbport: or host memory imported into Vulkan (drivers whose dma-buf does not fit, NVIDIA).
     host_memory_import = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     // bbport: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.

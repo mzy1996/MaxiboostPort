@@ -3,10 +3,10 @@
 The runtime reports <user>/addcont/<title id>/<entitlement label> as installed (shadPS4's layout,
 src/runtime_content.c). A DLC folder may hold:
 - dumped add-ons, one folder each, named by the label, with sce_sys/param.sfo (Bloodborne's The
-  Old Hunters: its data ships with a patch, the folder is only the entitlement);
+    Old Hunters: its data ships with a patch, the folder is only the entitlement);
 - the add-ons' .pkg files as they are. MAXIBOOST ON's add-ons (mobile suits, such as
-  GUNDAMVSMBDLC001, Gundam Barbatos Lupus Rex) are unlock keys, as GUNDAM VERSUS' were: their data
-  is in the game and its update, the package carries none.
+    GUNDAMVSMBDLC001, Gundam Barbatos Lupus Rex) are unlock keys, as GUNDAM VERSUS' were: their data
+    is in the game and its update, the package carries none.
 
     python3 scripts/dlc.py link --dlc DIR --game GAME_DIR --user USER_DIR
     python3 scripts/dlc.py list --dlc DIR --title CUSA18758
@@ -24,6 +24,14 @@ from prepare import sfo  # noqa: E402
 # A folder of entitlements this script made: <user>/addcont/<title id> holding this file is
 # rebuilt every launch; a real folder without it (someone's own) is left alone.
 MARKER = '.mbport-dlc'
+
+# Add-ons published under one title id that also belong to another: the Hong Kong / Chinese
+# deluxe soundtrack edition (CUSA15006) is served the add-ons published as CUSA15005, whose
+# packages carry that title id in their content id. The add-on's data is in the game itself
+# (the add-ons are unlock keys), so the entitlement is all that matters.
+COMPATIBLE_TITLES = {
+    'CUSA15006': ('CUSA15005',),
+}
 
 
 def pkg_param(path):
@@ -46,6 +54,12 @@ def pkg_param(path):
     return None
 
 
+def accepted_titles(title_id):
+    """The title ids whose add-ons this game's own folder may hold: its own, plus the ones it is
+    served (COMPATIBLE_TITLES)."""
+    return (title_id,) + COMPATIBLE_TITLES.get(title_id, ())
+
+
 def addons(dlc, title_id):
     """{label: source}: this title's add-ons in the folder; source is the add-on's folder, or None
     for a package (only its entitlement is reported)."""
@@ -53,6 +67,7 @@ def addons(dlc, title_id):
     folder = Path(dlc)
     if not title_id or not folder.is_dir():
         return found
+    titles = accepted_titles(title_id)
     for entry in sorted(folder.iterdir()):
         if entry.is_dir():
             try:
@@ -68,7 +83,7 @@ def addons(dlc, title_id):
         else:
             continue
         content = str(info.get('CONTENT_ID', ''))
-        if info.get('CATEGORY') != 'ac' or content[7:16] != title_id or len(content) != 36:
+        if info.get('CATEGORY') != 'ac' or content[7:16] not in titles or len(content) != 36:
             continue
         if label is not None and content[20:] != label:
             continue

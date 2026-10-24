@@ -707,8 +707,8 @@ EN = {
         'Game patches',
     'Португальский (Бразилия)':
         'Portuguese (Brazil)',
-    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) с обновлением 1.15':
-        'This is not MAXIBOOST ON (found {}): MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) with update 1.15 is needed',
+    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 или CUSA15006) с обновлением 1.15':
+        'This is not MAXIBOOST ON (found {}): MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 or CUSA15006) with update 1.15 is needed',
     'Тачпад, левая половина':
         'Touchpad, left half',
     'Тачпад, правая половина':
@@ -759,7 +759,34 @@ EN = {
     'Подключиться к другому ПК': 'Join another PC',
     'Адрес ПК, который принимает игроков': 'Address of the PC that takes the players',
     'Адрес этого ПК: {}': "This PC's address: {}",
+
+    "Файл читов": "Cheat file",
+    "Выбрать файл читов": "Choose the cheat file",
+    "не выбран": "not chosen",
+    "Это не файл читов": "This is not a cheat file",
+    "JSON-файл с читами (формат shadPS4). Каждый чит включается отдельно; байты пишутся в исполняемый файл при запуске игры.": "A JSON file with cheats (the shadPS4 format). Every cheat is switched on by itself; the bytes are written into the executable when the game starts.",
+    "Включить все": "Enable all",
+    "Выключить все": "Disable all",
+    "Включённые читы": "Enabled cheats",
+    # The Windows launcher
+    "MAXIBOOST ON 1.15: поддерживается": "MAXIBOOST ON 1.15: supported",
+    "Выбрать папку игры": "Choose the game folder",
+    "Выход": "Quit",
+    "Диагностика падений": "Crash diagnostics",
+    "Игра завершилась (код {}).": "The game exited (code {}).",
+    "Игра не найдена: выберите папку с eboot.bin": "Game not found: choose the folder with eboot.bin",
+    "Модель памяти": "Memory model",
+    "Не найден исполняемый файл bb-probe.exe. Соберите проект.": "bb-probe.exe not found. Build the project.",
+    "Ограничение кадров": "Frame rate limit",
+    "Очистить журнал": "Clear the log",
+    "Проверка Vulkan": "Vulkan validation",
+    "Режим презентации": "Presentation mode",
+    "Статистика кадров": "Frame statistics",
+    "Файл читов не выбран": "No cheat file chosen",
+    "Язык игры": "Game language",
+    "Язык интерфейса": "Interface language",
 }
+
 
 PT_BR = {
     "Папка DLC": "Pasta de DLC",
@@ -1520,8 +1547,8 @@ PT_BR = {
         'Patches do jogo',
     'Португальский (Бразилия)':
         'Português (Brasil)',
-    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) с обновлением 1.15':
-        'Isto não é o MAXIBOOST ON (encontrado: {}): é preciso o MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) com a atualização 1.15',
+    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 или CUSA15006) с обновлением 1.15':
+        'Isto não é o MAXIBOOST ON (encontrado: {}): é preciso o MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 ou CUSA15006) com a atualização 1.15',
     'Тачпад, левая половина':
         'Touchpad, metade esquerda',
     'Тачпад, правая половина':
@@ -1572,7 +1599,34 @@ PT_BR = {
     'Подключиться к другому ПК': 'Conectar a outro PC',
     'Адрес ПК, который принимает игроков': 'Endereço do PC que recebe os jogadores',
     'Адрес этого ПК: {}': 'Endereço deste PC: {}',
+
+    "Файл читов": "Arquivo de trapaças",
+    "Выбрать файл читов": "Escolher o arquivo de trapaças",
+    "не выбран": "não escolhido",
+    "Это не файл читов": "Isto não é um arquivo de trapaças",
+    "JSON-файл с читами (формат shadPS4). Каждый чит включается отдельно; байты пишутся в исполняемый файл при запуске игры.": "Um arquivo JSON com trapaças (o formato shadPS4). Cada trapaça é ligada separadamente; os bytes são escritos no executável quando o jogo começa.",
+    "Включить все": "Ativar todas",
+    "Выключить все": "Desativar todas",
+    "Включённые читы": "Trapaças ativas",
+    # The Windows launcher
+    "MAXIBOOST ON 1.15: поддерживается": "MAXIBOOST ON 1.15: suportado",
+    "Выбрать папку игры": "Escolher a pasta do jogo",
+    "Выход": "Sair",
+    "Диагностика падений": "Diagnóstico de travamentos",
+    "Игра завершилась (код {}).": "O jogo terminou (código {}).",
+    "Игра не найдена: выберите папку с eboot.bin": "Jogo não encontrado: escolha a pasta com eboot.bin",
+    "Модель памяти": "Modelo de memória",
+    "Не найден исполняемый файл bb-probe.exe. Соберите проект.": "Arquivo executável bb-probe.exe não encontrado. Compile o projeto.",
+    "Ограничение кадров": "Limite de quadros",
+    "Очистить журнал": "Limpar o registro",
+    "Проверка Vulkan": "Validação Vulkan",
+    "Режим презентации": "Modo de apresentação",
+    "Статистика кадров": "Estatísticas de quadros",
+    "Файл читов не выбран": "Nenhum arquivo de cheats escolhido",
+    "Язык игры": "Idioma do jogo",
+    "Язык интерфейса": "Idioma da interface",
 }
+
 
 
 # Spanish (Spain).
@@ -2243,8 +2297,8 @@ ES = {
         'Parches del juego',
     'Португальский (Бразилия)':
         'Portugués (Brasil)',
-    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) с обновлением 1.15':
-        'Esto no es MAXIBOOST ON (encontrado: {}): se necesita MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) con la actualización 1.15',
+    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 или CUSA15006) с обновлением 1.15':
+        'Esto no es MAXIBOOST ON (encontrado: {}): se necesita MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 o CUSA15006) con la actualización 1.15',
     'Тачпад, левая половина':
         'Panel táctil, mitad izquierda',
     'Тачпад, правая половина':
@@ -2295,7 +2349,34 @@ ES = {
     'Подключиться к другому ПК': 'Conectarse a otro PC',
     'Адрес ПК, который принимает игроков': 'Dirección del PC que recibe a los jugadores',
     'Адрес этого ПК: {}': 'Dirección de este PC: {}',
+
+    "Файл читов": "Archivo de trucos",
+    "Выбрать файл читов": "Elegir el archivo de trucos",
+    "не выбран": "no elegido",
+    "Это не файл читов": "Esto no es un archivo de trucos",
+    "JSON-файл с читами (формат shadPS4). Каждый чит включается отдельно; байты пишутся в исполняемый файл при запуске игры.": "Un archivo JSON con trucos (el formato de shadPS4). Cada truco se activa por separado; los bytes se escriben en el ejecutable al iniciar el juego.",
+    "Включить все": "Activar todos",
+    "Выключить все": "Desactivar todos",
+    "Включённые читы": "Trucos activados",
+    # The Windows launcher
+    "MAXIBOOST ON 1.15: поддерживается": "MAXIBOOST ON 1.15: compatible",
+    "Выбрать папку игры": "Elegir la carpeta del juego",
+    "Выход": "Salir",
+    "Диагностика падений": "Diagnóstico de fallos",
+    "Игра завершилась (код {}).": "El juego terminó (código {}).",
+    "Игра не найдена: выберите папку с eboot.bin": "Juego no encontrado: elige la carpeta con eboot.bin",
+    "Модель памяти": "Modelo de memoria",
+    "Не найден исполняемый файл bb-probe.exe. Соберите проект.": "No se encontró el ejecutable bb-probe.exe. Compila el proyecto.",
+    "Ограничение кадров": "Límite de fotogramas",
+    "Очистить журнал": "Vaciar el registro",
+    "Проверка Vulkan": "Validación de Vulkan",
+    "Режим презентации": "Modo de presentación",
+    "Статистика кадров": "Estadísticas de fotogramas",
+    "Файл читов не выбран": "No se eligió un archivo de cheats",
+    "Язык игры": "Idioma del juego",
+    "Язык интерфейса": "Idioma de la interfaz",
 }
+
 
 
 # Italian.
@@ -2966,8 +3047,8 @@ IT = {
         'Patch del gioco',
     'Португальский (Бразилия)':
         'Portoghese (Brasile)',
-    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) с обновлением 1.15':
-        'Questo non è MAXIBOOST ON (trovato {}): serve MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) con l’aggiornamento 1.15',
+    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 или CUSA15006) с обновлением 1.15':
+        'Questo non è MAXIBOOST ON (trovato {}): serve MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 o CUSA15006) con l’aggiornamento 1.15',
     'Тачпад, левая половина':
         'Touchpad, metà sinistra',
     'Тачпад, правая половина':
@@ -3018,7 +3099,34 @@ IT = {
     'Подключиться к другому ПК': 'Collegati a un altro PC',
     'Адрес ПК, который принимает игроков': 'Indirizzo del PC che accoglie i giocatori',
     'Адрес этого ПК: {}': 'Indirizzo di questo PC: {}',
+
+    "Файл читов": "File dei trucchi",
+    "Выбрать файл читов": "Scegli il file dei trucchi",
+    "не выбран": "non scelto",
+    "Это не файл читов": "Questo non è un file dei trucchi",
+    "JSON-файл с читами (формат shadPS4). Каждый чит включается отдельно; байты пишутся в исполняемый файл при запуске игры.": "Un file JSON con trucchi (il formato shadPS4). Ogni trucco si attiva da solo; i byte vengono scritti nell'eseguibile all'avvio del gioco.",
+    "Включить все": "Attiva tutti",
+    "Выключить все": "Disattiva tutti",
+    "Включённые читы": "Trucchi attivati",
+    # The Windows launcher
+    "MAXIBOOST ON 1.15: поддерживается": "MAXIBOOST ON 1.15: supportato",
+    "Выбрать папку игры": "Scegli la cartella del gioco",
+    "Выход": "Esci",
+    "Диагностика падений": "Diagnostica degli arresti anomali",
+    "Игра завершилась (код {}).": "Il gioco è terminato (codice {}).",
+    "Игра не найдена: выберите папку с eboot.bin": "Gioco non trovato: scegli la cartella con eboot.bin",
+    "Модель памяти": "Modello di memoria",
+    "Не найден исполняемый файл bb-probe.exe. Соберите проект.": "File eseguibile bb-probe.exe non trovato. Compila il progetto.",
+    "Ограничение кадров": "Limite di frame",
+    "Очистить журнал": "Svuota il registro",
+    "Проверка Vulkan": "Validazione Vulkan",
+    "Режим презентации": "Modalità presentazione",
+    "Статистика кадров": "Statistiche dei frame",
+    "Файл читов не выбран": "Nessun file di cheat scelto",
+    "Язык игры": "Lingua del gioco",
+    "Язык интерфейса": "Lingua dell'interfaccia",
 }
+
 
 
 # French.
@@ -3689,8 +3797,8 @@ FR = {
         'Correctifs du jeu',
     'Португальский (Бразилия)':
         'Portugais (Brésil)',
-    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) с обновлением 1.15':
-        "Ce n'est pas MAXIBOOST ON (trouvé : {}) : il faut MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) avec la mise à jour 1.15",
+    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 или CUSA15006) с обновлением 1.15':
+        "Ce n'est pas MAXIBOOST ON (trouvé : {}) : il faut MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 ou CUSA15006) avec la mise à jour 1.15",
     'Тачпад, левая половина':
         'Pavé tactile, moitié gauche',
     'Тачпад, правая половина':
@@ -3741,7 +3849,34 @@ FR = {
     'Подключиться к другому ПК': 'Se connecter à un autre PC',
     'Адрес ПК, который принимает игроков': 'Adresse du PC qui accueille les joueurs',
     'Адрес этого ПК: {}': 'Adresse de ce PC : {}',
+
+    "Файл читов": "Fichier de triches",
+    "Выбрать файл читов": "Choisir le fichier de triches",
+    "не выбран": "non choisi",
+    "Это не файл читов": "Ce n'est pas un fichier de triches",
+    "JSON-файл с читами (формат shadPS4). Каждый чит включается отдельно; байты пишутся в исполняемый файл при запуске игры.": "Un fichier JSON de triches (le format shadPS4). Chaque triche s'active séparément ; les octets sont écrits dans l'exécutable au démarrage du jeu.",
+    "Включить все": "Tout activer",
+    "Выключить все": "Tout désactiver",
+    "Включённые читы": "Triches activées",
+    # The Windows launcher
+    "MAXIBOOST ON 1.15: поддерживается": "MAXIBOOST ON 1.15 : pris en charge",
+    "Выбрать папку игры": "Choisir le dossier du jeu",
+    "Выход": "Quitter",
+    "Диагностика падений": "Diagnostic des plantages",
+    "Игра завершилась (код {}).": "Le jeu s'est terminé (code {}).",
+    "Игра не найдена: выберите папку с eboot.bin": "Jeu introuvable : choisissez le dossier avec eboot.bin",
+    "Модель памяти": "Modèle de mémoire",
+    "Не найден исполняемый файл bb-probe.exe. Соберите проект.": "Exécutable bb-probe.exe introuvable. Compilez le projet.",
+    "Ограничение кадров": "Limite de fréquence d'images",
+    "Очистить журнал": "Effacer le journal",
+    "Проверка Vulkan": "Validation Vulkan",
+    "Режим презентации": "Mode présentation",
+    "Статистика кадров": "Statistiques d'images",
+    "Файл читов не выбран": "Aucun fichier de triche choisi",
+    "Язык игры": "Langue du jeu",
+    "Язык интерфейса": "Langue de l'interface",
 }
+
 
 
 # German.
@@ -4412,8 +4547,8 @@ DE = {
         'Spiel-Patches',
     'Португальский (Бразилия)':
         'Portugiesisch (Brasilien)',
-    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) с обновлением 1.15':
-        'Das ist nicht MAXIBOOST ON (gefunden: {}): Benötigt wird MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) mit Update 1.15',
+    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 или CUSA15006) с обновлением 1.15':
+        'Das ist nicht MAXIBOOST ON (gefunden: {}): Benötigt wird MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 oder CUSA15006) mit Update 1.15',
     'Тачпад, левая половина':
         'Touchpad, linke Hälfte',
     'Тачпад, правая половина':
@@ -4464,7 +4599,34 @@ DE = {
     'Подключиться к другому ПК': 'Mit einem anderen PC verbinden',
     'Адрес ПК, который принимает игроков': 'Adresse des PCs, der die Spieler aufnimmt',
     'Адрес этого ПК: {}': 'Adresse dieses PCs: {}',
+
+    "Файл читов": "Cheat-Datei",
+    "Выбрать файл читов": "Cheat-Datei wählen",
+    "не выбран": "nicht gewählt",
+    "Это не файл читов": "Das ist keine Cheat-Datei",
+    "JSON-файл с читами (формат shadPS4). Каждый чит включается отдельно; байты пишутся в исполняемый файл при запуске игры.": "Eine JSON-Datei mit Cheats (das shadPS4-Format). Jeder Cheat wird einzeln eingeschaltet; die Bytes werden beim Spielstart in die ausführbare Datei geschrieben.",
+    "Включить все": "Alle aktivieren",
+    "Выключить все": "Alle deaktivieren",
+    "Включённые читы": "Aktive Cheats",
+    # The Windows launcher
+    "MAXIBOOST ON 1.15: поддерживается": "MAXIBOOST ON 1.15: unterstützt",
+    "Выбрать папку игры": "Spielordner wählen",
+    "Выход": "Beenden",
+    "Диагностика падений": "Absturzdiagnose",
+    "Игра завершилась (код {}).": "Das Spiel wurde beendet (Code {}).",
+    "Игра не найдена: выберите папку с eboot.bin": "Spiel nicht gefunden: Ordner mit eboot.bin wählen",
+    "Модель памяти": "Speichermodell",
+    "Не найден исполняемый файл bb-probe.exe. Соберите проект.": "bb-probe.exe nicht gefunden. Bitte das Projekt bauen.",
+    "Ограничение кадров": "Bildratenbegrenzung",
+    "Очистить журнал": "Protokoll leeren",
+    "Проверка Vulkan": "Vulkan-Validierung",
+    "Режим презентации": "Präsentationsmodus",
+    "Статистика кадров": "Bildstatistik",
+    "Файл читов не выбран": "Keine Cheat-Datei gewählt",
+    "Язык игры": "Spielsprache",
+    "Язык интерфейса": "Oberflächensprache",
 }
+
 
 
 # Simplified Chinese.
@@ -5079,8 +5241,8 @@ ZH_CN = {
         '游戏补丁',
     'Португальский (Бразилия)':
         '葡萄牙语（巴西）',
-    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758) с обновлением 1.15':
-        '这不是 MAXIBOOST ON（检测到 {}）：需要带 1.15 更新的 MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON（CUSA18758）',
+    'Это не MAXIBOOST ON (найдено {}): нужна MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON (CUSA18758 или CUSA15006) с обновлением 1.15':
+        '这不是 MAXIBOOST ON（检测到 {}）：需要带 1.15 更新的 MOBILE SUIT GUNDAM EXTREME VS. MAXIBOOST ON（CUSA18758 或 CUSA15006）',
     'Тачпад, левая половина':
         '触摸板左侧',
     'Тачпад, правая половина':
@@ -5131,7 +5293,34 @@ ZH_CN = {
     'Подключиться к другому ПК': '连接到另一台电脑',
     'Адрес ПК, который принимает игроков': '接收玩家的电脑的地址',
     'Адрес этого ПК: {}': '这台电脑的地址：{}',
+
+    "Файл читов": "金手指文件",
+    "Выбрать файл читов": "选择金手指文件",
+    "не выбран": "未选择",
+    "Это не файл читов": "这不是金手指文件",
+    "JSON-файл с читами (формат shadPS4). Каждый чит включается отдельно; байты пишутся в исполняемый файл при запуске игры.": "包含金手指的 JSON 文件（shadPS4 格式）。每个金手指可单独开启；启动游戏时字节会写入可执行文件。",
+    "Включить все": "全部启用",
+    "Выключить все": "全部禁用",
+    "Включённые читы": "已启用的金手指",
+    # The Windows launcher
+    "MAXIBOOST ON 1.15: поддерживается": "MAXIBOOST ON 1.15：受支持",
+    "Выбрать папку игры": "选择游戏文件夹",
+    "Выход": "退出",
+    "Диагностика падений": "崩溃诊断",
+    "Игра завершилась (код {}).": "游戏已退出（代码 {}）。",
+    "Игра не найдена: выберите папку с eboot.bin": "未找到游戏：请选择包含 eboot.bin 的文件夹",
+    "Модель памяти": "内存模型",
+    "Не найден исполняемый файл bb-probe.exe. Соберите проект.": "未找到可执行文件 bb-probe.exe。请先编译项目。",
+    "Ограничение кадров": "帧率限制",
+    "Очистить журнал": "清空日志",
+    "Проверка Vulkan": "Vulkan 验证",
+    "Режим презентации": "演示模式",
+    "Статистика кадров": "帧统计",
+    "Файл читов не выбран": "未选择金手指文件",
+    "Язык игры": "游戏语言",
+    "Язык интерфейса": "界面语言",
 }
+
 
 # Translations by language code; Russian is the key itself. Strings missing in a translation
 # fall back to English, not to the Russian key.

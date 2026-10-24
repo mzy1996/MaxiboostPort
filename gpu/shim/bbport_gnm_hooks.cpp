@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "host_services.h"
 #include "bbport_gnm_hooks.h"
 
 #include <algorithm>
@@ -10,7 +11,6 @@
 #include <cstring>
 #include <thread>
 #include <vector>
-#include <sys/mman.h>
 #include <unistd.h>
 
 namespace BbGnmHooks {
@@ -37,7 +37,7 @@ constexpr std::size_t CounterStride = 64; // one cache line per counter
 
 u8* stubs = nullptr;
 u64* CounterAt(std::size_t i) {
-    const std::size_t page = std::size_t(sysconf(_SC_PAGESIZE));
+    const std::size_t page = std::size_t(HostPageSize());
     const std::size_t code_bytes = ((Count + 1) * SlotSize + page - 1) / page * page;
     return reinterpret_cast<u64*>(stubs + code_bytes + i * CounterStride);
 }
@@ -47,9 +47,8 @@ u8* MapNear(unsigned char* image, std::uint64_t image_size, std::size_t size) {
     const u64 base = reinterpret_cast<u64>(image);
     for (u64 k = 1; k <= 64; ++k) {
         for (const u64 hint : {base - k * (16ull << 20), base + image_size + k * (16ull << 20)}) {
-            void* p = mmap(reinterpret_cast<void*>(hint), size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-            if (p != MAP_FAILED) {
+            void* p = HostMapAt(reinterpret_cast<void*>(hint), size, HostProtRead | HostProtWrite);
+            if (p) {
                 return static_cast<u8*>(p);
             }
         }
@@ -517,7 +516,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         return;
     }
     const std::size_t stub_bytes = (Count + 1) * SlotSize; // + the shared exit thunk
-    const std::size_t page = std::size_t(sysconf(_SC_PAGESIZE));
+    const std::size_t page = std::size_t(HostPageSize());
     const std::size_t code_bytes = (stub_bytes + page - 1) / page * page;
     const std::size_t map_bytes = code_bytes + Count * CounterStride;
     image_base = reinterpret_cast<u64>(image);
@@ -588,7 +587,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         std::memset(fn + 5, 0xcc, e.prologue_size - 5);
         ++patched;
     }
-    mprotect(stubs, code_bytes, PROT_READ | PROT_EXEC);
+    Core::MProtect(stubs, code_bytes, Core::ProtRead | Core::ProtExec);
     std::printf("Gnm census: %zu of %zu libGnm entry points hooked (%zu do not match the 1.09 eboot)%s\n",
                 patched, Count, mismatched, observe ? "; command buffer methods observed" : "");
     std::thread(ReportLoop).detach();
