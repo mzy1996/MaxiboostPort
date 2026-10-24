@@ -84,6 +84,7 @@ int runtime_users_next_login(void);
 uintptr_t runtime_process_resolve_data(const char *name);
 void runtime_process_load_unwind(const char *path, const unsigned char *image);
 void runtime_guest_backtrace(FILE *out);
+void runtime_guest_where(FILE *out, uint64_t address);
 void runtime_fiber_report(void);
 uintptr_t runtime_ngs2_resolve(const char *name);
 uintptr_t runtime_font_resolve(const char *name);

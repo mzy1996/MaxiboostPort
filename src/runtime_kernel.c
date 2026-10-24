@@ -195,6 +195,11 @@ static ABI __attribute__((noreturn)) void hard_exit(int status) {
 }
 static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t argument) {
     fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
+    /* The caller is where the game raised it: the frame pointer is often left out on
+     * this platform, so the return address is read instead. */
+    { const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
+      fprintf(stderr,"  raised at %p\n",(void *)caller);
+      runtime_guest_where(stderr,(uint64_t)caller); }
     runtime_guest_backtrace(stderr);
     runtime_report();
     exit(23);

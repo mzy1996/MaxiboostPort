@@ -84,6 +84,14 @@ static const UnwindModule *unwind_module_at(uint64_t address) {
         if (address>=unwind_modules[i].start && address-unwind_modules[i].start<unwind_modules[i].size) return &unwind_modules[i];
     return NULL;
 }
+/* Where an address is: the module it belongs to and the offset in it (or the address
+ * itself when it is in none of them). */
+void runtime_guest_where(FILE *out, uint64_t address) {
+    const UnwindModule *m=unwind_module_at(address);
+    if (m) fprintf(out,"  the address is in %s at +0x%llx\n",m->name,
+                         (unsigned long long)(address-m->start));
+    else fprintf(out,"  the address is in no module\n");
+}
 /* The guest frames above the caller (frame pointers; PS4 code keeps them), each as module+offset:
  * where a guest thread stopped (a debug exception: an uncaught C++ exception ends in one). */
 void runtime_guest_backtrace(FILE *out) {
