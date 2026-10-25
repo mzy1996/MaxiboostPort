@@ -144,18 +144,37 @@ def link(game, out, module_names=DEFAULT_MODULES):
         return identities[key]
 
     exports, by_nid = {}, collections.defaultdict(list)
+    # The layout of the modules first, then their exports: the main program is linked
+    # before the libraries, and it imports some of the libraries' symbols, which are
+    # their exports (the same identity, another spelling). Without knowing them, the
+    # import would be left to the runtime, which does not have it, and the game would
+    # call nothing.
+    layout = {}
+    base = (size + 65535) & ~65535
+    for filename in module_names:
+        m = module(game / 'sce_module' / filename)
+        loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
+        modsize = max(p['vaddr'] + p['memsz'] for p in loads)
+        if base + modsize > 512 * 1024 * 1024:
+            raise ValueError('linked image exceeds probe limit')
+        layout[filename] = (m, base, modsize, loads)
+        base = (base + modsize + 65535) & ~65535
+    for filename, (m, module_base, modsize, loads) in layout.items():
+        for s in m['symbols']:
+            if s['section'] and s['binding'] in (1, 2) and s['identity'] and s['type'] in (1, 2):
+                if s['identity'] in exports:
+                    raise ValueError(f'{filename}: ambiguous export')
+                entry_value = (module_base + s['value'], 2 if s['type'] == 1 else 1, filename)
+                exports[s['identity']] = entry_value
+                by_nid[(s['identity'][0], s['identity'][1][0])].append(entry_value)
     table = []
     base = (size + 65535) & ~65535
     fs_patched = patch_fs_loads(image, main['ph'], 0)
     tls_module = 2
     module_phs = []
     for filename in module_names:
-        m = module(game / 'sce_module' / filename)
+        m, base, modsize, loads = layout[filename]
         module_phs.append(m['ph'])
-        loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
-        modsize = max(p['vaddr'] + p['memsz'] for p in loads)
-        if base + modsize > 512 * 1024 * 1024:
-            raise ValueError('linked image exceeds probe limit')
         image.extend(bytes(base + modsize - len(image)))
 
         def mapped(address, length=8, loads=loads):
@@ -195,10 +214,15 @@ def link(game, out, module_names=DEFAULT_MODULES):
                 elif not symbol['identity'] and symbol['binding'] == 2:
                     struct.pack_into('<Q', image, target, 0)  # weak undefined (module_start/stop)
                 else:
-                    rk = 2 if symbol['type'] == 1 else 1
-                    if (rk == 1 and addend) or not 0 <= addend < 4096:
-                        raise ValueError(f'{filename}: unsupported import addend')
-                    relocs.append((target, rk, imported(symbol), addend))
+                    found = exports.get(symbol['identity'])
+                    if found is not None and found[2] != filename:
+                        # The symbol is another module's export: the call goes there.
+                        struct.pack_into('<Q', image, target, found[0])
+                    else:
+                        rk = 2 if symbol['type'] == 1 else 1
+                        if (rk == 1 and addend) or not 0 <= addend < 4096:
+                            raise ValueError(f'{filename}: unsupported import addend')
+                        relocs.append((target, rk, imported(symbol), addend))
             else:
                 raise ValueError(f'{filename}: unsupported relocation type {kind}')
         count = 0
@@ -206,10 +230,8 @@ def link(game, out, module_names=DEFAULT_MODULES):
             if s['section'] and s['binding'] in (1, 2) and s['identity'] and s['type'] in (1, 2):
                 if not mapped(s['value'], max(1, s['size'])):
                     raise ValueError(f'{filename}: export outside load segments')
-                if s['identity'] in exports:
-                    raise ValueError(f'{filename}: ambiguous export')
                 entry_value = (base + s['value'], 2 if s['type'] == 1 else 1, filename)
-                exports[s['identity']] = entry_value
+                exports.setdefault(s['identity'], entry_value)
                 by_nid[(s['identity'][0], s['identity'][1][0])].append(entry_value)
                 count += 1
         fs_patched += patch_fs_loads(image, m['ph'], base)

@@ -202,6 +202,38 @@ static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t
     { const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
       fprintf(stderr,"  raised at %p\n",(void *)caller);
       runtime_guest_where(stderr,(uint64_t)caller);
+      /* The game runs on this processor, so its registers are the ones of the host here:
+       * the return value of the call it made before (rax) and the rest say what it did. */
+      uint64_t registers[16];
+      __asm__ volatile(
+          "movq %%rax,  0(%0)\n\t" "movq %%rbx,  8(%0)\n\t" "movq %%rcx, 16(%0)\n\t"
+          "movq %%rdx, 24(%0)\n\t" "movq %%rsi, 32(%0)\n\t" "movq %%rdi, 40(%0)\n\t"
+          "movq %%rbp, 48(%0)\n\t" "movq %%rsp, 56(%0)\n\t" "movq %%r8,  64(%0)\n\t"
+          "movq %%r9,  72(%0)\n\t" "movq %%r10, 80(%0)\n\t" "movq %%r11, 88(%0)\n\t"
+          "movq %%r12, 96(%0)\n\t" "movq %%r13,104(%0)\n\t" "movq %%r14,112(%0)\n\t"
+          "movq %%r15,120(%0)\n\t" : : "r"(registers) : "memory");
+      static const char *const names[16]={"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+          "r8","r9","r10","r11","r12","r13","r14","r15"};
+      for (int i=0;i<16;++i) fprintf(stderr,"  %s=%#llx\n",names[i],(unsigned long long)registers[i]);
+      /* The game's own frames: a return address is the one after a call, and the call is
+       * either a direct one (E8) or an indirect one (FF /2). Only those are frames; the
+       * rest of the stack holds data that looks like an address. */
+      { const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
+        int shown=0;
+        for (int i=0;i<400 && shown<12;++i) {
+            const uintptr_t at=sp[i];
+            if (!runtime_guest_address(at,NULL,NULL)) continue;
+            uint8_t before[8];
+            if (platform_read_memory((void *)(at-8),before,sizeof(before))) continue;
+            const int direct=before[3]==0xE8;
+            const int indirect=before[3]==0xFF && (before[4]&7)==2;
+            if (!direct && !indirect) continue;
+            uint64_t offset=0; const char *module=NULL;
+            runtime_guest_address(at,&offset,&module);
+            fprintf(stderr,"  a frame of the game: %s+%#llx (after a %s call)\n",
+                    module?module:"its code",(unsigned long long)offset,direct?"direct":"indirect");
+            ++shown;
+        } }
       /* The game's own frames on the stack: where it was when it stopped. */
       uint64_t addresses[8];
       const int found=guest_call_addresses(addresses,8);
