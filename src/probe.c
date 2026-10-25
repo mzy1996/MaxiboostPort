@@ -753,6 +753,15 @@ int main(int argc, char **argv) {
             }
         }
         memcpy(image + relocs[i].target, &value, 8);
+        if (getenv("BB_DUMP_IMPORTS")) {
+            const char *name=names[relocs[i].value];
+            const char *symbol=runtime_symbol(name);
+            const uintptr_t resolved=runtime_resolve(name,relocs[i].kind==2);
+            printf("IMPORT %s -> %s%s (kind %d addend %#llx)%s\n",name,
+                   symbol?symbol:"(no name)",resolved?" resolved":"",
+                   relocs[i].kind,(unsigned long long)relocs[i].addend,
+                   (relocs[i].kind==1&&!resolved&&!native_libc)?" TRAP":"");
+        }
     }
     /* BB_LIST_UNRESOLVED=1: every import neither the runtime nor a linked module provides, then
      * exit; the whole list at once instead of the first one the game happens to call. */

@@ -202,6 +202,7 @@ static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t
     { const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
       fprintf(stderr,"  raised at %p\n",(void *)caller);
       runtime_guest_where(stderr,(uint64_t)caller);
+      { fprintf(stderr,"Runtime: the game's frames:\n"); runtime_guest_backtrace(stderr); }
       /* The game runs on this processor, so its registers are the ones of the host here:
        * the return value of the call it made before (rax) and the rest say what it did. */
       uint64_t registers[16];
@@ -219,6 +220,17 @@ static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t
        * either a direct one (E8) or an indirect one (FF /2). Only those are frames; the
        * rest of the stack holds data that looks like an address. */
       { const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
+        /* The frame pointer chain of the guest (it keeps the frame pointer). */
+        { uintptr_t frame=registers[6]; /* rbp */
+          for (int depth=0; depth<24 && frame; ++depth) {
+              uint64_t saved=0, ret=0;
+              if (platform_read_memory((void *)frame,&saved,8) || platform_read_memory((void *)(frame+8),&ret,8)) break;
+              uint64_t offset=0; const char *module=NULL;
+              runtime_guest_address(ret,&offset,&module);
+              fprintf(stderr,"  #%d %p %s+%#llx\n",depth,(void *)ret,module?module:"(host)",(unsigned long long)offset);
+              if (saved<=frame) break;
+              frame=saved;
+          } }
         int shown=0;
         for (int i=0;i<400 && shown<12;++i) {
             const uintptr_t at=sp[i];

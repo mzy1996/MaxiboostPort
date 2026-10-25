@@ -105,7 +105,25 @@ void runtime_guest_where(FILE *out, uint64_t address) {
 /* The guest frames above the caller (frame pointers; PS4 code keeps them), each as module+offset:
  * where a guest thread stopped (a debug exception: an uncaught C++ exception ends in one). */
 void runtime_guest_backtrace(FILE *out) {
+    /* The guest's own frames are further down the stack: its code keeps the frame pointer,
+     * so the chain on its stack is the call chain. The host's frames come first, so the
+     * guest's frame pointer is looked for: a word whose two neighbours are both in the
+     * game's code. */
     uintptr_t rbp=(uintptr_t)__builtin_frame_address(0);
+    { const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
+      int shown=0;
+      for (int i=0;i<400 && shown<24;++i) {
+          const uintptr_t at=sp[i];
+          const UnwindModule *m=unwind_module_at(at);
+          if (!m) continue;
+          unsigned char before[8];
+          if (platform_read_memory((void *)(at-8),before,sizeof(before))) continue;
+          const int direct=before[3]==0xE8;
+          const int indirect=before[3]==0xFF && (before[4]&7)==2;
+          if (!direct && !indirect) continue;
+          fprintf(out,"  #%d %s+%#llx\n",shown,m->name,(unsigned long long)(at-m->start));
+          ++shown;
+      } }
     for (int depth=0; depth<40 && rbp; ++depth) {
         uintptr_t frame[2];
         if (platform_read_memory((void *)rbp,frame,sizeof(frame)) || frame[0]<=rbp) break;

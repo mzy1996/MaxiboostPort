@@ -38,7 +38,13 @@ void runtime_set_procparam(void *param) {
     process_param=param;
     /* bbport: the game's libc heap settings (SceProcParam +0x30: SceLibcParam; its +0x10.. pointers to
      * the heap size, delayed and extended allocation flags, initial size). */
-    const uint64_t *p=(const uint64_t *)param;
+    uint64_t *p=(uint64_t *)param;
+    if (!p) return;
+    /* The game dumps the library's settings through +0x30, and the game's own file leaves
+     * that field empty (the system builds the struct). The library's settings are at +0x38
+     * (the same structure), so the pointer goes there. Without it the game stops in the
+     * library's own check of its heap. */
+    if (!p[6] && p[7]) p[6]=p[7];
     if (!p || p[0]<0x38 || !p[6]) return;
     const uint64_t *libc=(const uint64_t *)p[6];
     printf("Runtime: libc param size %#llx, entries %u", (unsigned long long)libc[0], (unsigned)libc[1]);
