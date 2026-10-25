@@ -146,6 +146,7 @@ static void *guest_main_start(void *argument) {
     const GuestMain *main_thread=(const GuestMain *)argument;
     typedef void (ABI *Entry)(void *, void (ABI *)(void));
     ((Entry)(main_thread->entry))(main_thread->params,main_thread->exit_fn);
+    fprintf(stderr,"Runtime: the game's entry returned\n");
     return NULL;
 }
 #endif
@@ -524,6 +525,39 @@ static NtQueryThreadStartFn thread_start_of(void) {
     }
     return fn;
 }
+#ifdef _WIN32
+/* Whether an address is in the program itself (the game's threads) or in the system. */
+static uintptr_t watchdog_image_lo=0, watchdog_image_hi=0;
+void watchdog_set_image(uintptr_t lo,uintptr_t hi) { watchdog_image_lo=lo; watchdog_image_hi=hi; }
+static int watchdog_in_program(uintptr_t address) {
+    static uintptr_t lo=0, hi=0;
+    if (!lo) {
+        HMODULE base=GetModuleHandleA(NULL);
+        if (!base) return 0;
+        lo=(uintptr_t)base;
+        MEMORY_BASIC_INFORMATION info;
+        if (VirtualQuery((void *)base,&info,sizeof(info))==sizeof(info)) hi=lo+info.RegionSize;
+        else hi=lo+(1u<<20);
+    }
+    if (address>=watchdog_image_lo && address<watchdog_image_hi) return 1;
+    return address>=lo && address<hi;
+}
+/* The number of threads there are (Windows): the tool help knows them all. */
+static unsigned thread_count(void) {
+    unsigned count=0;
+    HANDLE all=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    if (all!=INVALID_HANDLE_VALUE) {
+        THREADENTRY32 one;
+        one.dwSize=sizeof(one);
+        if (Thread32First(all,&one)) do { ++count; } while (Thread32Next(all,&one));
+        CloseHandle(all);
+    }
+    return count;
+}
+#define THREAD_COUNT_NOTE(where) fprintf(stderr,"Threads %s: %u\n",where,thread_count())
+#else
+#define THREAD_COUNT_NOTE(where)
+#endif
 /* The watchdog (Windows): the game can wait for something that never comes, and then
  * nothing is said. The threads are looked at after the time is up: where each of them
  * is, and (for the ones that are in the game's own code) which place of the game. */
@@ -532,119 +566,71 @@ static void *watchdog_image;
 static unsigned watchdog_seconds;
 static DWORD WINAPI watchdog_thread(LPVOID parameter) {
     (void)parameter;
-    Sleep(watchdog_seconds?watchdog_seconds*1000:0);
-    if (watchdog_fired) return 0;
-    watchdog_fired=1;
-    /* The report goes to a file of its own: the runtime's output is full of the game's
-     * own work, and this report is what is looked for. */
-    FILE *report=fopen("watchdog.txt","w");
-    FILE *out=report?report:stderr;
-    fprintf(out,"STOP: watchdog timeout; the threads:\n");
-    {   /* The modules of the process: the threads of the program are looked for in them. */
-        HANDLE modules=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,
-                                                 GetCurrentProcessId());
-        if (modules!=INVALID_HANDLE_VALUE) {
-            MODULEENTRY32 module;
-            module.dwSize=sizeof(module);
-            if (Module32First(modules,&module)) do
-                fprintf(out,"  module: %s at %#llx\n",module.szModule,
-                        (unsigned long long)(uintptr_t)module.modBaseAddr);
-            while (Module32Next(modules,&module));
-            CloseHandle(modules);
-        }
-    }
-    {   /* How many threads there are: a great many of them is a sign on its own. */
-        DWORD count=0;
-        HANDLE all=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
-        if (all!=INVALID_HANDLE_VALUE) {
-            THREADENTRY32 one;
-            one.dwSize=sizeof(one);
-            if (Thread32First(all,&one)) do { ++count; } while (Thread32Next(all,&one));
-            CloseHandle(all);
-        }
-        fprintf(out,"  %lu threads in all\n",(unsigned long)count);
-        {   /* Where the threads started: the same place means the same creator. */
-            HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
-            if (snapshot!=INVALID_HANDLE_VALUE) {
-                THREADENTRY32 one;
-                one.dwSize=sizeof(one);
-                if (Thread32First(snapshot,&one)) do {
-                    HANDLE thread=OpenThread(THREAD_QUERY_INFORMATION,FALSE,one.th32ThreadID);
-                    if (!thread) continue;
-                    ULONG_PTR start=0;
-                    ULONG length=0;
-                    if (thread_start_of() && thread_start_of()(thread,9,&start,sizeof(start),&length)==0) {
-                        const uintptr_t at=(uintptr_t)start;
-                        char where[128]="(the program)";
+    const unsigned interval=watchdog_seconds?watchdog_seconds:10;
+    FILE *out=fopen("watchdog.txt","w");
+    if (!out) out=stderr;
+    for (unsigned round=0;;++round) {
+        Sleep(interval*200);
+        fprintf(out,"--- round %u ---\n",round);
+        /* The threads of the program itself: the many others belong to the system. */
+        HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        unsigned count=0, mine=0;
+        if (snapshot!=INVALID_HANDLE_VALUE) {
+            THREADENTRY32 entry;
+            entry.dwSize=sizeof(entry);
+            /* The game's own threads are asked: the runtime knows their numbers (the
+             * system's nine thousand threads are not asked about). */
+            uint64_t ids[256];
+            char names[256][32];
+            const size_t guests=runtime_thread_guest_threads(ids,names[0],32,256);
+            for (size_t g=0;g<guests;++g) {
+                HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT,FALSE,(DWORD)ids[g]);
+                if (!thread) continue;
+                SuspendThread(thread);
+                CONTEXT context;
+                memset(&context,0,sizeof(context));
+                context.ContextFlags=CONTEXT_CONTROL;
+                if (GetThreadContext(thread,&context)) {
+                    const uintptr_t rip=(uintptr_t)context.Rip;
+                    ++mine;
+                    fprintf(out,"  guest '%s' tid=%llu rip=%p",names[g],(unsigned long long)ids[g],(void *)rip);
+                    {   /* What the thread waits for (the runtime knows). */
+                        const char *what=runtime_wait_marked_of(ids[g]);
+                        if (what) fprintf(out," waits for %s",what);
+                    }
+                    if (watchdog_image)
+                        fprintf(out," image+%#llx",
+                                (unsigned long long)(rip-(uintptr_t)watchdog_image));
+                    {   /* The module the place is in. */
                         HANDLE modules=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,
                                                                  GetCurrentProcessId());
                         if (modules!=INVALID_HANDLE_VALUE) {
                             MODULEENTRY32 module;
                             module.dwSize=sizeof(module);
                             if (Module32First(modules,&module)) do {
-                                if (at>=(uintptr_t)module.modBaseAddr &&
-                                    at<(uintptr_t)module.modBaseAddr+module.modBaseSize) {
-                                    snprintf(where,sizeof(where),"%s+%#llx",module.szModule,
-                                             (unsigned long long)(at-(uintptr_t)module.modBaseAddr));
+                                if (rip>=(uintptr_t)module.modBaseAddr &&
+                                    rip<(uintptr_t)module.modBaseAddr+module.modBaseSize) {
+                                    fprintf(out," in %s+%#llx",module.szModule,
+                                            (unsigned long long)(rip-(uintptr_t)module.modBaseAddr));
                                     break;
                                 }
                             } while (Module32Next(modules,&module));
                             CloseHandle(modules);
                         }
-                        fprintf(out,"  thread start: %s at %#llx\n",where,(unsigned long long)at);
                     }
-                    CloseHandle(thread);
-                } while (Thread32Next(snapshot,&one));
-                CloseHandle(snapshot);
+                    fprintf(out,"\n");
+                }
+                ResumeThread(thread);
+                CloseHandle(thread);
             }
+            CloseHandle(snapshot);
         }
-    }
-    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
-    if (snapshot!=INVALID_HANDLE_VALUE) {
-        THREADENTRY32 entry;
-        entry.dwSize=sizeof(entry);
-        if (Thread32First(snapshot,&entry)) do {
-            HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,entry.th32ThreadID);
-            if (!thread) continue;
-            SuspendThread(thread);
-            CONTEXT context;
-            memset(&context,0,sizeof(context));
-            context.ContextFlags=CONTEXT_CONTROL;
-            if (GetThreadContext(thread,&context)) {
-                const uintptr_t rip=(uintptr_t)context.Rip;
-                fprintf(out,"  tid=%lu rip=%p",(unsigned long)entry.th32ThreadID,(void *)rip);
-                {   /* The module the thread is in. */
-                    HANDLE modules=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,
-                                                             GetCurrentProcessId());
-                    if (modules!=INVALID_HANDLE_VALUE) {
-                        MODULEENTRY32 module;
-                        module.dwSize=sizeof(module);
-                        if (Module32First(modules,&module)) do {
-                            if (rip>=(uintptr_t)module.modBaseAddr &&
-                                rip<(uintptr_t)module.modBaseAddr+module.modBaseSize) {
-                                fprintf(out," in %s+%#llx",module.szModule,
-                                        (unsigned long long)(rip-(uintptr_t)module.modBaseAddr));
-                                break;
-                            }
-                        } while (Module32Next(modules,&module));
-                        CloseHandle(modules);
-                    }
-                }
-
-                if (watchdog_image) {
-                    const uint64_t offset=rip-(uintptr_t)watchdog_image;
-                    fprintf(out," image+%#llx",(unsigned long long)offset);
-                }
-                fprintf(out,"\n");
-            }
-            ResumeThread(thread);
-            CloseHandle(thread);
-        } while (Thread32Next(snapshot,&entry));
-        CloseHandle(snapshot);
-        if (report) fclose(report);
+        fprintf(out,"  %u threads in all, %u of them the program's\n",count,mine);
+        fflush(out);
     }
     return 0;
 }
+
 #endif
 
 #ifdef _WIN32
@@ -684,6 +670,7 @@ int main(int argc, char **argv) {
         fwrite(buffer,1,(size_t)length,stdout);
         return 0;
     }
+    THREAD_COUNT_NOTE("at the start");
     check_cpu();
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
@@ -756,6 +743,7 @@ int main(int argc, char **argv) {
     uint64_t capabilities = memcmp(magic, "BBPROBE1", 8) ? read64(f) : 0;
     if (capabilities & ~UINT64_C(1)) fail("unknown runtime capabilities");
     runtime_start(strict_imports ? 0 : capabilities);
+    THREAD_COUNT_NOTE("after the runtime starts");
     if (!size || size > 512*1024*1024 || entry >= size || !ns || ns > 64 || nr > 1000000 || import_count > 100000)
         fail("boot file limits exceeded");
     int multi=!memcmp(magic,"BBPROBE5",8);
@@ -937,6 +925,7 @@ int main(int argc, char **argv) {
     if (!executable_entry) fail("entry is not executable");
     runtime_count_install(image);
     cpu_watch_install();
+    THREAD_COUNT_NOTE("after the modules are loaded");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
     if (native_libc) {
         for (uint64_t m=0;m<module_count;++m) {
@@ -963,6 +952,7 @@ int main(int argc, char **argv) {
             if (result) fail("module initializer failed");
         }
     }
+    THREAD_COUNT_NOTE("before the game");
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
 #ifdef _WIN32
@@ -970,6 +960,12 @@ int main(int argc, char **argv) {
      * is said at all. */
     watchdog_image=image;
     watchdog_seconds=timeout_seconds;
+    {   /* The image is the game's own code: the threads that are in it are the game's. */
+        MEMORY_BASIC_INFORMATION info;
+        if (VirtualQuery(image,&info,sizeof(info))==sizeof(info))
+            watchdog_set_image((uintptr_t)info.BaseAddress,(uintptr_t)info.BaseAddress+info.RegionSize);
+        else watchdog_set_image((uintptr_t)image,(uintptr_t)image+64*1024*1024);
+    }
     if (timeout_seconds) {
         HANDLE watchdog=CreateThread(NULL,0,watchdog_thread,NULL,0,NULL);
         if (watchdog) CloseHandle(watchdog);

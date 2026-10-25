@@ -455,6 +455,31 @@ static void guest_call_sites(uint64_t out[3]) {
         out[i]=offset;
     }
 }
+/* What a thread waits for: it is said when it is asked to (BB_WAIT_TRACE=1). The mark
+ * is kept where the watchdog can read it: the thread's own number is the key (the
+ * thread local one is of no use to another thread). */
+static _Thread_local const char *wait_mark;
+static struct { uint64_t tid; const char *what; } wait_marks[256];
+static pthread_mutex_t wait_marks_lock=PTHREAD_MUTEX_INITIALIZER;
+void runtime_wait_mark(const char *what) {
+    wait_mark=what;
+    const uint64_t tid=platform_thread_id();
+    pthread_mutex_lock(&wait_marks_lock);
+    for (size_t i=0;i<256;++i)
+        if (wait_marks[i].tid==tid || !wait_marks[i].tid) {
+            wait_marks[i].tid=tid; wait_marks[i].what=what; break;
+        }
+    pthread_mutex_unlock(&wait_marks_lock);
+}
+const char *runtime_wait_marked(void) { return wait_mark; }
+const char *runtime_wait_marked_of(uint64_t tid) {
+    const char *what=0;
+    pthread_mutex_lock(&wait_marks_lock);
+    for (size_t i=0;i<256;++i)
+        if (wait_marks[i].tid==tid) { what=wait_marks[i].what; break; }
+    pthread_mutex_unlock(&wait_marks_lock);
+    return what;
+}
 void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
     if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL;

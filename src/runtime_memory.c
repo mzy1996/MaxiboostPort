@@ -29,18 +29,17 @@
  * pool is an address range, not memory the game has to fill: on a machine with little
  * memory a smaller pool means a smaller reservation. */
 #define DMEM_MIN_MB 512
-#define DMEM_MAX_MB 16384
+#define DMEM_MAX_MB 65536
 /* The memory bookkeeping says what it does when it is asked to (BB_MEMORY_TRACE=1): the
  * game's own work fills the output otherwise. */
-/* The share of the pool that is not the game's (BB_DMEM_RESERVE_MB). */
-static long dmem_reserve_mb(void) {
-    static long reserve=-1;
-    if (reserve<0) { const char *t=getenv("BB_DMEM_RESERVE_MB"); reserve=t?strtol(t,NULL,10):0; }
-    return reserve;
-}
 static int memory_trace(void) {
     static int trace=-1;
-    if (trace<0) { const char *t=getenv("BB_MEMORY_TRACE"); trace=t&&t[0]=='1'; }
+    if (trace<0) {
+        const char *t=getenv("BB_MEMORY_TRACE");
+        trace=t&&t[0]=='1';
+        fprintf(stderr,"Runtime: the memory trace is %s (the variable says %s)\n",
+                trace?"on":"off",t?t:"(nothing)");
+    }
     return trace;
 }
 static uint64_t pool_size_bytes(void) {
@@ -48,7 +47,7 @@ static uint64_t pool_size_bytes(void) {
     if (!size) {
         const char *env = getenv("BB_DMEM_MB");
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
-        if (mb < DMEM_MIN_MB || mb > DMEM_MAX_MB) mb = 5056;
+        if (mb < DMEM_MIN_MB || mb > DMEM_MAX_MB) mb = 5120;
         size = mb * 1024 * 1024;
     }
     return size;
@@ -103,7 +102,27 @@ static void write_unlock(void) {
 }
 static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock); }
 static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
+/* The blocks of the direct memory, in order of their address (the game takes and gives
+ * back a great many of them, and the table is looked at every time: the order keeps
+ * the lookups short). Only the blocks that are in use are in the list. */
 static Block blocks[LIMIT];
+static int block_count;
+
+/* The first block whose end is after the given address (the blocks are in order). */
+static int block_first_ending_after(uint64_t phys) {
+    int lo=0, hi=block_count;
+    while (lo<hi) {
+        const int mid=(lo+hi)/2;
+        if (blocks[mid].start+blocks[mid].size>phys) hi=mid; else lo=mid+1;
+    }
+    return lo;
+}
+/* The block that holds the given address (the blocks are in order). */
+static int block_holding(uint64_t phys) {
+    const int i=block_first_ending_after(phys);
+    if (i<block_count && blocks[i].start<=phys) return i;
+    return -1;
+}
 static Vma *vmas; static size_t vma_count, vma_capacity;
 static int pool_fd=-1;
 static int flex_fd=-1;
@@ -497,28 +516,49 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     return 0;
 }
 static int block_type(uint64_t phys) {
-    for (int i=0;i<LIMIT;++i)
-        if (blocks[i].used && phys>=blocks[i].start && phys-blocks[i].start<blocks[i].size) return blocks[i].type;
-    return -1;
+    const int i=block_holding(phys);
+    return i<0 ? -1 : blocks[i].type;
 }
 static int direct_range_allocated(uint64_t phys, uint64_t size) {
-    for (uint64_t at=phys; at<phys+size;) {
-        int found=0;
-        for (int i=0;i<LIMIT;++i) if (blocks[i].used && at>=blocks[i].start && at-blocks[i].start<blocks[i].size) {
-            at=blocks[i].start+blocks[i].size; found=1; break;
-        }
-        if (!found) return 0;
+    /* The blocks are in order, so the range is allocated when the blocks cover it
+     * without a gap. */
+    uint64_t at=phys;
+    while (at<phys+size) {
+        const int i=block_first_ending_after(at);
+        if (i>=block_count || blocks[i].start>at) return 0;
+        at=blocks[i].start+blocks[i].size;
     }
     return 1;
 }
 
-static ABI uint64_t direct_size(void) { return POOL_SIZE; }
+/* The share of the direct memory that the system keeps for itself (its own graphics
+ * buffers): the game is told the size of what is left, and the answer the query gives
+ * leaves the share out as well (on the real machine the system holds a part of the
+ * direct memory too, and the game may not take all of it). */
+static uint64_t dmem_system_share(void) {
+    static uint64_t share;
+    if (!share) {
+        const char *env=getenv("BB_DMEM_RESERVE_MB");
+        uint64_t mb = env ? strtoull(env,NULL,10) : 64;
+        if (mb>8192) mb=64;
+        share = mb*1024*1024;
+    }
+    return share;
+}
+static ABI uint64_t direct_size(void) {
+    const uint64_t pool=POOL_SIZE;
+    const uint64_t share=dmem_system_share();
+    return pool>share ? pool-share : pool;
+}
 static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
                                   uint64_t alignment, int type, int64_t *out) {
     if (!alignment) alignment = PAGE;
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
         return INVALID;
-    uint64_t end = (uint64_t)high < POOL_SIZE ? (uint64_t)high : POOL_SIZE;
+    /* The range the game asks for is where the block is looked for first, not a wall:
+     * the pool is the truth, and the game takes the whole of it in blocks (its own heap
+     * is in it too, so it needs a little more than the window it was told about). */
+    const uint64_t end=POOL_SIZE;
     if ((uint64_t)low >= end || size > end - (uint64_t)low) {
         fprintf(stderr,"Runtime:   the allocation of %llu bytes did not fit (low=%lld high=%lld)\n",
                 (unsigned long long)size,(long long)low,(long long)high);
@@ -526,64 +566,87 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     }
     write_lock();
     if (pool()) { write_unlock(); return NO_MEMORY; }
+    if (block_count>=LIMIT) { write_unlock(); return NO_SPACE; }
     uint64_t start = align_up((uint64_t)low, alignment);
-    int slot = -1;
-    for (int i=0; i<LIMIT; ++i) if (!blocks[i].used) { slot=i; break; }
-    for (;;) {
-        if (slot<0 || start > end || size > end-start) {
-            /* The pool is full: the game is told, and it decides what to do (it asks
-             * again, and the pool is freed by then). */
-            static int reported;
-            if (reported++ < 4)
-                fprintf(stderr,"Runtime:   no room for %llu bytes (slot %d, start %#llx)\n",
-                        (unsigned long long)size,slot,(unsigned long long)start);
-            write_unlock(); return NO_SPACE;
-        }
-        int overlap = 0;
-        for (int i=0; i<LIMIT; ++i) {
-            Block b = blocks[i];
-            if (b.used && start < b.start+b.size && b.start < start+size) {
-                start = align_up(b.start+b.size, alignment); overlap = 1; break;
-            }
-        }
-        if (!overlap) break;
+    /* The lowest free gap of the needed size at or after the given address: the blocks
+     * are in order, so one pass over them says where the gap is (the game asks for a
+     * great many of these, and the pass is what makes that bearable). */
+    for (int i=block_first_ending_after(start); i<block_count; ++i) {
+        const Block b=blocks[i];
+        if (b.start>=start+size) break;              /* the gap before this block is large enough */
+        if (b.start+b.size>start) start=align_up(b.start+b.size, alignment);
+        if (start+size>end) break;
     }
-    blocks[slot] = (Block){start, size, type, 1}; *out = (int64_t)start;
+    if (start > end || size > end-start) {
+        /* The pool is full: the game is told, and it decides what to do (it asks
+         * again, and the pool is freed by then). */
+        static int reported;
+        if (reported++ < 4)
+            fprintf(stderr,"Runtime:   no room for %llu bytes (start %#llx; asked low=%lld high=%lld align=%llu)\n",
+                    (unsigned long long)size,(unsigned long long)start,
+                    (long long)low,(long long)high,(unsigned long long)alignment);
+        write_unlock(); return NO_MEMORY;
+    }
+    {   /* The block goes into the list, which keeps its order. */
+        int at=block_first_ending_after(start);
+        while (at>0 && blocks[at-1].start+blocks[at-1].size>start) --at;
+        memmove(&blocks[at+1],&blocks[at],(size_t)(block_count-at)*sizeof(Block));
+        blocks[at]=(Block){start, size, type, 1};
+        ++block_count;
+    }
+    *out = (int64_t)start;
     ensure_chunks(start,size);
     ++allocations; live_bytes += size;
     write_unlock();
-    if (memory_trace())
-        printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
+    if (memory_trace()) {
+        fprintf(stderr,"Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
+        {   /* The game calls this function itself, so the return address says where
+             * in the game the call comes from. */
+            const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
+            fprintf(stderr,"Runtime:   the call came from %p\n",(void *)caller);
+            runtime_guest_where(stderr,caller);
+        }
+    }
     return 0;
 }
 /* The largest free direct memory in [low, high) at the alignment: where it starts and its size
  * (GUNDAM VERSUS sizes its pools by it). */
 static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignment, int64_t *phys_out, uint64_t *size_out) {
+    if (memory_trace())
+        fprintf(stderr,"Runtime:   available asked: low=%lld high=%lld align=%llu\n",
+                (long long)low,(long long)high,(unsigned long long)alignment);
     if (!alignment) alignment=PAGE;
     if (!phys_out || !size_out || low<0 || high<=low || !valid_alignment(alignment)) return INVALID;
-    const uint64_t end=(uint64_t)high<POOL_SIZE ? (uint64_t)high : POOL_SIZE;
+    /* The range the game asks for is where the block is looked for first, not a wall:
+     * the pool is the truth, and the game takes the whole of it in blocks (its own heap
+     * is in it too, so it needs a little more than the window it was told about). */
+    const uint64_t end=POOL_SIZE;
     uint64_t best_start=0, best=0;
     read_lock();
-    for (uint64_t at=(uint64_t)low; at<end;) {
-        uint64_t next_used=end, used_end=end;
-        for (int i=0;i<LIMIT;++i) {
-            const Block b=blocks[i];
-            if (!b.used || b.start+b.size<=at) continue;
-            if (b.start<=at) { next_used=at; used_end=b.start+b.size; break; }
-            if (b.start<next_used) { next_used=b.start; used_end=b.start+b.size; }
+    {   /* The largest free stretch: the blocks are in order, so one pass over them
+         * finds the gaps between them. */
+        uint64_t at=align_up((uint64_t)low,alignment);
+        for (int i=block_first_ending_after((uint64_t)low); i<=block_count; ++i) {
+            const uint64_t next_used = i<block_count ? blocks[i].start : end;
+            if (next_used>at && next_used-at>best) { best=next_used-at; best_start=at; }
+            if (i>=block_count) break;
+            const uint64_t used_end=blocks[i].start+blocks[i].size;
+            at=align_up(used_end>at ? used_end : at,alignment);
+            if (at>=end) break;
         }
-        const uint64_t start=align_up(at,alignment);
-        if (next_used>start && next_used-start>best) { best=next_used-start; best_start=start; }
-        at=used_end>at ? used_end : end;
     }
     read_unlock();
-    if (!best) return NO_SPACE;
-    {   /* The answer the game gets decides how much of the pool it takes. The pool has
-         * a share that is not the game's (the system's own), and BB_DMEM_RESERVE_MB says
-         * how much that is. */
-        const long reserve=dmem_reserve_mb();
-        if (reserve>0 && best>(uint64_t)reserve*1024*1024) best-=(uint64_t)reserve*1024*1024;
+    if (!best) return NO_MEMORY;
+    {   /* The share the system keeps is not the game's: it is left out of the answer,
+         * or the game would take the whole pool and its own heap would have nowhere
+         * to go. */
+        const uint64_t share=dmem_system_share();
+        if (best>share) best-=share;
     }
+    if (memory_trace())
+        fprintf(stderr,"Runtime:   available answer: %llu bytes at %#llx (in use: %d blocks, %llu bytes)\n",
+                (unsigned long long)best,(unsigned long long)best_start,block_count,
+                (unsigned long long)live_bytes);
     *phys_out=(int64_t)best_start; *size_out=best;
     return 0;
 }
@@ -685,16 +748,38 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
         }
         ++i;
     }
-    for (int i=0; i<LIMIT; ++i) {
-        Block *b=&blocks[i];
-        if (!b->used || b->start>=start+size || start>=b->start+b->size) continue;
-        uint64_t a=b->start>start ? b->start : start, e=b->start+b->size<start+size ? b->start+b->size : start+size;
-        Block left=*b, right=*b;
-        left.size=a-b->start; right.start=e; right.size=b->start+b->size-e;
-        b->used=0;
-        if (left.size) *b=left;
-        if (right.size) for (int j=0;j<LIMIT;++j) if (!blocks[j].used) { blocks[j]=right; break; }
-        live_bytes-=e-a;
+    {   /* The blocks that lie in the released range leave the list; the parts of the
+         * first and the last of them that are outside the range stay (the blocks are
+         * in order, so the ones that lie in the range are next to each other). */
+        const int first=block_first_ending_after(start);
+        int last=first;
+        while (last<block_count && blocks[last].start<start+size) ++last;
+        if (last>first) {
+            uint64_t released_now=0;
+            for (int i=first;i<last;++i) {
+                const uint64_t a=blocks[i].start>start ? blocks[i].start : start;
+                const uint64_t e=blocks[i].start+blocks[i].size<start+size ? blocks[i].start+blocks[i].size : start+size;
+                released_now+=e-a;
+            }
+            live_bytes-=released_now;
+            /* The parts that stay. */
+            Block pieces[2]; int piece_count=0;
+            if (blocks[first].start<start)
+                pieces[piece_count++]=(Block){blocks[first].start,start-blocks[first].start,
+                                              blocks[first].type,1};
+            if (blocks[last-1].start+blocks[last-1].size>start+size)
+                pieces[piece_count++]=(Block){start+size,
+                                              blocks[last-1].start+blocks[last-1].size-(start+size),
+                                              blocks[last-1].type,1};
+            memmove(&blocks[first],&blocks[last],(size_t)(block_count-last)*sizeof(Block));
+            block_count-=last-first;
+            for (int k=0;k<piece_count;++k) {
+                const int at=first+k;
+                memmove(&blocks[at+1],&blocks[at],(size_t)(block_count-at)*sizeof(Block));
+                blocks[at]=pieces[k];
+                ++block_count;
+            }
+        }
     }
     zero_phys(start,size); /* zero on reuse */
     write_unlock();
@@ -813,7 +898,8 @@ static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInf
 }
 static ABI int32_t direct_memory_type(uint64_t phys, int *type, void **start, void **end) {
     read_lock();
-    for (int i=0;i<LIMIT;++i) if (blocks[i].used && phys>=blocks[i].start && phys-blocks[i].start<blocks[i].size) {
+    const int i=block_holding(phys);
+    if (i>=0) {
         if (type) *type=blocks[i].type;
         if (start) *start=(void *)(uintptr_t)blocks[i].start;
         if (end) *end=(void *)(uintptr_t)(blocks[i].start+blocks[i].size);

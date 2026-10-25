@@ -147,7 +147,9 @@ static int32_t wait_flag(uint64_t id,uint64_t bits,uint32_t mode,uint64_t *resul
                 if (f->deleted) { status=ERR(13); break; }
                 if ((f->generation>>63)!=cancelled_before) { status=ERR(85); break; }
                 if (matches(f->pattern,bits,mode)) break;
+                runtime_wait_mark("an event flag");
                 int e=timeout ? pthread_cond_timedwait(&f->changed,&lock,&end) : pthread_cond_wait(&f->changed,&lock);
+                runtime_wait_mark(0);
                 if (e==ETIMEDOUT) {
                     if (!f->deleted && matches(f->pattern,bits,mode)) break;
                     status=ERR(60); ++timed_out; break;

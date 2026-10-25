@@ -4,6 +4,7 @@
  * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "platform.h"
 #include "asm.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +52,7 @@ typedef struct GuestThread {
     uint64_t *tcb;
     unsigned char *tls_block;
     pthread_t host;
+    uint64_t host_id;
     GuestEntry entry;
     void *argument, *result;
     ThreadAttr attr;
@@ -273,6 +275,7 @@ __asm__(BB_ASM_TEXT BB_ASM_GLOBAL("runtime_call_on_stack") BB_ASM_TYPE("runtime_
 static void (ABI *thread_dtors)(void);
 static void *host_start(void *p) {
     GuestThread *t=p;
+    t->host_id=platform_thread_id();
     attach(t);
     set_host_name(t->name);
     if (!setjmp(t->exit_jump))
@@ -450,6 +453,23 @@ uintptr_t runtime_thread_resolve(const char *name) {
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
         if (runtime_nid_is(name,table[i].nid)) return (uintptr_t)table[i].fn;
     return RUNTIME_LOOKUP(named_exports,name);
+}
+/* The numbers and the names of the guest's threads: the watchdog looks at where each
+ * of them is (the name says which part of the game it is). */
+size_t runtime_thread_guest_threads(uint64_t *ids,char *names,size_t name_size,size_t max) {
+    size_t n=0;
+    pthread_mutex_lock(&lock);
+    for (GuestThread *t=threads;t && n<max;t=t->next)
+        if (t->host_id) {
+            ids[n]=t->host_id;
+            if (names && name_size) {
+                strncpy(names+n*name_size,t->name,name_size-1);
+                names[n*name_size+name_size-1]=0;
+            }
+            ++n;
+        }
+    pthread_mutex_unlock(&lock);
+    return n;
 }
 void runtime_thread_report(void) {
     pthread_mutex_lock(&lock);

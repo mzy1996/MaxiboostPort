@@ -51,7 +51,13 @@ typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Li
 /* commit: a save file opened for writing is written to a temporary copy (temp), which replaces
  * the file (commit) in one rename when closed: a crash or a kill mid-save leaves the old file. */
 typedef struct { int used, host, dirty; Listing *dir; size_t position; char path[512]; char *commit, *temp; } File;
-typedef struct { char guest[64]; char host[512]; } Mount;
+typedef struct { char guest[64]; char host[512]; } Mount;/* Whether the file operations are said (BB_FILE_TRACE=1). */
+static int file_trace(void) {
+    static int trace=-1;
+    if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && t[0]=='1'; }
+    return trace;
+}
+
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
@@ -137,9 +143,7 @@ static int translate(const char *guest,char *out,size_t size) {
     pthread_mutex_unlock(&lock);
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
     /* BB_FILE_TRACE=1: every guest path the game opens, stats or checks (mods, missing files). */
-    static int trace=-1;
-    if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && t[0]=='1'; }
-    if (trace) printf("File trace: %s -> %s\n",guest,result ? "(no mount)" : out);
+    if (file_trace()) printf("File trace: %s -> %s\n",guest,result ? "(no mount)" : out);
     return result;
 }
 /* The PS4's file system ignores case, and the game asks for lower-case names
@@ -476,6 +480,7 @@ static ssize_t read_retrying(int h,void *buffer,uint64_t size,int64_t offset,int
 }
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
+    if (file_trace()) printf("File trace: read(fd %d, %llu bytes) at %p\n",fd,(unsigned long long)size,buffer);
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
@@ -487,6 +492,8 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
+    if (file_trace()) printf("File trace: pread(fd %d, %llu bytes at %lld) at %p\n",fd,
+                             (unsigned long long)size,(long long)offset,buffer);
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);

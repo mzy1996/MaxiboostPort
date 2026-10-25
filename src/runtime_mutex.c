@@ -198,7 +198,9 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     ++waits;
     const uint64_t start = runtime_wait_clock();
+    runtime_wait_mark("a condition variable");
     const int e2 = pthread_cond_wait(&(*cond)->native, &(*mutex)->native);
+    runtime_wait_mark(0);
     runtime_wait_note(0, runtime_wait_clock() - start);
     return orbis_error(e2);
 }
@@ -208,7 +210,9 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
     const uint64_t start = runtime_wait_clock();
+    runtime_wait_mark("a condition variable (with a time)");
     const int e2 = pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end);
+    runtime_wait_mark(0);
     runtime_wait_note(0, runtime_wait_clock() - start);
     return timed_error(e2);
 }

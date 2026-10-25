@@ -127,11 +127,13 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
         uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000000 : 0;
         while (!w.done) {
             int e;
+            runtime_wait_mark("a semaphore");
             if (!timeout) e=bb_cond_wait(&w.event,&lock);
             else {
                 const uint64_t left=deadline>now_ns() ? deadline-now_ns() : 0;
                 e=bb_cond_timedwait(&w.event,&lock,(uint32_t)((left+999999)/1000000));
             }
+            runtime_wait_mark(0);
             if (e==ETIMEDOUT && !w.done) {
                 Waiter **p=&s->first;
                 while (*p!=&w) p=&(*p)->next;

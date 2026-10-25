@@ -32,6 +32,8 @@ uintptr_t runtime_resolve(const char *name, int is_data);
 void runtime_report(void);
 void runtime_finalize(void *dso);
 uintptr_t runtime_printf_resolve(const char *name);
+/* The guest's threads and their numbers (the watchdog looks at them). */
+size_t runtime_thread_guest_threads(uint64_t *ids,char *names,size_t name_size,size_t max);
 uintptr_t runtime_stdio_resolve(const char *name);
 void *runtime_stdio_stream(int which);
 uintptr_t runtime_mutex_resolve(const char *name);
@@ -47,6 +49,11 @@ void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size);
 void runtime_memory_prepare_cpu_write(uintptr_t address, uint64_t size);
 /* bbport (frame stats): a guest thread was blocked `ns` in the runtime (0 cond, 1 mutex, 2 sema, 3 sleep). */
 void runtime_wait_note(int kind, uint64_t ns);
+/* What a thread waits for (BB_WAIT_TRACE=1 says it): the name is remembered per thread
+ * and the watchdog reads it. */
+void runtime_wait_mark(const char *what);
+const char *runtime_wait_marked(void);
+const char *runtime_wait_marked_of(uint64_t tid);
 void runtime_wait_report(double frames);
 void runtime_guest_call_sites(uint64_t out[3]);
 /* bbport: times the game's heap asked for more memory (posix_mmap): a sign it leaks. */

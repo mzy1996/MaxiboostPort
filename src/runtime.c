@@ -112,6 +112,7 @@ void runtime_report(void) {
     runtime_font_report();
     runtime_content_report();
     runtime_memory_report();
+    runtime_file_report();
     runtime_ajm_report();
     runtime_audio_report();
     runtime_pad_report();
