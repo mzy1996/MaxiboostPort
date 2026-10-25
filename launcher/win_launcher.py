@@ -323,13 +323,17 @@ class PrepareWorker(QThread):
     result = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, window):
+    def __init__(self, window, game_dir):
         super().__init__()
         self.window = window
+        # The folder the player chose and the file the settings are in: both are read here
+        # (the thread's own), not in the window's thread.
+        self.game_dir = str(game_dir)
+        self.config_file = window.config_path()
 
     def run(self):
         try:
-            prepared = port_prepare.prepare_game(DATA_DIR, self.window.config_path())
+            prepared = port_prepare.prepare_game(DATA_DIR, self.config_file, game=self.game_dir)
         except port_prepare.PrepareError as error:
             self.failed.emit(str(error))
             return
@@ -346,6 +350,7 @@ class Window(QMainWindow):
         if not self.settings.get("game_dir"):
             self.settings["game_dir"] = str(default_game_dir())
         self.process = None
+        self.worker = None
         self.setWindowTitle("MAXIBOOST ON (mbport)")
         self.resize(980, 720)
 
@@ -1044,9 +1049,13 @@ class Window(QMainWindow):
         run in a thread and the window stays alive."""
         self.set_busy(True)
         self.log.append(tr("Готовим игру..."))
-        worker = PrepareWorker(self)
+        worker = PrepareWorker(self, self.settings.get("game_dir", ""))
+        # The window keeps the thread: a thread that is destroyed while it runs stops the
+        # whole process.
+        self.worker = worker
         worker.result.connect(self.on_prepared)
         worker.failed.connect(self.on_prepare_failed)
+        worker.finished.connect(self.on_worker_finished)
         worker.start()
         return None
 
@@ -1058,6 +1067,10 @@ class Window(QMainWindow):
         """The window's buttons while the game is being prepared."""
         self.play.setEnabled(not busy)
         self.stop.setEnabled(not busy)
+
+    def on_worker_finished(self):
+        """The preparation is over: the thread is let go."""
+        self.worker = None
 
     def on_prepared(self, arguments):
         """The game is prepared: the runtime can start."""

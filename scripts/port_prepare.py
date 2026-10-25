@@ -45,9 +45,12 @@ def _capture(function, *args, **kwargs):
     return buffer.getvalue()
 
 
-def prepare_game(data, config, modules=None):
+def prepare_game(data, config, modules=None, game=None):
     """Prepares the game and returns what the runtime needs: the image, the profile and the
-    patches, and the folder the game is played from."""
+    patches, and the folder the game is played from.
+
+    The game's folder is the one the player chose (game); the environment names it when
+    there is none."""
     import cheats  # noqa: F401  (the patches read the cheat table through it)
     import content_profile
     import dlc
@@ -61,7 +64,7 @@ def prepare_game(data, config, modules=None):
     user_dir = Path(os.environ.get("BB_USER_DIR", Path(data) / "user"))
     user_dir.mkdir(parents=True, exist_ok=True)
 
-    game = Path(os.environ.get("BB_GAME_DIR", ROOT / "CUSA18758-full"))
+    game = Path(game) if game else Path(os.environ.get("BB_GAME_DIR", ROOT / "CUSA18758-full"))
     if not (game / "eboot.bin").is_file():
         raise PrepareError(f"no eboot.bin in {game} (the game's folder is not set)")
     original_game = game
