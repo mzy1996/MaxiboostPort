@@ -85,8 +85,11 @@ CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 # The generated files (the cheat table, the patch table) go with the program.
 DATA_DIR = Path(os.environ.get("BB_DATA_DIR", PORT_DIR))
-CHEATS_CONFIG = DATA_DIR / "cheats.json"
-PATCHES_CONFIG = DATA_DIR / "patches.json"
+# The runtime's own configuration (bbport.ini): the user's directory, not the program's
+# own (that one may be read only, and it is replaced when the package is built again).
+RUNTIME_CONFIG = CONFIG_DIR / "bbport.ini"
+CHEATS_CONFIG = CONFIG_DIR / "cheats.json"
+PATCHES_CONFIG = CONFIG_DIR / "patches.json"
 
 # The language of the launcher: the first entry is the system's own, the others are named
 # in the language they are (a person who does not read the rest looks for their own).
@@ -220,6 +223,13 @@ def fps_modes(have=None):
     return [mode for mode in FPS_MODES if all(name in have for name in FPS_PRESETS.get(mode[1], ()))]
 
 
+def runtime_config_path():
+    """Where the runtime's own configuration (bbport.ini) is: the user's directory."""
+    path = Path(os.environ.get("BB_CONFIG", RUNTIME_CONFIG)).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def game_environment(s):
     """The environment for the runtime: the same variables the Linux launcher sets."""
     env = dict(os.environ)
@@ -228,6 +238,7 @@ def game_environment(s):
         env["BB_USER_DIR"] = s["user_dir"]
     if s.get("dlc_dir"):
         env["BB_DLC_DIR"] = str(Path(s["dlc_dir"]).expanduser())
+    env["BB_CONFIG"] = str(runtime_config_path())
     env["BB_MODS_ENABLED"] = "0"
     env["BB_PATCHES_DIR"] = str(patches_dir(s))
     env["BB_PATCHES_CONFIG"] = str(PATCHES_CONFIG)
@@ -1061,7 +1072,7 @@ class Window(QMainWindow):
 
     def config_path(self):
         """The file the settings are read from (the runtime's own configuration)."""
-        return DATA_DIR / "bbport.ini"
+        return runtime_config_path()
 
     def set_busy(self, busy):
         """The window's buttons while the game is being prepared."""
@@ -1135,6 +1146,12 @@ class Window(QMainWindow):
         self.process = None
         self.play.setEnabled(True)
         self.stop.setEnabled(False)
+        # The code tells what happened: a library that is missing, a program that cannot
+        # run, or the game's own end.
+        if code == 0xC0000135:
+            self.log.append(tr("Не найдена библиотека (DLL). Проверьте, что папка bin целая."))
+        elif code == 0xC000007B:
+            self.log.append(tr("Неверный формат программы (64-разрядный режим)."))
 
     def on_stop(self):
         if self.process is not None:

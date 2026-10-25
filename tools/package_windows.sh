@@ -76,9 +76,8 @@ fi
 cp "$root/scripts"/*.py "$package/scripts/"
 
 # The launcher (the Windows one and the translations it uses).
-cp "$root/launcher/win_launcher.py" "$package/launcher/"
-cp "$root/launcher/bbport_i18n.py" "$package/launcher/"
-cp "$root/launcher/bbport_assets.py" "$package/launcher/" 2>/dev/null || true
+# The launcher's own scripts (every one of them: a missing one stops the window).
+cp "$root/launcher/"*.py "$package/launcher/"
 cp "$root/launcher/maxiboost.svg" "$package/launcher/" 2>/dev/null || true
 # The file that starts the launcher by a double click.
 cp "$root/launcher/launcher.bat" "$package/launcher/"

@@ -842,6 +842,8 @@ EN = {
     "2048 МБ": "2048 MB",
     "4096 МБ": "4096 MB",
     "5056 МБ (как на PS4)": "5056 MB (as on the PS4)",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -1729,6 +1731,8 @@ PT_BR = {
     "4096 МБ": "4096 MB",
     "512 МБ (экономичный)": "512 MB (economical)",
     "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -2533,6 +2537,8 @@ ES = {
     "4096 МБ": "4096 MB",
     "512 МБ (экономичный)": "512 MB (economical)",
     "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -3337,6 +3343,8 @@ IT = {
     "4096 МБ": "4096 MB",
     "512 МБ (экономичный)": "512 MB (economical)",
     "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -4141,6 +4149,8 @@ FR = {
     "4096 МБ": "4096 MB",
     "512 МБ (экономичный)": "512 MB (economical)",
     "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -4945,6 +4955,8 @@ DE = {
     "4096 МБ": "4096 MB",
     "512 МБ (экономичный)": "512 MB (economical)",
     "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -5721,6 +5733,8 @@ ZH_CN = {
     "4096 МБ": "4096 MB",
     "512 МБ (экономичный)": "512 MB（省电）",
     "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "缺少库文件（DLL）。请检查 bin 文件夹是否完整。",
+    "Неверный формат программы (64-разрядный режим).": "程序格式错误（64 位模式）。",
 }
 
 
@@ -6359,6 +6373,8 @@ ZH_TW = {
     "4096 МБ": "4096 MB",
     "512 МБ (экономичный)": "512 MB（省電）",
     "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "缺少庫檔案（DLL）。請檢查 bin 資料夾是否完整。",
+    "Неверный формат программы (64-разрядный режим).": "程式格式錯誤（64 位模式）。",
 }
 
 # Translations by language code; Russian is the key itself. Strings missing in a translation
