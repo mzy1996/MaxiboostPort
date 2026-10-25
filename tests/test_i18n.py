@@ -24,7 +24,7 @@ class WorkerTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT / 'scripts'))
         import win_launcher
         window = win_launcher.Window()
-        worker = win_launcher.PrepareWorker(window)
+        worker = win_launcher.PrepareWorker(window, window.settings.get("game_dir", ""))
         # A signal that is not the class's own is a plain object and has no connect: the
         # window crashed on that.
         seen = []
@@ -36,6 +36,34 @@ class WorkerTests(unittest.TestCase):
         worker.wait(60000)
         app.processEvents()
         self.assertTrue(seen)
+
+
+class PackageTests(unittest.TestCase):
+    """The package must carry every script the launcher needs, and the configuration must
+    be written where the player can write."""
+
+    def test_the_package_copies_every_script_of_the_launcher(self):
+        script = (ROOT / 'tools' / 'package_windows.sh').read_text(encoding='utf-8')
+        # A script that is not copied stops the window ("No module named ...").
+        self.assertIn('cp "$root/launcher/"*.py "$package/launcher/"', script)
+
+    def test_the_runtime_configuration_is_in_the_user_directory(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        # The program's own folder may be read only, and it is replaced when the package
+        # is built again: the configuration goes to the user's directory.
+        self.assertEqual(win_launcher.RUNTIME_CONFIG.parent, win_launcher.CONFIG_DIR)
+        self.assertEqual(win_launcher.CHEATS_CONFIG.parent, win_launcher.CONFIG_DIR)
+        self.assertEqual(win_launcher.PATCHES_CONFIG.parent, win_launcher.CONFIG_DIR)
+
+    def test_the_runtime_is_told_where_its_configuration_is(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        env = win_launcher.game_environment(dict(win_launcher.load_settings(),
+                                                  game_dir=str(ROOT), user_dir='',
+                                                  dlc_dir='', cheats_file=''))
+        self.assertIn('BB_CONFIG', env)
+        self.assertTrue(env['BB_CONFIG'].endswith('bbport.ini'))
 
 
 class MenuTests(unittest.TestCase):
@@ -155,7 +183,7 @@ class WorkerTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT / 'scripts'))
         import win_launcher
         window = win_launcher.Window()
-        worker = win_launcher.PrepareWorker(window)
+        worker = win_launcher.PrepareWorker(window, window.settings.get("game_dir", ""))
         # A signal that is not the class's own is a plain object and has no connect: the
         # window crashed on that.
         seen = []
@@ -167,6 +195,34 @@ class WorkerTests(unittest.TestCase):
         worker.wait(60000)
         app.processEvents()
         self.assertTrue(seen)
+
+
+class PackageTests(unittest.TestCase):
+    """The package must carry every script the launcher needs, and the configuration must
+    be written where the player can write."""
+
+    def test_the_package_copies_every_script_of_the_launcher(self):
+        script = (ROOT / 'tools' / 'package_windows.sh').read_text(encoding='utf-8')
+        # A script that is not copied stops the window ("No module named ...").
+        self.assertIn('cp "$root/launcher/"*.py "$package/launcher/"', script)
+
+    def test_the_runtime_configuration_is_in_the_user_directory(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        # The program's own folder may be read only, and it is replaced when the package
+        # is built again: the configuration goes to the user's directory.
+        self.assertEqual(win_launcher.RUNTIME_CONFIG.parent, win_launcher.CONFIG_DIR)
+        self.assertEqual(win_launcher.CHEATS_CONFIG.parent, win_launcher.CONFIG_DIR)
+        self.assertEqual(win_launcher.PATCHES_CONFIG.parent, win_launcher.CONFIG_DIR)
+
+    def test_the_runtime_is_told_where_its_configuration_is(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        env = win_launcher.game_environment(dict(win_launcher.load_settings(),
+                                                  game_dir=str(ROOT), user_dir='',
+                                                  dlc_dir='', cheats_file=''))
+        self.assertIn('BB_CONFIG', env)
+        self.assertTrue(env['BB_CONFIG'].endswith('bbport.ini'))
 
 
 class MenuTests(unittest.TestCase):
