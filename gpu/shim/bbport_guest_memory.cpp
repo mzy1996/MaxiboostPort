@@ -16,6 +16,8 @@
 extern "C" void runtime_memory_set_guest_chunk_allocator(int (*alloc)(uint64_t phys,
                                                                       uint64_t size));
 extern "C" void runtime_memory_set_guest_chunk_whole(int whole);
+extern "C" void runtime_memory_set_guest_chunk_lazy(int lazy);
+extern "C" int runtime_memory_guest_chunk_gpu(uint64_t phys, uint64_t size);
 extern "C" void* runtime_memory_backing_pointer(uint64_t phys);
 
 namespace BbGuestMemory {
@@ -31,6 +33,7 @@ std::size_t chunk_count = 0;
 bool whole_only = false; // the driver's dma-buf maps at offset 0 only: a chunk per allocation
 enum class Mode { DmaBuf, HostImport };
 Mode mode = Mode::DmaBuf;
+bool lazy = false; /* the GPU's memory for a chunk is made when the GPU needs it */
 std::atomic<u64> chunk_bytes{0};
 
 bool GuestInVram() {
@@ -304,6 +307,19 @@ int AllocImported(u64 phys, u64 size) {
     return -3;
 }
 
+/* The host's memory import is not cached consistently on Windows: what the GPU wrote is
+ * seen by the CPU only after the range is invalidated, and what the CPU wrote is seen by
+ * the GPU only after it is flushed. The two calls are the whole difference between the
+ * import working and not. */
+void FlushHostRange(const vk::Device& dev, const vk::DeviceMemory& memory, u64 size) {
+    const vk::MappedMemoryRange range{.memory = memory, .offset = 0, .size = size};
+    dev.flushMappedMemoryRanges(range);
+}
+void InvalidateHostRange(const vk::Device& dev, const vk::DeviceMemory& memory, u64 size) {
+    const vk::MappedMemoryRange range{.memory = memory, .offset = 0, .size = size};
+    dev.invalidateMappedMemoryRanges(range);
+}
+
 /// Runs `record` on the graphics queue and waits; false on any failure.
 template <typename Record>
 bool RunOnce(const Vulkan::Instance& instance, Record&& record) {
@@ -376,23 +392,19 @@ bool HostImportWorks(const Vulkan::Instance& instance, const char*& why) {
     } else if (LayerMemory()) {
         // The layer's memory module binds the imported buffers themselves (no sparse arena): the
         // same GPU and CPU writes through the imported buffer.
-        guest[1024] = 0x5ca1ab1e;
+        view[1024] = 0x5ca1ab1e;
+        /* What the CPU wrote is seen by the GPU only after the range is flushed. */
+        FlushHostRange(dev, memory, Size);
         const bool ran = RunOnce(instance, [&](vk::CommandBuffer cmd) {
             cmd.fillBuffer(buffer, 0, 4096, 0x600dcafe);
             cmd.copyBuffer(buffer, buffer, vk::BufferCopy{4096, 8192, 4});
         });
         why = "GPU work on imported memory";
         if (ran) {
-#ifdef _WIN32
-            /* The imported buffer's own memory is the one the GPU wrote: the probe reads
-             * it (the other allocation is a separate one, and reading it would tell
-             * nothing). */
+            /* What the GPU wrote is seen by the CPU only after the range is invalidated. */
+            InvalidateHostRange(dev, memory, Size);
             const bool gpu_to_cpu = view[0] == 0x600dcafe && view[1023] == 0x600dcafe;
             const bool cpu_to_gpu = view[2048] == 0x5ca1ab1e;
-#else
-            const bool gpu_to_cpu = guest[0] == 0x600dcafe && guest[1023] == 0x600dcafe;
-            const bool cpu_to_gpu = guest[2048] == 0x5ca1ab1e;
-#endif
             why = !gpu_to_cpu ? "GPU writes not seen by the CPU" : "CPU writes not seen by the GPU";
             ok = gpu_to_cpu && cpu_to_gpu;
         }
@@ -438,23 +450,17 @@ bool HostImportWorks(const Vulkan::Instance& instance, const char*& why) {
                 dev.waitForFences(fence, true, 5'000'000'000ull) == vk::Result::eSuccess) {
                 // GPU writes through the sparse buffer, CPU reads through the guest view; CPU
                 // writes through the guest view, the GPU copies them through the sparse buffer.
-                guest[1024] = 0x5ca1ab1e;
+                view[1024] = 0x5ca1ab1e;
+                FlushHostRange(dev, memory, Size);
                 const bool ran = RunOnce(instance, [&](vk::CommandBuffer cmd) {
                     cmd.fillBuffer(sparse, 0, 4096, 0x600dcafe);
                     cmd.copyBuffer(sparse, buffer, vk::BufferCopy{4096, 8192, 4});
                 });
                 why = "GPU work on imported memory";
                 if (ran) {
-#ifdef _WIN32
-                    /* The imported buffer's own memory is the one the GPU wrote: the probe
-                     * reads it (the other allocation is a separate one, and reading it
-                     * would tell nothing). */
+                    InvalidateHostRange(dev, memory, Size);
                     const bool gpu_to_cpu = view[0] == 0x600dcafe && view[1023] == 0x600dcafe;
                     const bool cpu_to_gpu = view[2048] == 0x5ca1ab1e;
-#else
-                    const bool gpu_to_cpu = guest[0] == 0x600dcafe && guest[1023] == 0x600dcafe;
-                    const bool cpu_to_gpu = guest[2048] == 0x5ca1ab1e;
-#endif
                     why = !gpu_to_cpu ? "GPU writes not seen by the CPU"
                                       : "CPU writes not seen by the GPU";
                     ok = gpu_to_cpu && cpu_to_gpu;
@@ -723,6 +729,28 @@ void Install(const Vulkan::Instance& instance) {
     // BB_GUEST_IN_PLACE (the GPU uses this memory in place) needs it too.
     const char* env = std::getenv("BB_GUEST_GPU_MEMORY");
     const char* in_place = std::getenv("BB_GUEST_IN_PLACE");
+    const char* off = std::getenv("BB_GUEST_GPU_MEMORY_OFF");
+#ifdef _WIN32
+    /* Windows has no dma-buf: the host's memory import is the only way the GPU can work
+     * on the game's own memory in place, so it is tried there by itself (the environment
+     * variable turns it off again). */
+    if (off && off[0] == '1') return;
+    if (!env && !in_place) {
+        if (!Usable(instance)) {
+            std::printf("Guest memory: the GPU works on copies (the host's memory import did not work)\n");
+            return;
+        }
+        const bool host = mode == Mode::HostImport;
+        runtime_memory_set_guest_chunk_whole(LayerMemory() || (!host && whole_only) ? 1 : 0);
+        runtime_memory_set_guest_chunk_allocator(host ? &AllocImported : &AllocChunk);
+        /* The game takes the whole pool at the start, so the GPU's memory for the chunks
+         * is made when the GPU needs it and not all at once. */
+        lazy=true;
+        runtime_memory_set_guest_chunk_lazy(1);
+        std::printf("Guest memory: direct memory chunks come from Vulkan (the host's memory import)\n");
+        return;
+    }
+#endif
     if (!(env && env[0] == '1') && !(in_place && in_place[0] == '1' && PcModelGpu(instance))) {
         return;
     }
@@ -739,6 +767,18 @@ void Install(const Vulkan::Instance& instance) {
 }
 
 const Chunk* Find(std::uint64_t phys) {
+    if (lazy) {
+        /* The memory of this chunk is made when the GPU needs it: the game took the whole
+         * pool at the start, and making the GPU's memory for all of it at once is slow
+         * and takes the device's address space for nothing. */
+        bool known=false;
+        {
+            std::scoped_lock lk{mutex};
+            known=chunk_count>0 && phys>=chunks[0]->phys &&
+                  phys<chunks[chunk_count-1]->phys+chunks[chunk_count-1]->size;
+        }
+        if (!known) runtime_memory_guest_chunk_gpu(phys,1);
+    }
     std::scoped_lock lk{mutex};
     // The last chunk starting at or below phys.
     std::size_t lo = 0, hi = chunk_count;

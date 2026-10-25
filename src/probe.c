@@ -513,6 +513,17 @@ void runtime_restart(void) {
 }
 
 #ifdef _WIN32
+/* The kernel's own call for the start address of a thread (the headers of the host do
+ * not have the newer wrapper). */
+typedef LONG (NTAPI *NtQueryThreadStartFn)(HANDLE, ULONG, void*, ULONG, ULONG*);
+static NtQueryThreadStartFn thread_start_of(void) {
+    static NtQueryThreadStartFn fn;
+    if (!fn) {
+        HMODULE ntdll=GetModuleHandleA("ntdll.dll");
+        fn=(NtQueryThreadStartFn)(ntdll?GetProcAddress(ntdll,"NtQueryInformationThread"):NULL);
+    }
+    return fn;
+}
 /* The watchdog (Windows): the game can wait for something that never comes, and then
  * nothing is said. The threads are looked at after the time is up: where each of them
  * is, and (for the ones that are in the game's own code) which place of the game. */
@@ -524,7 +535,70 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
     Sleep(watchdog_seconds?watchdog_seconds*1000:0);
     if (watchdog_fired) return 0;
     watchdog_fired=1;
-    fprintf(stderr,"STOP: watchdog timeout; the threads:/n");
+    /* The report goes to a file of its own: the runtime's output is full of the game's
+     * own work, and this report is what is looked for. */
+    FILE *report=fopen("watchdog.txt","w");
+    FILE *out=report?report:stderr;
+    fprintf(out,"STOP: watchdog timeout; the threads:\n");
+    {   /* The modules of the process: the threads of the program are looked for in them. */
+        HANDLE modules=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,
+                                                 GetCurrentProcessId());
+        if (modules!=INVALID_HANDLE_VALUE) {
+            MODULEENTRY32 module;
+            module.dwSize=sizeof(module);
+            if (Module32First(modules,&module)) do
+                fprintf(out,"  module: %s at %#llx\n",module.szModule,
+                        (unsigned long long)(uintptr_t)module.modBaseAddr);
+            while (Module32Next(modules,&module));
+            CloseHandle(modules);
+        }
+    }
+    {   /* How many threads there are: a great many of them is a sign on its own. */
+        DWORD count=0;
+        HANDLE all=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        if (all!=INVALID_HANDLE_VALUE) {
+            THREADENTRY32 one;
+            one.dwSize=sizeof(one);
+            if (Thread32First(all,&one)) do { ++count; } while (Thread32Next(all,&one));
+            CloseHandle(all);
+        }
+        fprintf(out,"  %lu threads in all\n",(unsigned long)count);
+        {   /* Where the threads started: the same place means the same creator. */
+            HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+            if (snapshot!=INVALID_HANDLE_VALUE) {
+                THREADENTRY32 one;
+                one.dwSize=sizeof(one);
+                if (Thread32First(snapshot,&one)) do {
+                    HANDLE thread=OpenThread(THREAD_QUERY_INFORMATION,FALSE,one.th32ThreadID);
+                    if (!thread) continue;
+                    ULONG_PTR start=0;
+                    ULONG length=0;
+                    if (thread_start_of() && thread_start_of()(thread,9,&start,sizeof(start),&length)==0) {
+                        const uintptr_t at=(uintptr_t)start;
+                        char where[128]="(the program)";
+                        HANDLE modules=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,
+                                                                 GetCurrentProcessId());
+                        if (modules!=INVALID_HANDLE_VALUE) {
+                            MODULEENTRY32 module;
+                            module.dwSize=sizeof(module);
+                            if (Module32First(modules,&module)) do {
+                                if (at>=(uintptr_t)module.modBaseAddr &&
+                                    at<(uintptr_t)module.modBaseAddr+module.modBaseSize) {
+                                    snprintf(where,sizeof(where),"%s+%#llx",module.szModule,
+                                             (unsigned long long)(at-(uintptr_t)module.modBaseAddr));
+                                    break;
+                                }
+                            } while (Module32Next(modules,&module));
+                            CloseHandle(modules);
+                        }
+                        fprintf(out,"  thread start: %s at %#llx\n",where,(unsigned long long)at);
+                    }
+                    CloseHandle(thread);
+                } while (Thread32Next(snapshot,&one));
+                CloseHandle(snapshot);
+            }
+        }
+    }
     HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
     if (snapshot!=INVALID_HANDLE_VALUE) {
         THREADENTRY32 entry;
@@ -538,18 +612,36 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
             context.ContextFlags=CONTEXT_CONTROL;
             if (GetThreadContext(thread,&context)) {
                 const uintptr_t rip=(uintptr_t)context.Rip;
-                fprintf(stderr,"  tid=%lu rip=%p",(unsigned long)entry.th32ThreadID,(void *)rip);
+                fprintf(out,"  tid=%lu rip=%p",(unsigned long)entry.th32ThreadID,(void *)rip);
+                {   /* The module the thread is in. */
+                    HANDLE modules=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,
+                                                             GetCurrentProcessId());
+                    if (modules!=INVALID_HANDLE_VALUE) {
+                        MODULEENTRY32 module;
+                        module.dwSize=sizeof(module);
+                        if (Module32First(modules,&module)) do {
+                            if (rip>=(uintptr_t)module.modBaseAddr &&
+                                rip<(uintptr_t)module.modBaseAddr+module.modBaseSize) {
+                                fprintf(out," in %s+%#llx",module.szModule,
+                                        (unsigned long long)(rip-(uintptr_t)module.modBaseAddr));
+                                break;
+                            }
+                        } while (Module32Next(modules,&module));
+                        CloseHandle(modules);
+                    }
+                }
 
                 if (watchdog_image) {
                     const uint64_t offset=rip-(uintptr_t)watchdog_image;
-                    fprintf(stderr," image+%#llx",(unsigned long long)offset);
+                    fprintf(out," image+%#llx",(unsigned long long)offset);
                 }
-                fprintf(stderr,"\n");
+                fprintf(out,"\n");
             }
             ResumeThread(thread);
             CloseHandle(thread);
         } while (Thread32Next(snapshot,&entry));
         CloseHandle(snapshot);
+        if (report) fclose(report);
     }
     return 0;
 }

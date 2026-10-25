@@ -30,6 +30,19 @@
  * memory a smaller pool means a smaller reservation. */
 #define DMEM_MIN_MB 512
 #define DMEM_MAX_MB 16384
+/* The memory bookkeeping says what it does when it is asked to (BB_MEMORY_TRACE=1): the
+ * game's own work fills the output otherwise. */
+/* The share of the pool that is not the game's (BB_DMEM_RESERVE_MB). */
+static long dmem_reserve_mb(void) {
+    static long reserve=-1;
+    if (reserve<0) { const char *t=getenv("BB_DMEM_RESERVE_MB"); reserve=t?strtol(t,NULL,10):0; }
+    return reserve;
+}
+static int memory_trace(void) {
+    static int trace=-1;
+    if (trace<0) { const char *t=getenv("BB_MEMORY_TRACE"); trace=t&&t[0]=='1'; }
+    return trace;
+}
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
@@ -52,7 +65,10 @@ static uint64_t pool_size_bytes(void) {
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
-#define LIMIT 4096
+/* The blocks of the direct memory: the pool is 5056 MiB and the game takes it in blocks
+ * of a megabyte (it holds them all and maps the ones it needs), so the table has to hold
+ * as many blocks as the pool can be divided into. */
+#define LIMIT 65536
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
 #define ACCESS ((int32_t)UINT32_C(0x8002000d))
@@ -101,6 +117,7 @@ static GuestChunkAlloc chunk_alloc;
 static int *chunk_fds; /* per CHUNK of direct memory: -1 not decided, -2 memfd, -3 memfd the GPU
                         * imported (host memory: VK_EXT_external_memory_host), else a dma-buf fd */
 #define CHUNK_IMPORTED (-3)
+#define CHUNK_PENDING (-4) /* the GPU's memory for it is made when the GPU asks for it */
 /* Released memory in a chunk the GPU uses is cleared, not punched out: the GPU holds those pages. */
 #define GPU_CHUNK(fd) ((fd)>=0 || (fd)==CHUNK_IMPORTED)
 /* Drivers whose dma-buf maps at offset 0 only (NVIDIA): a chunk per direct allocation instead of
@@ -108,6 +125,7 @@ static int *chunk_fds; /* per CHUNK of direct memory: -1 not decided, -2 memfd, 
  * backing view start at offset 0 of their chunk. */
 static unsigned char *backing_base; /* second view of the pool: host writes bypass guest/GPU page protection */
 static int whole_chunks;
+static int lazy_chunks; /* the GPU's memory for a chunk is made when the GPU asks for it */
 typedef struct { uint64_t phys, size; int fd; } Region;
 #define MAX_REGIONS 256
 static Region regions[MAX_REGIONS];
@@ -191,6 +209,14 @@ static void ensure_chunks(uint64_t phys, uint64_t size) {
     const uint64_t last=(phys+size-1<POOL_SIZE ? phys+size-1 : POOL_SIZE-1)/CHUNK;
     for (uint64_t c=phys/CHUNK;c<=last;++c) {
         if (chunk_fds[c]!=-1) continue;
+        if (lazy_chunks) {
+            /* The GPU's memory for this chunk is made when the GPU asks for it: the game
+             * takes the whole pool at the start, and the GPU needs only the parts it
+             * really uses (making the memory for all of them at once is slow and takes
+             * the address space of the device for nothing). */
+            chunk_fds[c]=CHUNK_PENDING;
+            continue;
+        }
         int fd=chunk_alloc ? chunk_alloc(c*CHUNK,chunk_size(c)) : -1;
         if (fd>=0 && !platform_section_map(fd,backing_base+c*CHUNK,chunk_size(c),0,BB_PROT_READ|BB_PROT_WRITE)) {
             platform_section_release(fd);
@@ -493,14 +519,26 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
         return INVALID;
     uint64_t end = (uint64_t)high < POOL_SIZE ? (uint64_t)high : POOL_SIZE;
-    if ((uint64_t)low >= end || size > end - (uint64_t)low) return NO_SPACE;
+    if ((uint64_t)low >= end || size > end - (uint64_t)low) {
+        fprintf(stderr,"Runtime:   the allocation of %llu bytes did not fit (low=%lld high=%lld)\n",
+                (unsigned long long)size,(long long)low,(long long)high);
+        return NO_SPACE;
+    }
     write_lock();
     if (pool()) { write_unlock(); return NO_MEMORY; }
     uint64_t start = align_up((uint64_t)low, alignment);
     int slot = -1;
     for (int i=0; i<LIMIT; ++i) if (!blocks[i].used) { slot=i; break; }
     for (;;) {
-        if (slot<0 || start > end || size > end-start) { write_unlock(); return NO_SPACE; }
+        if (slot<0 || start > end || size > end-start) {
+            /* The pool is full: the game is told, and it decides what to do (it asks
+             * again, and the pool is freed by then). */
+            static int reported;
+            if (reported++ < 4)
+                fprintf(stderr,"Runtime:   no room for %llu bytes (slot %d, start %#llx)\n",
+                        (unsigned long long)size,slot,(unsigned long long)start);
+            write_unlock(); return NO_SPACE;
+        }
         int overlap = 0;
         for (int i=0; i<LIMIT; ++i) {
             Block b = blocks[i];
@@ -514,13 +552,8 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     ensure_chunks(start,size);
     ++allocations; live_bytes += size;
     write_unlock();
-    printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
-    { static int shown;
-      static uint64_t last;
-      if (size!=last && shown<5) { last=size; ++shown;
-        fprintf(stderr,"Runtime:   asked for %llu bytes at low=%lld high=%lld align=%llu type=%d -> offset=%#llx\n",
-                (unsigned long long)size,(long long)low,(long long)high,
-                (unsigned long long)alignment,type,(unsigned long long)start); } }
+    if (memory_trace())
+        printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
     return 0;
 }
 /* The largest free direct memory in [low, high) at the alignment: where it starts and its size
@@ -530,10 +563,6 @@ static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignmen
     if (!phys_out || !size_out || low<0 || high<=low || !valid_alignment(alignment)) return INVALID;
     const uint64_t end=(uint64_t)high<POOL_SIZE ? (uint64_t)high : POOL_SIZE;
     uint64_t best_start=0, best=0;
-    { static int shown;
-      if (shown<3) { ++shown;
-        fprintf(stderr,"Runtime:   available asked: low=%lld high=%lld align=%llu\n",
-                (long long)low,(long long)high,(unsigned long long)alignment); } }
     read_lock();
     for (uint64_t at=(uint64_t)low; at<end;) {
         uint64_t next_used=end, used_end=end;
@@ -549,6 +578,12 @@ static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignmen
     }
     read_unlock();
     if (!best) return NO_SPACE;
+    {   /* The answer the game gets decides how much of the pool it takes. The pool has
+         * a share that is not the game's (the system's own), and BB_DMEM_RESERVE_MB says
+         * how much that is. */
+        const long reserve=dmem_reserve_mb();
+        if (reserve>0 && best>(uint64_t)reserve*1024*1024) best-=(uint64_t)reserve*1024*1024;
+    }
     *phys_out=(int64_t)best_start; *size_out=best;
     return 0;
 }
@@ -586,7 +621,10 @@ static ABI int32_t direct_map(void **out, uint64_t size, int prot, int flags, in
     int32_t result=map_direct_locked(out,size,prot,flags,physical,alignment);
     write_unlock();
     flush_hooks();
-    if (!result) printf("Runtime: mapped direct memory %p, size=%" PRIu64 ", prot=0x%x\n", *out, size, prot);
+    if (!result) {
+        if (memory_trace())
+            printf("Runtime: mapped direct memory %p, size=%" PRIu64 ", prot=0x%x\n", *out, size, prot);
+    }
     else printf("Runtime: mapping direct memory %#" PRIx64 ", size=%" PRIu64 " at %p (flags %#x, alignment %#" PRIx64 ") failed (error %#x)\n",
                 (uint64_t)physical, size, asked, (unsigned)flags, alignment, (unsigned)result);
     return result;
@@ -631,7 +669,8 @@ static size_t released;
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     if (start % PAGE || size % PAGE) return INVALID;
     if (!size) return 0;
-    fprintf(stderr,"Runtime:   released offset=%#llx size=%llu\n",(unsigned long long)start,(unsigned long long)size);
+    if (memory_trace())
+        fprintf(stderr,"Runtime:   released offset=%#llx size=%llu\n",(unsigned long long)start,(unsigned long long)size);
     write_lock();
     if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
     /* Mappings of released physical pages disappear with them. */
@@ -902,6 +941,32 @@ void *runtime_memory_backing_pointer(uint64_t phys) { return backing_base ? back
 void runtime_memory_set_guest_chunk_allocator(int (*alloc)(uint64_t phys, uint64_t size)) {
     write_lock();
     chunk_alloc=alloc;
+    write_unlock();
+}
+/* bbport: the GPU asks for the memory of a chunk of the direct memory (the game took the
+ * whole pool at the start, and the GPU needs only the parts it really uses). The memory is
+ * made then, not when the game allocated. */
+int runtime_memory_guest_chunk_gpu(uint64_t phys, uint64_t size) {
+    if (!chunk_fds || !chunk_alloc) return -1;
+    const uint64_t c=phys/CHUNK;
+    if (c*CHUNK+chunk_size(c)<phys+size) return -1;
+    write_lock();
+    int fd=chunk_fds[c];
+    if (fd==CHUNK_PENDING) {
+        fd=chunk_alloc(c*CHUNK,chunk_size(c));
+        if (fd>=0 && !platform_section_map(fd,backing_base+c*CHUNK,chunk_size(c),0,BB_PROT_READ|BB_PROT_WRITE)) {
+            platform_section_release(fd);
+            fd=-1;
+        }
+        chunk_fds[c]=fd>=0 || fd==CHUNK_IMPORTED ? fd : -2;
+    }
+    write_unlock();
+    return fd>=0 || fd==CHUNK_IMPORTED ? fd : -1;
+}
+/* bbport: the chunks of the direct memory are made when the GPU asks for them. */
+void runtime_memory_set_guest_chunk_lazy(int lazy) {
+    write_lock();
+    lazy_chunks=lazy;
     write_unlock();
 }
 void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalidate) {
