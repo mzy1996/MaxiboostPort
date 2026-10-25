@@ -383,8 +383,16 @@ bool HostImportWorks(const Vulkan::Instance& instance, const char*& why) {
         });
         why = "GPU work on imported memory";
         if (ran) {
+#ifdef _WIN32
+            /* The imported buffer's own memory is the one the GPU wrote: the probe reads
+             * it (the other allocation is a separate one, and reading it would tell
+             * nothing). */
+            const bool gpu_to_cpu = view[0] == 0x600dcafe && view[1023] == 0x600dcafe;
+            const bool cpu_to_gpu = view[2048] == 0x5ca1ab1e;
+#else
             const bool gpu_to_cpu = guest[0] == 0x600dcafe && guest[1023] == 0x600dcafe;
             const bool cpu_to_gpu = guest[2048] == 0x5ca1ab1e;
+#endif
             why = !gpu_to_cpu ? "GPU writes not seen by the CPU" : "CPU writes not seen by the GPU";
             ok = gpu_to_cpu && cpu_to_gpu;
         }
@@ -437,8 +445,16 @@ bool HostImportWorks(const Vulkan::Instance& instance, const char*& why) {
                 });
                 why = "GPU work on imported memory";
                 if (ran) {
+#ifdef _WIN32
+                    /* The imported buffer's own memory is the one the GPU wrote: the probe
+                     * reads it (the other allocation is a separate one, and reading it
+                     * would tell nothing). */
+                    const bool gpu_to_cpu = view[0] == 0x600dcafe && view[1023] == 0x600dcafe;
+                    const bool cpu_to_gpu = view[2048] == 0x5ca1ab1e;
+#else
                     const bool gpu_to_cpu = guest[0] == 0x600dcafe && guest[1023] == 0x600dcafe;
                     const bool cpu_to_gpu = guest[2048] == 0x5ca1ab1e;
+#endif
                     why = !gpu_to_cpu ? "GPU writes not seen by the CPU"
                                       : "CPU writes not seen by the GPU";
                     ok = gpu_to_cpu && cpu_to_gpu;
