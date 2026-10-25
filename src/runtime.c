@@ -235,6 +235,11 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
         if (runtime_nid_is(name,"f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
         if (runtime_nid_is(name,"ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
+        /* The three streams of the program: the game asks for them by name and hands
+         * them back to the functions of the C library. */
+        if (runtime_nid_is(name,"2sWzhYqFH4E#libSceLibcInternal")) return (uintptr_t)runtime_stdio_stream(1);
+        if (runtime_nid_is(name,"H8AprKeZtNg#libSceLibcInternal")) return (uintptr_t)runtime_stdio_stream(2);
+        if (runtime_nid_is(name,"1TDo-ImqkJc#libSceLibcInternal")) return (uintptr_t)runtime_stdio_stream(0);
         return runtime_process_resolve_data(name);
     }
     /* Exact scoped imports for CUSA03173; the suffix identifies library/module. */
@@ -256,6 +261,10 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (runtime_nid_is(name,"vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
     if (runtime_nid_is(name,"959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
     if (runtime_nid_is(name,"p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
+    uintptr_t printing = runtime_printf_resolve(name);
+    if (printing) return printing;
+    uintptr_t stdio = runtime_stdio_resolve(name);
+    if (stdio) return stdio;
     uintptr_t mutex = runtime_mutex_resolve(name);
     if (mutex) return mutex;
     uintptr_t thread = runtime_thread_resolve(name);

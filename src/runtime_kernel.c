@@ -202,6 +202,7 @@ static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t
     { const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
       fprintf(stderr,"  raised at %p\n",(void *)caller);
       runtime_guest_where(stderr,(uint64_t)caller);
+      runtime_report_maps(stderr);
       { fprintf(stderr,"Runtime: the game's frames:\n"); runtime_guest_backtrace(stderr); }
       /* The game runs on this processor, so its registers are the ones of the host here:
        * the return value of the call it made before (rax) and the rest say what it did. */

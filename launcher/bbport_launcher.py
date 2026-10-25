@@ -699,7 +699,7 @@ THANKS = (
 
 class LauncherWindow(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="MAXIBOOST ON")
+        super().__init__(application=app, title="MAXIBOOST ON (mbport) (B站：一位路过飞宇移植优化)")
         self.set_default_size(760, 820)
         self.settings = load_settings()
         set_language(self.settings.get("ui_language", ""))

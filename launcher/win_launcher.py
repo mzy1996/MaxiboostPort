@@ -362,7 +362,7 @@ class Window(QMainWindow):
             self.settings["game_dir"] = str(default_game_dir())
         self.process = None
         self.worker = None
-        self.setWindowTitle("MAXIBOOST ON (mbport)")
+        self.setWindowTitle("MAXIBOOST ON (mbport) (B站：一位路过飞宇移植优化)")
         self.resize(980, 720)
 
         # The language is set before the pages are built: every text is translated as it
@@ -825,7 +825,7 @@ class Window(QMainWindow):
         built again. The window is not replaced: the tabs are emptied and filled anew, so
         that the game that runs keeps going."""
         set_language(self.settings.get("ui_language", ""))
-        self.setWindowTitle("MAXIBOOST ON (mbport)")
+        self.setWindowTitle("MAXIBOOST ON (mbport) (B站：一位路过飞宇移植优化)")
         # The pages are emptied first: the old ones would keep their texts.
         while self.tabs.count():
             widget = self.tabs.widget(0)

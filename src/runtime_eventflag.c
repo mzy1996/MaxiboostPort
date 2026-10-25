@@ -11,6 +11,25 @@
 #include <errno.h>
 #include <time.h>
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
+/* The clock the condition variables are made with: the monotonic one where the host
+ * can be told to use it (the Windows libraries cannot), the real time clock otherwise.
+ * The wait below uses the same one. */
+static clockid_t bb_cond_clock = CLOCK_REALTIME;
+static int bb_cond_clock_known;
+static clockid_t cond_clock(void) {
+    if (!bb_cond_clock_known) {
+        bb_cond_clock_known=1;
+        bb_cond_clock=CLOCK_REALTIME;
+#ifdef CLOCK_MONOTONIC
+        pthread_condattr_t probe;
+        if (!pthread_condattr_init(&probe)) {
+            if (!pthread_condattr_setclock(&probe,CLOCK_MONOTONIC)) bb_cond_clock=CLOCK_MONOTONIC;
+            pthread_condattr_destroy(&probe);
+        }
+#endif
+    }
+    return bb_cond_clock;
+}
 enum { ATTR_SINGLE=0x10, ATTR_MULTI=0x20, WAIT_AND=1, WAIT_OR=2, CLEAR_ALL=0x10, CLEAR_PAT=0x20 };
 typedef struct Flag {
     uint64_t id, pattern;
@@ -49,7 +68,10 @@ static ABI int32_t flag_create(uint64_t *out,const char *name,uint32_t attr,uint
     if (!f) return ERR(12);
     pthread_condattr_t ca;
     host_check(pthread_condattr_init(&ca));
-    host_check(pthread_condattr_setclock(&ca,CLOCK_MONOTONIC));
+    /* The clock of the condition variable: the host's libraries do not all have the
+     * monotonic one (the Windows one does not), and the wait below uses the clock the
+     * condition variable was made with. */
+    host_check(pthread_condattr_setclock(&ca,cond_clock()));
     host_check(pthread_cond_init(&f->changed,&ca));
     host_check(pthread_condattr_destroy(&ca));
     snprintf(f->name,sizeof(f->name),"%s",name);
@@ -113,7 +135,13 @@ static int32_t wait_flag(uint64_t id,uint64_t bits,uint32_t mode,uint64_t *resul
             ++f->waiting; ++f->active; ++waits;
             const uint64_t start=runtime_wait_clock();
             const uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000 : 0;
-            const struct timespec end={.tv_sec=(time_t)(deadline/1000000000),.tv_nsec=(long)(deadline%1000000000)};
+            /* The deadline is in the clock of the condition variable (the real time
+             * clock where the monotonic one is not there). */
+            struct timespec end;
+            clock_gettime(cond_clock(),&end);
+            end.tv_sec+=(time_t)(deadline/1000000000);
+            end.tv_nsec+=(long)(deadline%1000000000);
+            if (end.tv_nsec>=1000000000L) { end.tv_sec++; end.tv_nsec-=1000000000L; }
             const uint64_t cancelled_before=f->generation>>63;
             for (;;) {
                 if (f->deleted) { status=ERR(13); break; }

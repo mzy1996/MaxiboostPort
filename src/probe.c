@@ -15,6 +15,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #include <pthread.h>
 #else
 #include <sys/mman.h>
@@ -511,8 +512,63 @@ void runtime_restart(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* The watchdog (Windows): the game can wait for something that never comes, and then
+ * nothing is said. The threads are looked at after the time is up: where each of them
+ * is, and (for the ones that are in the game's own code) which place of the game. */
+static volatile int watchdog_fired;
+static void *watchdog_image;
+static unsigned watchdog_seconds;
+static DWORD WINAPI watchdog_thread(LPVOID parameter) {
+    (void)parameter;
+    Sleep(watchdog_seconds?watchdog_seconds*1000:0);
+    if (watchdog_fired) return 0;
+    watchdog_fired=1;
+    fprintf(stderr,"STOP: watchdog timeout; the threads:/n");
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    if (snapshot!=INVALID_HANDLE_VALUE) {
+        THREADENTRY32 entry;
+        entry.dwSize=sizeof(entry);
+        if (Thread32First(snapshot,&entry)) do {
+            HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,entry.th32ThreadID);
+            if (!thread) continue;
+            SuspendThread(thread);
+            CONTEXT context;
+            memset(&context,0,sizeof(context));
+            context.ContextFlags=CONTEXT_CONTROL;
+            if (GetThreadContext(thread,&context)) {
+                const uintptr_t rip=(uintptr_t)context.Rip;
+                fprintf(stderr,"  tid=%lu rip=%p",(unsigned long)entry.th32ThreadID,(void *)rip);
+
+                if (watchdog_image) {
+                    const uint64_t offset=rip-(uintptr_t)watchdog_image;
+                    fprintf(stderr," image+%#llx",(unsigned long long)offset);
+                }
+                fprintf(stderr,"\n");
+            }
+            ResumeThread(thread);
+            CloseHandle(thread);
+        } while (Thread32Next(snapshot,&entry));
+        CloseHandle(snapshot);
+    }
+    return 0;
+}
+#endif
+
+#ifdef _WIN32
+/* The way the process ends is reported: the game can end in many ways, and the one
+ * that happened is what says where it stopped. */
+static void report_exit(void) {
+    fflush(stdout);
+    fputs("Runtime: the process is ending\n",stderr);
+    fflush(stderr);
+}
+#endif
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef _WIN32
+    atexit(report_exit);
+#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -817,6 +873,16 @@ int main(int argc, char **argv) {
     }
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
+#ifdef _WIN32
+    /* The watchdog: the game can wait for something that never comes, and then nothing
+     * is said at all. */
+    watchdog_image=image;
+    watchdog_seconds=timeout_seconds;
+    if (timeout_seconds) {
+        HANDLE watchdog=CreateThread(NULL,0,watchdog_thread,NULL,0,NULL);
+        if (watchdog) CloseHandle(watchdog);
+    }
+#endif
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
     /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
     enum { MAIN_STACK=8*1024*1024 };

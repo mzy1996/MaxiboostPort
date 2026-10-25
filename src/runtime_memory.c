@@ -390,10 +390,14 @@ static uintptr_t find_free_in(uintptr_t from, uintptr_t limit, uint64_t size, ui
 #ifdef _WIN32
 /* The host's own mappings fill the ranges below the user's range (Windows), so the
  * runtime's own pool goes above it (the game puts its own things in the user's range,
- * from 64 gigabytes up, and the two must not meet). */
-#define SYSTEM_MIN UINT64_C(0x10000000000)
+ * from 64 gigabytes up, and the two must not meet).
+ * The pool must stay inside the range the game's library accepts: its mmap refuses
+ * anything above 0xfbffc3fffff, and Windows cannot map a view above its own user
+ * address space either (the host's choice then lands outside the game's range and the
+ * library turns it into a failure). 0x800000000 (512 gigabytes) is inside both. */
+#define SYSTEM_MIN UINT64_C(0x800000000)
 #define LOW_MIN UINT64_C(0x40000000000)
-#define FLEXIBLE_MIN UINT64_C(0x10000000000)
+#define FLEXIBLE_MIN UINT64_C(0x800000000)
 #else
 #define SYSTEM_MIN UINT64_C(0x0200000000)
 #define LOW_MIN UINT64_C(0x0800000000)
@@ -511,6 +515,12 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     ++allocations; live_bytes += size;
     write_unlock();
     printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
+    { static int shown;
+      static uint64_t last;
+      if (size!=last && shown<5) { last=size; ++shown;
+        fprintf(stderr,"Runtime:   asked for %llu bytes at low=%lld high=%lld align=%llu type=%d -> offset=%#llx\n",
+                (unsigned long long)size,(long long)low,(long long)high,
+                (unsigned long long)alignment,type,(unsigned long long)start); } }
     return 0;
 }
 /* The largest free direct memory in [low, high) at the alignment: where it starts and its size
@@ -520,6 +530,10 @@ static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignmen
     if (!phys_out || !size_out || low<0 || high<=low || !valid_alignment(alignment)) return INVALID;
     const uint64_t end=(uint64_t)high<POOL_SIZE ? (uint64_t)high : POOL_SIZE;
     uint64_t best_start=0, best=0;
+    { static int shown;
+      if (shown<3) { ++shown;
+        fprintf(stderr,"Runtime:   available asked: low=%lld high=%lld align=%llu\n",
+                (long long)low,(long long)high,(unsigned long long)alignment); } }
     read_lock();
     for (uint64_t at=(uint64_t)low; at<end;) {
         uint64_t next_used=end, used_end=end;
@@ -597,6 +611,12 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     trap_forget(start,end);
     return 0;
 }
+/* The guest's mappings: what the game sees of its own memory. */
+void runtime_report_maps(FILE *out) {
+    for (size_t i=0;i<vma_count;++i)
+        fprintf(out,"Runtime: map %#" PRIx64 "..%#" PRIx64 " kind %d prot %#x phys %#" PRIx64 "\n",
+                (uint64_t)vmas[i].start,(uint64_t)vmas[i].end,vmas[i].kind,vmas[i].prot,vmas[i].phys);
+}
 static ABI int32_t direct_unmap(void *address, uint64_t size) {
     /* The GPU forgets the range before it disappears (as shadPS4's early GPU unmap). */
     if (hook_unmap && !((uintptr_t)address%PAGE) && size) hook_unmap((uintptr_t)address,align_up(size,PAGE));
@@ -607,9 +627,11 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     write_unlock();
     return result;
 }
+static size_t released;
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     if (start % PAGE || size % PAGE) return INVALID;
     if (!size) return 0;
+    fprintf(stderr,"Runtime:   released offset=%#llx size=%llu\n",(unsigned long long)start,(unsigned long long)size);
     write_lock();
     if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
     /* Mappings of released physical pages disappear with them. */
@@ -655,8 +677,10 @@ static ABI int32_t map_flexible(void **inout, uint64_t size, int prot, int flags
     write_unlock();
     flush_hooks();
     if (!result) printf("Runtime: mapped flexible memory %p, size=%" PRIu64 ", prot=0x%x\n", *inout, size, prot);
-    else fprintf(stderr,"Runtime: flexible map of %" PRIu64 " bytes failed (0x%x), in use=%" PRIu64 "\n",
-                 size, (unsigned)result, flexible_bytes);
+    else fprintf(stderr,"Runtime: flexible map of %" PRIu64 " bytes failed (0x%x): %s (in use %" PRIu64 ")\n",
+                 size, (unsigned)result,
+                 result==INVALID?"the request was not valid":result==NO_MEMORY?"not enough memory":
+                 result==NO_SPACE?"no room":"another reason", flexible_bytes);
     return result;
 }
 static ABI int32_t map_flexible_named(void **inout, uint64_t size, int prot, int flags, const char *name) {
@@ -761,6 +785,15 @@ static ABI int32_t direct_memory_type(uint64_t phys, int *type, void **start, vo
 }
 static ABI int32_t batch_map2(BatchEntry *entries, int count, int *processed, int flags) {
     if (!entries || count<0) return INVALID;
+    { static int shown;
+      if (shown<3) { ++shown;
+        fprintf(stderr,"Runtime:   batch map of %d entries (flags %#x):",count,flags);
+        for (int i=0;i<count && i<4;++i)
+            fprintf(stderr," [op %d start %p len %llu prot %#x off %#lld]",
+                    entries[i].operation,(void *)entries[i].start,
+                    (unsigned long long)entries[i].length,(unsigned)entries[i].prot,
+                    (long long)entries[i].offset);
+        fprintf(stderr,"\n"); } }
     int32_t result=0; int done=0;
     write_lock();
     for (; done<count; ++done) {
