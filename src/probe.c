@@ -702,7 +702,9 @@ int main(int argc, char **argv) {
     { /* link_modules.py's unwind.txt beside the boot image: the modules' unwind tables */
         char unwind[4096];
         snprintf(unwind,sizeof(unwind),"%s",argv[1]);
-        char *slash=strrchr(unwind,'/');
+        /* The folder of the path, whichever way it is written (Windows uses the backslash). */
+        char *slash=NULL;
+        for (char *at=unwind;*at;++at) if (*at=='/' || *at=='\\') slash=at;
         snprintf(slash ? slash+1 : unwind,sizeof(unwind)-(size_t)(slash ? slash+1-unwind : 0),"unwind.txt");
         runtime_process_load_unwind(unwind,image);
     }

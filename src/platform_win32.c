@@ -182,6 +182,12 @@ void *platform_reserve_low(size_t size, int prot) {
     return VirtualAlloc(NULL, rounded, MEM_RESERVE, host_protect(prot));
 }
 
+void *platform_private_memory(size_t size, int prot) {
+    /* The pages are reserved, not committed: the game gets them as it writes them, so a
+     * machine with little memory is not charged for the whole heap. */
+    return VirtualAlloc(NULL,size,MEM_RESERVE,host_protect(prot));
+}
+
 void *platform_alloc_executable(size_t size) {
     /* The runtime's own code: it has to be executable and writable (the thunks are patched). */
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);

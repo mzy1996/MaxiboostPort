@@ -193,13 +193,24 @@ static ABI __attribute__((noreturn)) void hard_exit(int status) {
     fflush(stdout);
     _exit(status);
 }
+/* The addresses of the game's own frames on this thread's stack. */
+static int guest_call_addresses(uint64_t out[], int max);
 static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t argument) {
     fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
     /* The caller is where the game raised it: the frame pointer is often left out on
      * this platform, so the return address is read instead. */
     { const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
       fprintf(stderr,"  raised at %p\n",(void *)caller);
-      runtime_guest_where(stderr,(uint64_t)caller); }
+      runtime_guest_where(stderr,(uint64_t)caller);
+      /* The game's own frames on the stack: where it was when it stopped. */
+      uint64_t addresses[8];
+      const int found=guest_call_addresses(addresses,8);
+      for (int i=0;i<found;++i) {
+          uint64_t offset=0; const char *module=NULL;
+          runtime_guest_address(addresses[i],&offset,&module);
+          fprintf(stderr,"  the game was at %s+%#llx\n",module?module:"its code",
+                  (unsigned long long)offset);
+      } }
     runtime_guest_backtrace(stderr);
     runtime_report();
     exit(23);
@@ -373,8 +384,7 @@ static WaitSite wait_sites[512];
 static _Thread_local int wait_tid;
 void runtime_guest_call_sites(uint64_t out[3]);
 /* The first three return addresses into the game's code on this thread's stack (guest offsets). */
-static void guest_call_sites(uint64_t out[3]) {
-    const uintptr_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
+static int guest_call_addresses(uint64_t out[], int max) {
     static _Thread_local uintptr_t stack_hi;
     if (!stack_hi) {
         void *base=NULL,*top=NULL;
@@ -383,8 +393,22 @@ static void guest_call_sites(uint64_t out[3]) {
     }
     const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
     int found=0;
+    /* The game's own code is in the modules that were linked into the image; where the
+     * image sits is not the same on every platform. */
+    for (int i=0;i<400 && found<max && (uintptr_t)(sp+i+1)<=stack_hi;++i) {
+        if (runtime_guest_address(sp[i],NULL,NULL)) out[found++]=sp[i];
+    }
+    return found;
+}
+static void guest_call_sites(uint64_t out[3]) {
+    uint64_t addresses[8];
+    const int found=guest_call_addresses(addresses,8);
     out[0]=out[1]=out[2]=0;
-    for (int i=0;i<400 && found<3 && (uintptr_t)(sp+i+1)<=stack_hi;++i) if (sp[i]>=text_lo && sp[i]<text_hi) out[found++]=sp[i]-text_lo;
+    for (int i=0;i<3 && i<found;++i) {
+        uint64_t offset=0;
+        runtime_guest_address(addresses[i],&offset,NULL);
+        out[i]=offset;
+    }
 }
 void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;

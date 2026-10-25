@@ -84,6 +84,16 @@ static const UnwindModule *unwind_module_at(uint64_t address) {
         if (address>=unwind_modules[i].start && address-unwind_modules[i].start<unwind_modules[i].size) return &unwind_modules[i];
     return NULL;
 }
+/* Whether an address is in the game's own code, and where: the module it is in and the
+ * offset in it. The modules are the ones that were linked into the image. */
+int runtime_guest_address(uint64_t address, uint64_t *offset, const char **module) {
+    const UnwindModule *m=unwind_module_at(address);
+    if (!m) return 0;
+    if (offset) *offset=address-m->start;
+    if (module) *module=m->name;
+    return 1;
+}
+
 /* Where an address is: the module it belongs to and the offset in it (or the address
  * itself when it is in none of them). */
 void runtime_guest_where(FILE *out, uint64_t address) {

@@ -42,6 +42,13 @@ static uint64_t pool_size_bytes(void) {
 }
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
+/* The host's sections are mapped at the host's granularity (64 KiB on Windows), so the
+ * flexible memory is placed at such a boundary. */
+#ifdef _WIN32
+#define FLEX_GRAN (UINT64_C(64) * 1024)
+#else
+#define FLEX_GRAN PAGE
+#endif
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
@@ -83,6 +90,7 @@ static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&loc
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
 static int pool_fd=-1;
+static int flex_fd=-1;
 /* bbport: direct memory in GPU-visible system memory the GPU library allocates (dma-buf chunks,
  * BB_GUEST_GPU_MEMORY=1): the GPU reads the game's data in place instead of the CPU copying it
  * into staging buffers first. Chunks are allocated when the game allocates direct memory in them;
@@ -150,6 +158,9 @@ static int pool(void) {
     if (platform_section_create(&pool_fd,(size_t)(POOL_SIZE+FLEX_SPAN),"bb-guest-memory")) return -1;
     void *view=platform_section_backing(pool_fd,(size_t)(POOL_SIZE+FLEX_SPAN));
     if (!view) return -1;
+    /* The flexible memory has a section of its own: it is the game's heap, and the
+     * section of the pool is the direct memory (which the GPU shares). */
+    if (platform_section_create(&flex_fd,(size_t)FLEX_SPAN,"bb-guest-flexible")) return -1;
     backing_base=view;
     chunk_fds=malloc((POOL_SIZE/CHUNK+1)*sizeof(int));
     if (!chunk_fds) return -1;
@@ -190,14 +201,21 @@ static void ensure_chunks(uint64_t phys, uint64_t size) {
 }
 /* mmap of direct or flexible memory at phys, split where it crosses chunks. */
 static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys) {
+    /* The flexible memory is in the section of its own; the direct memory in the pool's.
+     * The offset in the section is the place in the pool, not in the section. */
+    const int section = phys>=POOL_SIZE ? flex_fd : pool_fd;
+    const uint64_t offset = phys>=POOL_SIZE ? phys-POOL_SIZE : phys;
 #ifdef _WIN32
-    /* The ranges the game asks for are full of the host's own mappings (Windows): the
-     * host picks the address itself. The mapping is made where the host can make it. */
-    (void)address;
-    return platform_section_map(pool_fd,NULL,size,phys,prot);
+    /* The address the game asked for comes first: the game puts its things at known
+     * places, and a mapping elsewhere is a mapping it cannot use. Only when that
+     * address cannot be mapped (it is full of the host's own mappings) does the host
+     * pick one itself. */
+    void *asked=platform_section_map(section,(void *)address,size,offset,prot);
+    if (asked) return asked;
+    return platform_section_map(section,NULL,size,offset,prot);
 #else
     if (!chunk_fds || phys>=POOL_SIZE)
-        return platform_section_map(pool_fd,(void *)address,size,phys,prot);
+        return platform_section_map(section,(void *)address,size,offset,prot);
     ensure_chunks(phys,size);
     for (uint64_t done=0;whole_chunks && done<size;) {
         const uint64_t at=phys+done;
@@ -296,16 +314,18 @@ static void flex_set(uint64_t first, uint64_t count, int used) {
     }
 }
 static uint64_t flex_alloc(uint64_t size) {
-    uint64_t pages=size/PAGE, total=FLEX_SPAN/PAGE, run=0;
+    const uint64_t units=(size+FLEX_GRAN-1)/FLEX_GRAN, total=FLEX_SPAN/FLEX_GRAN;
+    uint64_t run=0;
     for (uint64_t p=0;p<total;++p) {
         run = flex_test(p) ? 0 : run+1;
-        if (run==pages) { flex_set(p+1-pages,pages,1); return POOL_SIZE+(p+1-pages)*PAGE; }
+        if (run==units) { flex_set(p+1-units,units,1); return POOL_SIZE+(p+1-units)*FLEX_GRAN; }
     }
     return UINT64_MAX;
 }
 static void flex_free(uint64_t phys, uint64_t size) {
-    flex_set((phys-POOL_SIZE)/PAGE,size/PAGE,0);
-    platform_section_punch_hole(pool_fd,phys,(size_t)size);
+    const uint64_t units=(size+FLEX_GRAN-1)/FLEX_GRAN;
+    flex_set((phys-POOL_SIZE)/FLEX_GRAN,units,0);
+    platform_section_punch_hole(flex_fd,phys-POOL_SIZE,(size_t)(units*FLEX_GRAN));
 }
 static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
     size_t lo=0, hi=vma_count;
@@ -368,12 +388,12 @@ static uintptr_t find_free_in(uintptr_t from, uintptr_t limit, uint64_t size, ui
  * from 0x1000000000 up, and libc's first heap block or a flexible mapping there made them fail.
  * A hint inside the user range is searched from the hint, as before. */
 #ifdef _WIN32
-/* The host's own mappings fill everything below the user's range (Windows): the flexible
- * memory goes above the user's range, where the host can still make room, and the
- * game's own mappings keep the user's range. */
-#define SYSTEM_MIN UINT64_C(0x1000000000)
-#define LOW_MIN UINT64_C(0x4000000000)
-#define FLEXIBLE_MIN UINT64_C(0x4000000000)
+/* The host's own mappings fill the ranges below the user's range (Windows), so the
+ * runtime's own pool goes above it (the game puts its own things in the user's range,
+ * from 64 gigabytes up, and the two must not meet). */
+#define SYSTEM_MIN UINT64_C(0x10000000000)
+#define LOW_MIN UINT64_C(0x40000000000)
+#define FLEXIBLE_MIN UINT64_C(0x10000000000)
 #else
 #define SYSTEM_MIN UINT64_C(0x0200000000)
 #define LOW_MIN UINT64_C(0x0800000000)

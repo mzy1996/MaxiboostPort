@@ -81,6 +81,10 @@ int platform_protect(void *address, size_t size, int prot);
 int platform_query_protect(void *address, size_t size);
 /* Reserves address space for the guest below the 4 GiB line (the guest's low memory). */
 void *platform_reserve_low(size_t size, int prot);
+/* The host's own private memory for the guest (the flexible memory: the game's heap, which
+ * it does not share with the GPU). It is reserved, not filled: the pages are given to the
+ * game as it writes them. NULL when the host cannot give it. */
+void *platform_private_memory(size_t size, int prot);
 /* The guest's PROT_* values, the same numbers the guest uses. */
 #define BB_PROT_NONE 0
 #define BB_PROT_READ 1
