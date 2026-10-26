@@ -71,6 +71,18 @@ static ABI int64_t guest_mktime(void *tm) {
     return (int64_t)mktime(&value);
 }
 
+/* The thread-safe universal time: the time comes first (a pointer to it), the
+ * answer second (where it is written). The game's own library asks for it by
+ * name; without an address for it the game's linker stops the game. */
+static ABI int32_t guest_gmtime_s(const void *timer, void *result) {
+    if (!timer || !result) return 22; /* EINVAL */
+    const int64_t value = *(const int64_t *)timer;
+    struct tm *answer = gmtime(&value);
+    if (!answer) return 11; /* the time is not representable */
+    guest_tm_write(result, answer);
+    return 0;
+}
+
 /* The character set conversions (the Japanese profile of the console: Shift-JIS).
    The game asks for them by name; what it needs of them is not known here, so they
    are answered with "nothing to convert" - the game goes on with the text it has.
@@ -92,5 +104,6 @@ uintptr_t runtime_ces_resolve(const char *name) {
     if (runtime_nid_is(name,"r7Sr1i7KLus#3#1")) return (uintptr_t)ces_not_converted;
     if (runtime_nid_is(name,"IljzwFmlBKg#3#1")) return (uintptr_t)ces_not_converted;
     if (runtime_nid_is(name,"538bRGc6Zo8#3#1")) return (uintptr_t)ces_not_converted;
+    if (runtime_nid_is(name,"5bBacGLyLOs#libSceLibcInternal")) return (uintptr_t)guest_gmtime_s;
     return 0;
 }

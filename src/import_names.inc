@@ -746,6 +746,7 @@
 {"XD3mDeybCnk#p#J","scePthreadRwlockTryrdlock"},
 {"eXbUSpEaTsA#p#J","scePthreadAttrSetinheritsched"},
 {"ZT4ODD2Ts9o#libSceLibcInternal","Need_sceLibcInternal"},
+{"5bBacGLyLOs#libSceLibcInternal","gmtime_s"},
 {"lbQKqsERhtE#libSceDiscMap","sceDiscMapIsRequestOnHDD"},
 {"ioKMruft1ek#libSceDiscMap","sceDiscMap_8A828CAEE7EDD5E9"},
 /* GODZILLA (CUSA02046 1.01) imports that Bloodborne does not have. */
