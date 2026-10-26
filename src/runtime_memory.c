@@ -537,34 +537,22 @@ static int direct_range_allocated(uint64_t phys, uint64_t size) {
     return 1;
 }
 
-/* The share of the direct memory that the system keeps for itself (its own graphics
- * buffers): the game is told the size of what is left, and the answer the query gives
- * leaves the share out as well (on the real machine the system holds a part of the
- * direct memory too, and the game may not take all of it). */
-static uint64_t dmem_system_share(void) {
-    static uint64_t share;
-    if (!share) {
-        const char *env=getenv("BB_DMEM_RESERVE_MB");
-        uint64_t mb = env ? strtoull(env,NULL,10) : 1088;
-        if (mb>8192) mb=1088;
-        share = mb*1024*1024;
-    }
-    return share;
-}
+/* The direct memory the game may use: the whole pool. The real machine keeps a part of
+ * the physical memory for itself, but that is a property of the console's memory, not of
+ * the game's budget: the game is told the pool's size and may take all of it. */
 static ABI uint64_t direct_size(void) {
-    const uint64_t pool=POOL_SIZE;
-    const uint64_t share=dmem_system_share();
-    return pool>share ? pool-share : pool;
+    return POOL_SIZE;
 }
 static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
                                   uint64_t alignment, int type, int64_t *out) {
     if (!alignment) alignment = PAGE;
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
         return INVALID;
-    /* The range the game asks for is where the block is looked for first, not a wall:
-     * the pool is the truth, and the game takes the whole of it in blocks (its own heap
-     * is in it too, so it needs a little more than the window it was told about). */
-    const uint64_t end=POOL_SIZE;
+    /* The range the game asks for is where the block is looked for: the search never
+     * leaves it (shadPS4's MemoryManager::Allocate: the block must end before the
+     * search's end). The game asks for the whole direct memory and takes it in blocks;
+     * its own heap is in it too. */
+    const uint64_t end=(uint64_t)high<POOL_SIZE ? (uint64_t)high : POOL_SIZE;
     if ((uint64_t)low >= end || size > end - (uint64_t)low) {
         fprintf(stderr,"Runtime:   the allocation of %llu bytes did not fit (low=%lld high=%lld)\n",
                 (unsigned long long)size,(long long)low,(long long)high);
@@ -608,14 +596,14 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
         }
     }
     if (start > end || size > end-start || taken) {
-        /* The pool is full: the real machine says "try again later" (the memory comes
-         * back when the game gives it up), not that there is no memory. */
+        /* No room in the range the game asked for: the real machine says "try again
+         * later" (EAGAIN), not that there is no memory at all. */
         static int reported;
         if (reported++ < 4)
             fprintf(stderr,"Runtime:   no room for %llu bytes (start %#llx; asked low=%lld high=%lld align=%llu)\n",
                     (unsigned long long)size,(unsigned long long)start,
                     (long long)low,(long long)high,(unsigned long long)alignment);
-        write_unlock(); return NO_MEMORY;
+        write_unlock(); return NO_SPACE;
     }
     {   /* The block goes into the list, which keeps its order. */
         int at=block_first_ending_after(start);
@@ -665,12 +653,6 @@ static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignmen
     }
     read_unlock();
     if (!best) return NO_MEMORY;
-    {   /* The share the system keeps is not the game's: it is left out of the answer,
-         * or the game would take the whole pool and its own heap would have nowhere
-         * to go. */
-        const uint64_t share=dmem_system_share();
-        if (best>share) best-=share;
-    }
     if (memory_trace())
         fprintf(stderr,"Runtime:   available answer: %llu bytes at %#llx (in use: %d blocks, %llu bytes)\n",
                 (unsigned long long)best,(unsigned long long)best_start,block_count,
@@ -832,11 +814,23 @@ static ABI int32_t map_flexible(void **inout, uint64_t size, int prot, int flags
     int32_t result=map_flexible_locked(inout,size,prot,flags);
     write_unlock();
     flush_hooks();
-    if (!result) printf("Runtime: mapped flexible memory %p, size=%" PRIu64 ", prot=0x%x\n", *inout, size, prot);
-    else fprintf(stderr,"Runtime: flexible map of %" PRIu64 " bytes failed (0x%x): %s (in use %" PRIu64 ")\n",
-                 size, (unsigned)result,
-                 result==INVALID?"the request was not valid":result==NO_MEMORY?"not enough memory":
-                 result==NO_SPACE?"no room":"another reason", flexible_bytes);
+    if (!result) {
+        /* The game's heap grows with these: there are many of them, so the message is
+         * only for the ones that are asked for (BB_MEMORY_TRACE). */
+        if (memory_trace())
+            printf("Runtime: mapped flexible memory %p, size=%" PRIu64 ", prot=0x%x\n", *inout, size, prot);
+    }
+    else {
+        /* The game retries until the mapping works, so the reason is said a few times
+         * and then the count is kept quiet. */
+        static _Atomic unsigned failures;
+        const unsigned n=atomic_fetch_add(&failures,1)+1;
+        if (n<=4 || !(n&(n-1)))
+            fprintf(stderr,"Runtime: flexible map of %" PRIu64 " bytes failed (0x%x): %s (in use %" PRIu64 ", %u so far)\n",
+                    size, (unsigned)result,
+                    result==INVALID?"the request was not valid":result==NO_MEMORY?"not enough memory":
+                    result==NO_SPACE?"no room":"another reason", flexible_bytes, n);
+    }
     return result;
 }
 static ABI int32_t map_flexible_named(void **inout, uint64_t size, int prot, int flags, const char *name) {
@@ -856,11 +850,24 @@ static ABI void *posix_mmap(void *addr, uint64_t size, int prot, int flags, int 
     if (!size) { *runtime_errno()=POSIX_EINVAL; return (void *)-1; }
     void *out=(flags & MAP_FIXED_FLAG) ? addr : NULL;
     const int32_t result=map_flexible(&out,align_up(size,PAGE),prot & 0x37,flags & MAP_FIXED_FLAG);
-    uint64_t sites[3];
-    runtime_guest_call_sites(sites);
-    printf("Runtime: mmap %#" PRIx64 " bytes for the game (its heap grows) from +%#" PRIx64 " < +%#" PRIx64 " < +%#" PRIx64 "\n",
-           size,sites[0],sites[1],sites[2]);
-    if (result) { *runtime_errno()=result==NO_MEMORY ? POSIX_ENOMEM : POSIX_EINVAL; return (void *)-1; }
+    if (result) {
+        /* The game asks for more heap as it needs it; the answer is the reason it stops
+         * asking, so it is said (the game retries until it works). */
+        *runtime_errno()=result==NO_MEMORY ? POSIX_ENOMEM : POSIX_EINVAL;
+        char line[256];
+        const int length=snprintf(line,sizeof(line),
+            "Runtime: mmap %#" PRIx64 " bytes for the game failed (0x%x, %s; flexible in use %" PRIu64 " of %" PRIu64 ")\n",
+            size,(unsigned)result,result==NO_MEMORY?"not enough memory":"the request was not valid",
+            flexible_bytes,(uint64_t)FLEXIBLE_SIZE);
+        if (length>0) platform_write_stdout(line,(size_t)(length<(int)sizeof(line)?length:(int)sizeof(line)-1));
+        return (void *)-1;
+    }
+    if (memory_trace()) {
+        uint64_t sites[3];
+        runtime_guest_call_sites(sites);
+        printf("Runtime: mmap %#" PRIx64 " bytes for the game (its heap grows) from +%#" PRIx64 " < +%#" PRIx64 " < +%#" PRIx64 "\n",
+               size,sites[0],sites[1],sites[2]);
+    }
     return out;
 }
 static ABI int32_t reserve_range(void **inout, uint64_t size, int flags, uint64_t alignment) {

@@ -499,6 +499,7 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     touch_for_write(buffer,size);
     ssize_t n=read_retrying(h,buffer,size,offset,1);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    if (file_trace()) printf("File trace: pread -> %lld bytes\n",(long long)n);
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -515,6 +516,12 @@ static void touch_for_read(const void *buffer,uint64_t size) {
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
+    if (file_trace()) {
+        File *t=get(fd);
+        printf("File trace: write(fd %d, %llu bytes) at %p -> %s\n",fd,(unsigned long long)size,
+               buffer,t&&t->path[0]?t->path:"(none)");
+        fflush(stdout);
+    }
     touch_for_read(buffer,size);
     ssize_t n=write(h,buffer,size);
     if (n<0) return -errno;
@@ -524,6 +531,12 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
+    if (file_trace()) {
+        File *t=get(fd);
+        printf("File trace: pwrite(fd %d, %llu bytes at %lld) at %p -> %s\n",fd,
+               (unsigned long long)size,(long long)offset,buffer,t&&t->path[0]?t->path:"(none)");
+        fflush(stdout);
+    }
     touch_for_read(buffer,size);
     ssize_t n=(ssize_t)platform_pwrite(h,buffer,size,offset);
     return n<0 ? -errno : n;

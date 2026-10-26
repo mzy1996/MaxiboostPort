@@ -29,11 +29,20 @@ gpu_dll=$(find "$root/out/gpu-win" -name 'bbgpu.dll' | head -1)
 [ -n "$gpu_dll" ] && cp "$gpu_dll" "$package/bin/"
 
 # The debug symbols are dropped: the library is 300 MB with them and 13 MB without, and the
-# player has no use for them.
+# player has no use for them. The stripped file is written beside the original and moved
+# over it: strip works in place through a temporary file (stXXXXXX) on Windows, and when
+# that fails the file it was stripping is left empty (a package that cannot start).
 strip_bin="$msys/mingw64/bin/strip.exe"
 if [ -x "$strip_bin" ]; then
     for binary in "$package/bin/bb-probe.exe" "$package/bin/bbgpu.dll"; do
-        [ -f "$binary" ] && "$strip_bin" --strip-unneeded "$binary" 2>/dev/null || true
+        [ -f "$binary" ] || continue
+        stripped="$binary.stripped"
+        if "$strip_bin" --strip-unneeded -o "$stripped" "$binary" 2>/dev/null && [ -s "$stripped" ]; then
+            mv -f "$stripped" "$binary"
+        else
+            rm -f "$stripped"
+            echo "WARNING: $binary could not be stripped; it keeps its symbols"
+        fi
     done
 fi
 

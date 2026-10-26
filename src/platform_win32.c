@@ -475,9 +475,18 @@ int platform_context_is_fetch(const PlatformContext *context) {
     return record->ExceptionInformation[0]==3;
 }
 void platform_write_stdout(const char *text, size_t size) {
-    /* The runtime's log: the standard output, which the launcher reads. */
-    fwrite(text, 1, size, stdout);
-    fflush(stdout);
+    /* The runtime's log: the standard output, which the launcher reads. It is written
+     * straight to the handle, without the C library's buffer: a message that comes
+     * just before a crash (a fault, a stack overflow) must not be lost with the
+     * buffer, and the write needs almost no stack. */
+    HANDLE handle=GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD written=0;
+    if (handle!=INVALID_HANDLE_VALUE && handle)
+        WriteFile(handle,text,(DWORD)size,&written,NULL);
+    else {
+        fwrite(text, 1, size, stdout);
+        fflush(stdout);
+    }
 }
 
 /* A shared library the runtime loads at run time (the online module). */
