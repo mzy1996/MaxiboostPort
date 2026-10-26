@@ -105,7 +105,10 @@ typedef struct { char label[LABEL_SIZE]; char padding[3]; uint32_t status; } Add
  * slots. */
 static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
     require_initialized();
-    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
+    /* The service label names the service the add-ons belong to. The add-ons of this
+     * port are the same whoever asks for them (the folders under <user>/addcont), so
+     * the label is only noted, like the one of addon_info is. */
+    if (service) { static int noted; if (!noted) { noted=1; printf("Runtime: AppContent add-on list asked for a named service\n"); } }
     if ((!capacity || !list) && !hits) return PARAMETER;
     int fill=list && capacity;
     uint32_t count=0;
