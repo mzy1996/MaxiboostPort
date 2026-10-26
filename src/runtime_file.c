@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #ifndef _WIN32
 #include <strings.h>
 #endif
@@ -188,6 +189,12 @@ static int host_flags(int flags) {
     if (flags&0x400) r|=O_TRUNC;
     if (flags&0x800) r|=O_EXCL;
     if (flags&0x20000) r|=O_DIRECTORY;
+#ifdef _WIN32
+    /* The C library opens a file in text mode unless it is told otherwise, and then
+     * it takes 0x1A for the end of the file and turns the line ends into one byte:
+     * the game's archives are binary, so this would cut them short. */
+    r|=O_BINARY;
+#endif
     return r|O_CLOEXEC;
 }
 static void free_listing(Listing *l) { if (l) { free(l->names); free(l->offsets); free(l->types); free(l); } }
@@ -478,9 +485,23 @@ static ssize_t read_retrying(int h,void *buffer,uint64_t size,int64_t offset,int
     }
     return n;
 }
+/* The guest code that asked for it (the image offsets of the call chain): the file
+ * operations tell where in the game the read happened, which is what says whether the
+ * game read what it wanted. */
+static void guest_site(char *out, size_t size) {
+    uint64_t sites[3];
+    runtime_guest_call_sites(sites);
+    snprintf(out,size," from +%#" PRIx64 " < +%#" PRIx64 " < +%#" PRIx64,
+             sites[0],sites[1],sites[2]);
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
-    if (file_trace()) printf("File trace: read(fd %d, %llu bytes) at %p\n",fd,(unsigned long long)size,buffer);
+    if (file_trace()) {
+        char site[160]="";
+        guest_site(site,sizeof(site));
+        printf("File trace: read(fd %d, %llu bytes) at %p%s\n",fd,(unsigned long long)size,buffer,site);
+        fflush(stdout);
+    }
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
@@ -492,19 +513,37 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
-    if (file_trace()) printf("File trace: pread(fd %d, %llu bytes at %lld) at %p\n",fd,
-                             (unsigned long long)size,(long long)offset,buffer);
+    if (file_trace()) {
+        char site[160]="";
+        guest_site(site,sizeof(site));
+        printf("File trace: pread(fd %d, %llu bytes at %lld) at %p%s\n",fd,
+               (unsigned long long)size,(long long)offset,buffer,site);
+        fflush(stdout);
+    }
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
     ssize_t n=read_retrying(h,buffer,size,offset,1);
-    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
-    if (file_trace()) printf("File trace: pread -> %lld bytes\n",(long long)n);
+    if (n<0) {
+        if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno);
+        char line[192];
+        const int length=snprintf(line,sizeof(line),"File trace: pread failed (errno %d, %llu bytes asked at %lld)\n",
+                                  errno,(unsigned long long)size,(long long)offset);
+        if (length>0) platform_write_stdout(line,(size_t)length);
+        return -errno;
+    }
+    {   /* What the game got: the number decides whether it reads on (the archive's
+         * table is bigger than the first block). It is said without the C library's
+         * buffer, so it is there even if the game dies right after. */
+        char line[192];
+        const int length=snprintf(line,sizeof(line),"File trace: pread -> %lld bytes of %llu asked\n",
+                                  (long long)n,(unsigned long long)size);
+        if (length>0) platform_write_stdout(line,(size_t)length);
+    }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
-}
-/* Pages the GPU side keeps without access (data newer in VRAM, runtime_memory_trap reasons from
+}/* Pages the GPU side keeps without access (data newer in VRAM, runtime_memory_trap reasons from
  * 16 up) would make the kernel's copy fail with EFAULT: a user-mode read of each page first goes
  * through the handler, which copies the data back. */
 static void touch_for_read(const void *buffer,uint64_t size) {
@@ -561,7 +600,13 @@ static int64_t do_fstat(int fd,GuestStat *out) {
     if (!out) return -EFAULT;
     struct stat s;
     if (fstat(h,&s)) return -errno;
-    convert_stat(&s,out); return 0;
+    convert_stat(&s,out);
+    if (file_trace()) {
+        char line[192];
+        const int length=snprintf(line,sizeof(line),"File trace: fstat(fd %d) -> size %lld\n",fd,(long long)out->size);
+        if (length>0) platform_write_stdout(line,(size_t)length);
+    }
+    return 0;
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
     char path[1024]; struct stat s;

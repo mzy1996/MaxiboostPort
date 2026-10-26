@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <io.h>
+#include <errno.h>
 
 /* MapViewOfFileEx returns NULL when it fails; this is the value the caller compares with. */
 #define MAP_FAILED NULL
@@ -355,26 +358,56 @@ int platform_real_path(const char *path, char *buffer, size_t size) {
     return written>0 && written<size;
 }
 
+/* A positional read and write on Windows.
+ *
+ * The descriptor is the C library's own (not a Win32 handle): the Win32 call with it
+ * fails, and the game then never gets its archives - it reads the header, the table
+ * stays empty and every lookup in it fails. So the positional read is the library's
+ * seek and read. The two are together under a lock, so a second read of the same file
+ * does not get in between them. */
+static CRITICAL_SECTION positional_lock;
+static int positional_lock_ready;
+static void positional_enter(void) {
+    if (!positional_lock_ready) {
+        InitializeCriticalSection(&positional_lock);
+        positional_lock_ready=1;
+    }
+    EnterCriticalSection(&positional_lock);
+}
+static void positional_leave(void) { LeaveCriticalSection(&positional_lock); }
+
 int64_t platform_pread(int handle, void *buffer, size_t size, int64_t offset) {
-    OVERLAPPED overlapped;
-    memset(&overlapped,0,sizeof(overlapped));
-    overlapped.Offset=(DWORD)(offset & 0xffffffff);
-    overlapped.OffsetHigh=(DWORD)((uint64_t)offset>>32);
-    if (!ReadFile((HANDLE)handle,buffer,(DWORD)size,NULL,&overlapped)) {
-        if (GetLastError()==ERROR_HANDLE_EOF) return 0;
+    positional_enter();
+    if (_lseeki64(handle,(__int64)offset,SEEK_SET)<0) {
+        positional_leave();
         return -1;
     }
-    return (int64_t)GetOverlappedResult((HANDLE)handle,&overlapped,NULL,FALSE);
+    const ssize_t n=read(handle,buffer,size);
+    positional_leave();
+    if (n<0) {
+        {   /* Why the read failed: the game stops reading when a read fails, and the
+             * reason is only here (the message is written without a buffer, so it is
+             * there even if the game dies right after). */
+            char line[192];
+            const int length=snprintf(line,sizeof(line),"pread: the read failed (errno %d, %lu bytes asked at %lld)\n",
+                                      errno,(unsigned long)size,(long long)offset);
+            if (length>0) platform_write_stdout(line,(size_t)length);
+        }
+        return -1;
+    }
+    return (int64_t)n;
 }
 
 int64_t platform_pwrite(int handle, const void *buffer, size_t size, int64_t offset) {
-    OVERLAPPED overlapped;
-    memset(&overlapped,0,sizeof(overlapped));
-    overlapped.Offset=(DWORD)(offset & 0xffffffff);
-    overlapped.OffsetHigh=(DWORD)((uint64_t)offset>>32);
-    DWORD written=0;
-    if (!WriteFile((HANDLE)handle,buffer,(DWORD)size,&written,&overlapped)) return -1;
-    return (int64_t)written;
+    positional_enter();
+    if (_lseeki64(handle,(__int64)offset,SEEK_SET)<0) {
+        positional_leave();
+        return -1;
+    }
+    const ssize_t n=write(handle,buffer,size);
+    positional_leave();
+    if (n<0) return -1;
+    return (int64_t)n;
 }
 
 char *platform_strcasestr(const char *haystack, const char *needle) {
