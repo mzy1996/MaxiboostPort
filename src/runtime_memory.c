@@ -1404,9 +1404,17 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
  * From Awaken's BloodBorneButPc. */
 int runtime_memory_restore_access(void *context, uintptr_t address, int repeated) {
     /* The fault's kind comes from the host's context (Linux's error code, Windows's
-     * exception information): an instruction fetch is never a tracking fault. */
-    const int is_write=platform_context_is_write((const PlatformContext *)context);
-    if (platform_context_is_fetch((const PlatformContext *)context)) return 0; /* instruction fetch */
+     * exception information): an instruction fetch is never a tracking fault.
+     * The context is what the GPU library passes on: on Linux the ucontext, on
+     * Windows the exception's pointers. */
+#ifdef _WIN32
+    PlatformContext uc={(EXCEPTION_POINTERS *)context,NULL};
+    const PlatformContext *view=&uc;
+#else
+    const PlatformContext *view=(const PlatformContext *)context;
+#endif
+    const int is_write=platform_context_is_write(view);
+    if (platform_context_is_fetch(view)) return 0; /* instruction fetch */
     const uintptr_t page=address&~(uintptr_t)4095;
     int restored=0;
     read_lock();

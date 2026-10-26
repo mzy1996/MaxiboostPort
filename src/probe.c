@@ -184,7 +184,13 @@ void bb_fault_wait(const char *what) {
  * Windows); the address is the one the fault was about. */
 void bb_fault_wait(const char *what);
 static void report_fault(void *context, void *fault_address, int sig) {
+    /* The context is the exception's pointers on Windows and the ucontext on Linux:
+     * the shape of the view of it is not the same. */
+#ifdef _WIN32
+    PlatformContext uc = { (EXCEPTION_POINTERS *)context, ((EXCEPTION_POINTERS *)context)->ContextRecord };
+#else
     PlatformContext uc = { context };
+#endif
     const uintptr_t rip = (uintptr_t)platform_context_rip(&uc);
     char line[512];
     char module[256] = {0};
@@ -263,6 +269,59 @@ void bb_fault_wait(const char *what) {
 static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
     const DWORD code = exception->ExceptionRecord->ExceptionCode;
 
+    /* The first line is written with almost no stack: a stack overflow leaves the
+     * thread nearly without one, and the report has to survive it (the rest of the
+     * report needs a kilobyte of stack and would take the process down with it). */
+    {
+        static char first[200];
+        static const char digits[]="0123456789abcdef";
+        char *at=first;
+        const char *label="Fault: code 0x";
+        while (*label) *at++=*label++;
+        for (int shift=28;shift>=0;shift-=4) *at++=digits[(code>>shift)&0xf];
+        const uintptr_t rip=(uintptr_t)exception->ContextRecord->Rip;
+        const uintptr_t where=(uintptr_t)exception->ExceptionRecord->ExceptionInformation[1];
+        const char *what=" rip 0x";
+        while (*what) *at++=*what++;
+        for (int shift=60;shift>=0;shift-=4) *at++=digits[(rip>>shift)&0xf];
+        const char *address=" at 0x";
+        while (*address) *at++=*address++;
+        for (int shift=60;shift>=0;shift-=4) *at++=digits[(where>>shift)&0xf];
+        if (rip-(uintptr_t)image<0x10000000) {
+            const char *in=" (guest+0x";
+            while (*in) *at++=*in++;
+            for (int shift=60;shift>=0;shift-=4) *at++=digits[((rip-(uintptr_t)image)>>shift)&0xf];
+            *at++=')';
+        }
+        {   /* The module the place is in: the base and the offset in it. The module
+             * handle is asked for (it is a few words of stack, the report has to
+             * survive a thread that has hardly any stack left). */
+            HMODULE module=NULL;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)rip,&module)) {
+                const char *mod=" mod 0x";
+                while (*mod) *at++=*mod++;
+                for (int shift=60;shift>=0;shift-=4) *at++=digits[(((uintptr_t)module)>>shift)&0xf];
+                const char *off="+0x";
+                while (*off) *at++=*off++;
+                for (int shift=60;shift>=0;shift-=4) *at++=digits[((rip-(uintptr_t)module)>>shift)&0xf];
+                /* The name of the module, so the place can be looked up in it. */
+                static char path[MAX_PATH];
+                const DWORD length=GetModuleFileNameA(module,path,sizeof(path));
+                if (length && length<sizeof(path)) {
+                    const char *name=" ";
+                    while (*name) *at++=*name++;
+                    for (DWORD i=0;i<length;++i) *at++=path[i];
+                }
+            }
+        }
+        *at++='\n';
+        HANDLE handle=GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD written=0;
+        if (handle && handle!=INVALID_HANDLE_VALUE)
+            WriteFile(handle,first,(DWORD)(at-first),&written,NULL);
+    }
     if (code!=EXCEPTION_ACCESS_VIOLATION && code!=EXCEPTION_IN_PAGE_ERROR &&
         code!=EXCEPTION_ILLEGAL_INSTRUCTION && code!=EXCEPTION_INT_DIVIDE_BY_ZERO &&
         code!=EXCEPTION_PRIV_INSTRUCTION && code!=EXCEPTION_STACK_OVERFLOW) {
@@ -572,6 +631,8 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
     for (unsigned round=0;;++round) {
         Sleep(interval*200);
         fprintf(out,"--- round %u ---\n",round);
+        fflush(out); /* the round is said before the threads are looked at: a hang in
+                      * the looking must not take the rounds that came before it */
         /* The threads of the program itself: the many others belong to the system. */
         HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
         unsigned count=0, mine=0;
@@ -583,7 +644,13 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
             uint64_t ids[256];
             char names[256][32];
             const size_t guests=runtime_thread_guest_threads(ids,names[0],32,256);
+            fprintf(out,"  %zu guest threads\n",guests);
+            fflush(out);
             for (size_t g=0;g<guests;++g) {
+                /* What the thread waits for is asked before the thread is held: the
+                 * answer comes from a lock the thread itself takes, and a thread that
+                 * is held while it holds that lock never gives it back. */
+                const char *waits=runtime_wait_marked_of(ids[g]);
                 HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT,FALSE,(DWORD)ids[g]);
                 if (!thread) continue;
                 SuspendThread(thread);
@@ -594,10 +661,7 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
                     const uintptr_t rip=(uintptr_t)context.Rip;
                     ++mine;
                     fprintf(out,"  guest '%s' tid=%llu rip=%p",names[g],(unsigned long long)ids[g],(void *)rip);
-                    {   /* What the thread waits for (the runtime knows). */
-                        const char *what=runtime_wait_marked_of(ids[g]);
-                        if (what) fprintf(out," waits for %s",what);
-                    }
+                    if (waits) fprintf(out," waits for %s",waits);
                     if (watchdog_image)
                         fprintf(out," image+%#llx",
                                 (unsigned long long)(rip-(uintptr_t)watchdog_image));
