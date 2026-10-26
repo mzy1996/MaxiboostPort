@@ -95,6 +95,9 @@ void *platform_alloc_executable(size_t size);
 
 /* Reading the host's own memory (a stack trace, a profiler): the guest's own address space. */
 int platform_read_memory(void *address, void *buffer, size_t size);
+/* The same, but the address is checked first (a wrong one gives an error instead of
+ * taking the program down). */
+int platform_read_memory_checked(void *address, void *buffer, size_t size);
 
 /* The thread's own id, as the guest's sceKernelGetTid would report it. */
 uint64_t platform_thread_id(void);

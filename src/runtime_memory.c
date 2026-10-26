@@ -37,17 +37,23 @@ static int memory_trace(void) {
     if (trace<0) {
         const char *t=getenv("BB_MEMORY_TRACE");
         trace=t&&t[0]=='1';
-        fprintf(stderr,"Runtime: the memory trace is %s (the variable says %s)\n",
-                trace?"on":"off",t?t:"(nothing)");
     }
     return trace;
+}
+/* The bookkeeping of the memory goes to a file of its own: the runtime's output and
+ * the game's are mixed up on the terminal, and the bookkeeping has to be read as it
+ * is. */
+static FILE *memory_log(void) {
+    static FILE *log;
+    if (!log) log=fopen("memory.txt","w");
+    return log;
 }
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
         const char *env = getenv("BB_DMEM_MB");
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
-        if (mb < DMEM_MIN_MB || mb > DMEM_MAX_MB) mb = 5120;
+        if (mb < DMEM_MIN_MB || mb > DMEM_MAX_MB) mb = 6144;
         size = mb * 1024 * 1024;
     }
     return size;
@@ -539,8 +545,8 @@ static uint64_t dmem_system_share(void) {
     static uint64_t share;
     if (!share) {
         const char *env=getenv("BB_DMEM_RESERVE_MB");
-        uint64_t mb = env ? strtoull(env,NULL,10) : 64;
-        if (mb>8192) mb=64;
+        uint64_t mb = env ? strtoull(env,NULL,10) : 1088;
+        if (mb>8192) mb=1088;
         share = mb*1024*1024;
     }
     return share;
@@ -569,17 +575,41 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     if (block_count>=LIMIT) { write_unlock(); return NO_SPACE; }
     uint64_t start = align_up((uint64_t)low, alignment);
     /* The lowest free gap of the needed size at or after the given address: the blocks
-     * are in order, so one pass over them says where the gap is (the game asks for a
-     * great many of these, and the pass is what makes that bearable). */
-    for (int i=block_first_ending_after(start); i<block_count; ++i) {
-        const Block b=blocks[i];
-        if (b.start>=start+size) break;              /* the gap before this block is large enough */
-        if (b.start+b.size>start) start=align_up(b.start+b.size, alignment);
-        if (start+size>end) break;
+     * are in order, so one pass over them says where the gaps are (the game asks for
+     * a great many of these, and the pass is what makes that bearable). The gap a
+     * block goes into is the one before the block that follows it, and the block has
+     * to fit there after the alignment: a gap that is big enough but not at an
+     * aligned place is passed over, not wasted. */
+    {
+        int i=block_first_ending_after((uint64_t)low);
+        uint64_t gap_end = i<block_count ? blocks[i].start : end;
+        for (;;) {
+            const uint64_t aligned = align_up(start,alignment);
+            if (aligned+size<=gap_end) { start=aligned; break; }
+            if (i>=block_count) break;
+            start=align_up(blocks[i].start+blocks[i].size,alignment);
+            ++i;
+            gap_end = i<block_count ? blocks[i].start : end;
+            if (start+size>end) break;
+        }
     }
-    if (start > end || size > end-start) {
-        /* The pool is full: the game is told, and it decides what to do (it asks
-         * again, and the pool is freed by then). */
+    int taken=0;
+    {   /* The place must be free: a block that is already there belongs to another
+         * one, and the game would write over it. */
+        for (int i=0;i<block_count;++i) {
+            const Block b=blocks[i];
+            if (start < b.start+b.size && b.start < start+size) {
+                fprintf(stderr,"Runtime:   the place %#llx+%llu is taken by the block %#llx+%llu\n",
+                        (unsigned long long)start,(unsigned long long)size,
+                        (unsigned long long)b.start,(unsigned long long)b.size);
+                taken=1;
+                break;
+            }
+        }
+    }
+    if (start > end || size > end-start || taken) {
+        /* The pool is full: the real machine says "try again later" (the memory comes
+         * back when the game gives it up), not that there is no memory. */
         static int reported;
         if (reported++ < 4)
             fprintf(stderr,"Runtime:   no room for %llu bytes (start %#llx; asked low=%lld high=%lld align=%llu)\n",
@@ -599,12 +629,13 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     ++allocations; live_bytes += size;
     write_unlock();
     if (memory_trace()) {
-        fprintf(stderr,"Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
-        {   /* The game calls this function itself, so the return address says where
-             * in the game the call comes from. */
-            const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
-            fprintf(stderr,"Runtime:   the call came from %p\n",(void *)caller);
-            runtime_guest_where(stderr,caller);
+        /* The game calls this function itself, so the return address says where in the
+         * game the call comes from. */
+        const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
+        FILE *log=memory_log();
+        if (log) {
+            fprintf(log,"A %#" PRIx64 " %" PRIu64 " %d %p\n",start,size,type,(void *)caller);
+            fflush(log);
         }
     }
     return 0;
@@ -617,10 +648,7 @@ static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignmen
                 (long long)low,(long long)high,(unsigned long long)alignment);
     if (!alignment) alignment=PAGE;
     if (!phys_out || !size_out || low<0 || high<=low || !valid_alignment(alignment)) return INVALID;
-    /* The range the game asks for is where the block is looked for first, not a wall:
-     * the pool is the truth, and the game takes the whole of it in blocks (its own heap
-     * is in it too, so it needs a little more than the window it was told about). */
-    const uint64_t end=POOL_SIZE;
+    const uint64_t end=(uint64_t)high<POOL_SIZE ? (uint64_t)high : POOL_SIZE;
     uint64_t best_start=0, best=0;
     read_lock();
     {   /* The largest free stretch: the blocks are in order, so one pass over them
@@ -732,8 +760,13 @@ static size_t released;
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     if (start % PAGE || size % PAGE) return INVALID;
     if (!size) return 0;
-    if (memory_trace())
-        fprintf(stderr,"Runtime:   released offset=%#llx size=%llu\n",(unsigned long long)start,(unsigned long long)size);
+    if (memory_trace()) {
+        FILE *log=memory_log();
+        if (log) {
+            fprintf(log,"R %#" PRIx64 " %" PRIu64 "\n",(unsigned long long)start,(unsigned long long)size);
+            fflush(log);
+        }
+    }
     write_lock();
     if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
     /* Mappings of released physical pages disappear with them. */
@@ -781,7 +814,6 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
             }
         }
     }
-    zero_phys(start,size); /* zero on reuse */
     write_unlock();
     flush_hooks();
     return 0;

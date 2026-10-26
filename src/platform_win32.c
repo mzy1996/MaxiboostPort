@@ -193,6 +193,18 @@ void *platform_alloc_executable(size_t size) {
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 }
 
+int platform_read_memory_checked(void *address, void *buffer, size_t size) {
+    /* The address has to be readable: the pages are asked about first (a wrong
+     * address would take the program down otherwise). */
+    MEMORY_BASIC_INFORMATION info;
+    if (!address || !size) return -1;
+    if (VirtualQuery(address,&info,sizeof(info))!=sizeof(info)) return -1;
+    if (info.State!=MEM_COMMIT) return -1;
+    if ((uintptr_t)address+size > (uintptr_t)info.BaseAddress+info.RegionSize) return -1;
+    if (info.Protect&PAGE_NOACCESS) return -1;
+    memcpy(buffer,address,size);
+    return 0;
+}
 int platform_read_memory(void *address, void *buffer, size_t size) {
     /* The host reads its own memory: no permissions are needed, but the pages must be
      * readable, which is what the runtime guarantees. */
