@@ -78,6 +78,8 @@ void runtime_wait_mark(const char *what);
 const char *runtime_wait_marked(void);
 const char *runtime_wait_marked_of(uint64_t tid);
 void runtime_wait_report(double frames);
+/* What the guest asked the direct memory for, by size (the game's pools, the library's heap). */
+void runtime_memory_buckets_report(void);
 void runtime_guest_call_sites(uint64_t out[3]);
 /* bbport: times the game's heap asked for more memory (posix_mmap): a sign it leaks. */
 uint64_t runtime_heap_growths(void);

@@ -543,11 +543,27 @@ static int direct_range_allocated(uint64_t phys, uint64_t size) {
 static ABI uint64_t direct_size(void) {
     return POOL_SIZE;
 }
+/* What the guest asks for, by size (a power of two bucket). The game takes its own pools
+ * in one megabyte blocks and the library's heap in four megabyte ones; when the two
+ * compete for the same pool, this says which one gets the memory and which does not. */
+static _Atomic uint64_t direct_asked[24], direct_failed[24], direct_live_by_bucket[24];
+static int size_bucket(uint64_t size) {
+    int bucket=0;
+    while (size>1 && bucket<23) { size>>=1; ++bucket; }
+    return bucket;
+}
+static void direct_note(uint64_t size, uint64_t alignment, int failed) {
+    const int bucket=size_bucket(size);
+    atomic_fetch_add(&direct_asked[bucket],1);
+    if (failed) atomic_fetch_add(&direct_failed[bucket],1);
+}
 static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
                                   uint64_t alignment, int type, int64_t *out) {
     if (!alignment) alignment = PAGE;
-    if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
+    if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10) {
+        direct_note(size,alignment,1);
         return INVALID;
+    }
     /* The range the game asks for is where the block is looked for: the search never
      * leaves it (shadPS4's MemoryManager::Allocate: the block must end before the
      * search's end). The game asks for the whole direct memory and takes it in blocks;
@@ -556,11 +572,12 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     if ((uint64_t)low >= end || size > end - (uint64_t)low) {
         fprintf(stderr,"Runtime:   the allocation of %llu bytes did not fit (low=%lld high=%lld)\n",
                 (unsigned long long)size,(long long)low,(long long)high);
+        direct_note(size,alignment,1);
         return NO_SPACE;
     }
     write_lock();
-    if (pool()) { write_unlock(); return NO_MEMORY; }
-    if (block_count>=LIMIT) { write_unlock(); return NO_SPACE; }
+    if (pool()) { write_unlock(); direct_note(size,alignment,1); return NO_MEMORY; }
+    if (block_count>=LIMIT) { write_unlock(); direct_note(size,alignment,1); return NO_SPACE; }
     uint64_t start = align_up((uint64_t)low, alignment);
     /* The lowest free gap of the needed size at or after the given address: the blocks
      * are in order, so one pass over them says where the gaps are (the game asks for
@@ -603,7 +620,7 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
             fprintf(stderr,"Runtime:   no room for %llu bytes (start %#llx; asked low=%lld high=%lld align=%llu)\n",
                     (unsigned long long)size,(unsigned long long)start,
                     (long long)low,(long long)high,(unsigned long long)alignment);
-        write_unlock(); return NO_SPACE;
+        write_unlock(); direct_note(size,alignment,1); return NO_SPACE;
     }
     {   /* The block goes into the list, which keeps its order. */
         int at=block_first_ending_after(start);
@@ -615,6 +632,8 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     *out = (int64_t)start;
     ensure_chunks(start,size);
     ++allocations; live_bytes += size;
+    direct_note(size,alignment,0);
+    atomic_fetch_add(&direct_live_by_bucket[size_bucket(size)],size);
     write_unlock();
     if (memory_trace()) {
         /* The game calls this function itself, so the return address says where in the
@@ -777,6 +796,11 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
                 released_now+=e-a;
             }
             live_bytes-=released_now;
+            for (int i=first;i<last;++i) {
+                const uint64_t a=blocks[i].start>start ? blocks[i].start : start;
+                const uint64_t e=blocks[i].start+blocks[i].size<start+size ? blocks[i].start+blocks[i].size : start+size;
+                atomic_fetch_sub(&direct_live_by_bucket[size_bucket(blocks[i].size)],e-a);
+            }
             /* The parts that stay. */
             Block pieces[2]; int piece_count=0;
             if (blocks[first].start<start)
@@ -1450,9 +1474,22 @@ int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
     read_unlock();
     return result;
 }
+void runtime_memory_buckets_report(void) {
+    /* What the guest asked for, by size: the game's pools and the library's heap. */
+    for (int bucket=10;bucket<24;++bucket) {
+        const uint64_t asked=atomic_load(&direct_asked[bucket]);
+        if (!asked) continue;
+        const uint64_t failed=atomic_load(&direct_failed[bucket]);
+        const uint64_t live=atomic_load(&direct_live_by_bucket[bucket]);
+        printf("Runtime: direct %llu MiB blocks: asked=%llu, failed=%llu, live=%llu MiB\n",
+               1ull<<(bucket-20), (unsigned long long)asked, (unsigned long long)failed,
+               (unsigned long long)(live/1048576));
+    }
+}
 void runtime_memory_report(void) {
     printf("Runtime: direct memory allocations=%zu, maps=%zu, live=%" PRIu64 ", budget=%" PRIu64 "\n",
            allocations, maps, live_bytes, POOL_SIZE);
     printf("Runtime: flexible maps=%zu, in use=%" PRIu64 ", protects=%zu, queries=%zu, regions=%zu\n",
            flexible_maps, flexible_bytes, protects, queries, vma_count);
+    runtime_memory_buckets_report();
 }

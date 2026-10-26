@@ -507,6 +507,7 @@ void runtime_wait_note(int kind, uint64_t ns) {
 void runtime_wait_report(double frames) {
     sample_start();
     sample_report();
+    runtime_memory_buckets_report();
     static const char *kinds[]={"cond","mutex","sema","sleep"};
     struct { WaitSite *w; uint64_t ns, count; } rows[512]; int n=0;
     for (int i=0;i<512;++i) {
