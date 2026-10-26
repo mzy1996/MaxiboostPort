@@ -1151,6 +1151,15 @@ int main(int argc, char **argv) {
             }
         }
         memcpy(image + relocs[i].target, &value, 8);
+        if (relocs[i].kind==1 && value>=(uintptr_t)traps &&
+            value<(uintptr_t)traps+(import_count+1)*32) {
+            /* The import has no address: the game will find the trap when its own
+             * linker looks the symbol up (by its address), and it stops there. */
+            static int reported;
+            if (reported++ < 40)
+                printf("IMPORT left to the trap: %s (%s)\n",names[relocs[i].value],
+                       runtime_import_name(names[relocs[i].value]));
+        }
         if (getenv("BB_DUMP_IMPORTS")) {
             const char *name=names[relocs[i].value];
             const char *symbol=runtime_symbol(name);
