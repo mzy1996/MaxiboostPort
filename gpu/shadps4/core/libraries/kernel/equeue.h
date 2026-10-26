@@ -196,5 +196,7 @@ void RegisterEventQueue(Core::Loader::SymbolsResolver* sym);
 
 /// bbport (frame stats): prints the time the game waited in each event queue since the last call.
 void ReportEqueueWaits(double frames);
+/* bbport BB_QUEUE_TRACE=1: say the queues out loud (what the game waits for, what it gets). */
+bool QueueTrace();
 
 } // namespace Libraries::Kernel

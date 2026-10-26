@@ -209,10 +209,18 @@ int platform_read_memory_checked(void *address, void *buffer, size_t size) {
     return 0;
 }
 int platform_read_memory(void *address, void *buffer, size_t size) {
-    /* The host reads its own memory: no permissions are needed, but the pages must be
-     * readable, which is what the runtime guarantees. */
+    /* The host reads its own memory, but the address comes from the game's stack: it
+     * can be anything (a frame pointer that was never set, a wild pointer). The pages
+     * are asked about first: a wrong address would take the program down while it is
+     * reporting a fault of its own. */
     if (!size) return 0;
-    memcpy(buffer, address, size);
+    MEMORY_BASIC_INFORMATION info;
+    if (!address) return -1;
+    if (VirtualQuery(address,&info,sizeof(info))!=sizeof(info)) return -1;
+    if (info.State!=MEM_COMMIT) return -1;
+    if ((uintptr_t)address+size > (uintptr_t)info.BaseAddress+info.RegionSize) return -1;
+    if (info.Protect&PAGE_NOACCESS) return -1;
+    memcpy(buffer,address,size);
     return 0;
 }
 

@@ -146,6 +146,9 @@ static inline int runtime_nid_is(const char *name, const char *scoped) {
 }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
 uintptr_t runtime_kernel_resolve(const char *name);
+/* The system's C library: the time functions and the character set conversions that
+ * the library of the game asks it for. */
+uintptr_t runtime_ces_resolve(const char *name);
 uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
 uintptr_t runtime_json_resolve(const char *name);

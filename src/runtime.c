@@ -290,6 +290,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (memory) return memory;
     uintptr_t kernel = runtime_kernel_resolve(name);
     if (kernel) return kernel;
+    uintptr_t ces = runtime_ces_resolve(name);
+    if (ces) return ces;
     uintptr_t json = runtime_json_resolve(name);
     if (json) return json;
     uintptr_t services = runtime_services_resolve(name);

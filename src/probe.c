@@ -737,6 +737,35 @@ static unsigned thread_count(void) {
 static volatile int watchdog_fired;
 static void *watchdog_image;
 static unsigned watchdog_seconds;
+/* Where the game's threads are (the watchdog's answer): the place each thread was in when
+ * it was looked at, counted. A thread that spins in the game shows up with one place over
+ * and over; a thread that waits shows up all over the place. */
+typedef struct { uintptr_t rip; unsigned count; char name[32]; } ThreadPlace;
+static ThreadPlace thread_places[256];
+static unsigned thread_place_count;
+static void note_thread_place(const char *name, uintptr_t rip) {
+    for (unsigned i=0;i<thread_place_count;++i)
+        if (thread_places[i].rip==rip) { ++thread_places[i].count; return; }
+    if (thread_place_count>=sizeof(thread_places)/sizeof(*thread_places)) return;
+    ThreadPlace *p=&thread_places[thread_place_count++];
+    p->rip=rip; p->count=1;
+    snprintf(p->name,sizeof(p->name),"%s",name?name:"?");
+}
+static void report_thread_places(FILE *out) {
+    if (!thread_place_count) return;
+    for (unsigned i=0;i<thread_place_count;++i)
+        for (unsigned j=i;j>0 && thread_places[j].count>thread_places[j-1].count;--j) {
+            ThreadPlace t=thread_places[j]; thread_places[j]=thread_places[j-1]; thread_places[j-1]=t;
+        }
+    fprintf(out,"  where the threads were (the most looked-at places):\n");
+    for (unsigned i=0;i<thread_place_count && i<16;++i) {
+        const uintptr_t rip=thread_places[i].rip;
+        fprintf(out,"    %-28s %5u times",thread_places[i].name,thread_places[i].count);
+        if (watchdog_image && rip>=(uintptr_t)watchdog_image && rip<(uintptr_t)watchdog_image+0x80000000)
+            fprintf(out," image+%#llx",(unsigned long long)(rip-(uintptr_t)watchdog_image));
+        fprintf(out,"\n");
+    }
+}
 static DWORD WINAPI watchdog_thread(LPVOID parameter) {
     (void)parameter;
     const unsigned interval=watchdog_seconds?watchdog_seconds:10;
@@ -774,6 +803,7 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
                 if (GetThreadContext(thread,&context)) {
                     const uintptr_t rip=(uintptr_t)context.Rip;
                     ++mine;
+                    note_thread_place(names[g],rip);
                     fprintf(out,"  guest '%s' tid=%llu rip=%p",names[g],(unsigned long long)ids[g],(void *)rip);
                     if (waits) fprintf(out," waits for %s",waits);
                     if (watchdog_image)
@@ -804,6 +834,7 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
             CloseHandle(snapshot);
         }
         fprintf(out,"  %u threads in all, %u of them the program's\n",count,mine);
+        if (round%10==9) report_thread_places(out);
         fflush(out);
     }
     return 0;
@@ -1006,6 +1037,30 @@ int main(int argc, char **argv) {
     if (fread(names, 128, import_count, f) != import_count) fail("truncated import names");
     for (uint64_t i = 0; i < import_count; ++i)
         if (!memchr(names[i], 0, 128)) fail("unterminated import name");
+    /* What the linked library of the game exports: the same symbol can be imported by
+     * more than one module (the library itself and the module of the system's C library
+     * both want malloc, for instance), and the module that imports it is not the one
+     * that has it. The export is found by its name, so an import the runtime does not
+     * provide is still answered - the game's own linker looks the symbol up by name too,
+     * and it found nothing (the module's import was then resolved to nothing, and the
+     * game died dereferencing it). */
+    struct { const char *name; uint64_t address; int kind; } exported[512];
+    unsigned exported_count=0;
+    if (native_libc) {
+        for (uint64_t i = 0; i < import_count && exported_count < sizeof(exported)/sizeof(*exported); ++i) {
+            if (!bindings[i]) continue;
+            const char *symbol=runtime_symbol(names[i]);
+            if (!symbol) continue;
+            int known=0;
+            for (unsigned k = 0; k < exported_count; ++k)
+                if (!strcmp(exported[k].name,symbol)) { known=1; break; }
+            if (known) continue;
+            exported[exported_count].name=symbol;
+            exported[exported_count].address=bindings[i];
+            exported[exported_count].kind=(int)binding_kinds[i];
+            ++exported_count;
+        }
+    }
     for (uint64_t i = 0; i < nr; ++i) {
         relocs[i].target = read64(f);
         relocs[i].kind = read64(f);
@@ -1083,6 +1138,16 @@ int main(int argc, char **argv) {
                 uint64_t address=bindings[relocs[i].value];
                 if (binding_kinds[relocs[i].value]!=relocs[i].kind || !mapped(segments,ns,address,relocs[i].addend+1)) fail("native export kind/range mismatch");
                 value=(uintptr_t)image+address+relocs[i].addend;
+            } else if (native_libc) {
+                /* The same symbol, imported by another module: the library of the game
+                 * exports it, so it is taken from there. */
+                const char *symbol=runtime_symbol(names[relocs[i].value]);
+                for (unsigned k = 0; symbol && k < exported_count; ++k) {
+                    if (strcmp(exported[k].name,symbol) || exported[k].kind!=(int)relocs[i].kind) continue;
+                    if (!mapped(segments,ns,exported[k].address,relocs[i].addend+1)) break;
+                    value=(uintptr_t)image+exported[k].address+relocs[i].addend;
+                    break;
+                }
             }
         }
         memcpy(image + relocs[i].target, &value, 8);
@@ -1103,6 +1168,12 @@ int main(int argc, char **argv) {
         unsigned missing=0;
         for (uint64_t i=0;i<import_count;++i) {
             if (runtime_resolve(names[i],0) || runtime_resolve(names[i],1) || (native_libc && bindings[i])) continue;
+            /* The same symbol, exported by the library of the game: answered from there. */
+            const char *symbol=runtime_symbol(names[i]);
+            int found=0;
+            for (unsigned k=0;symbol && k<exported_count;++k)
+                if (!strcmp(exported[k].name,symbol)) { found=1; break; }
+            if (found) continue;
             printf("UNRESOLVED %s %s\n",names[i],runtime_import_name(names[i]));
             ++missing;
         }
