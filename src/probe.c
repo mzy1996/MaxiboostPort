@@ -323,6 +323,25 @@ static void report_fault(void *context, void *fault_address, int sig) {
     }
     snprintf(line, sizeof(line), "fault (signal %d)", sig);
     bb_fault_wait(line);
+    /* The game's own linker: it looks the symbol up by its address, and the address is
+     * in the table of the module it is linking. The table's entries say which address
+     * it wanted, so the one that is not in the image is said out loud. */
+    if (rip - (uintptr_t)image < 0x10000000) {
+        const uintptr_t module=(uintptr_t)platform_context_register(&uc, 14);
+        unsigned char entries[8*32];
+        if (module && platform_read_memory((void *)(module+0x30),entries,sizeof(entries))==0) {
+            for (unsigned i=0;i<8;++i) {
+                uint32_t at;
+                memcpy(&at,entries+i*32+0x2c,4);
+                if (!at) continue;
+                const int inside=runtime_guest_address((uintptr_t)at,NULL,NULL);
+                snprintf(line,sizeof(line),"  the linker wanted the symbol at %#x (%s)%s\n",
+                         at, inside ? "in the image" : "not in the image",
+                         inside ? "" : " - the kernel's answer, which the image does not know");
+                platform_write_stdout(line,strlen(line));
+            }
+        }
+    }
     _exit(128 + sig);
 }
 #ifdef _WIN32
