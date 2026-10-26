@@ -159,6 +159,16 @@ uint64_t platform_thread_id(void) {
     return (uint64_t)syscall(SYS_gettid);
 }
 
+uint64_t platform_thread_stack_limit(void) {
+    /* The C library of this host does not probe the stack (the kernel's guard page
+     * takes its place), so there is nothing to move out of the way. */
+    return 0;
+}
+
+void platform_set_thread_stack_limit(uint64_t limit) {
+    (void)limit;
+}
+
 uint64_t platform_monotonic_ns(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);

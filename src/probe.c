@@ -16,7 +16,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <pthread.h>
+#include "runtime_tls.h"
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -150,13 +152,77 @@ static void *guest_main_start(void *argument) {
     return NULL;
 }
 #endif
-/* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
-void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
+/* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack.
+ * The hand-written code takes its arguments in %rdi, %rsi, %rdx and %rcx (the System V way,
+ * which the guest's code follows), so the declaration says so: the host's compiler has to put
+ * them there (its own convention puts them in %rcx, %rdx, %r8 and %r9). */
+void enter_on_stack(void *entry, void *arg0, void *arg1, void *top) ABI;
 __asm__(BB_ASM_TEXT BB_ASM_GLOBAL("enter_on_stack") "enter_on_stack:\n"
         " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
         " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
+/* The jump that does not unwind (runtime.h): it puts the registers and the stack pointer back
+ * and continues there. The C library's long jump walks the frames between the two points, and
+ * the guest's frames have no unwind information for it.
+ * The hand-written code takes its arguments in %rdi (the System V way), so the declarations in
+ * runtime.h say so: the host's compiler has to put them there (its own convention puts them in
+ * %rcx). */
+__asm__(BB_ASM_TEXT BB_ASM_GLOBAL("runtime_setjmp") "runtime_setjmp:\n"
+        " movq %rax,0(%rdi)\n"
+        " movq %rbx,8(%rdi)\n"
+        " movq %rcx,16(%rdi)\n"
+        " movq %rdx,24(%rdi)\n"
+        " movq %rsi,32(%rdi)\n"
+        " movq %rdi,40(%rdi)\n"
+        " movq %rbp,48(%rdi)\n"
+        " leaq 8(%rsp),%rax\n"         /* the stack of the caller, once this returns */
+        " movq %rax,56(%rdi)\n"
+        " movq %r8,64(%rdi)\n"
+        " movq %r9,72(%rdi)\n"
+        " movq %r10,80(%rdi)\n"
+        " movq %r11,88(%rdi)\n"
+        " movq %r12,96(%rdi)\n"
+        " movq %r13,104(%rdi)\n"
+        " movq %r14,112(%rdi)\n"
+        " movq %r15,120(%rdi)\n"
+        " movq (%rsp),%rax\n"          /* where to continue: the return address */
+        " movq %rax,128(%rdi)\n"
+        " pushfq\n"
+        " popq %rax\n"
+        " movq %rax,136(%rdi)\n"
+        " stmxcsr 144(%rdi)\n"
+        " fnstcw 150(%rdi)\n"
+        " xorl %eax,%eax\n"
+        " ret\n");
+__asm__(BB_ASM_TEXT BB_ASM_GLOBAL("runtime_longjmp") "runtime_longjmp:\n"
+        " movq %rdi,%r11\n"            /* the buffer: kept until the last register is back */
+        " movq 56(%r11),%rsp\n"        /* the stack to continue on */
+        " movl %esi,%eax\n"            /* the value the jump returns */
+        " movq %rax,-16(%rsp)\n"       /* kept there: %rax is put back below */
+        " ldmxcsr 144(%r11)\n"
+        " fldcw 150(%r11)\n"
+        " pushq 136(%r11)\n"
+        " popfq\n"
+        " movq 128(%r11),%rax\n"       /* where to continue */
+        " movq %rax,-8(%rsp)\n"        /* the return takes it from there */
+        " movq 0(%r11),%rax\n"
+        " movq 8(%r11),%rbx\n"
+        " movq 16(%r11),%rcx\n"
+        " movq 24(%r11),%rdx\n"
+        " movq 32(%r11),%rsi\n"
+        " movq 40(%r11),%rdi\n"
+        " movq 48(%r11),%rbp\n"
+        " movq 64(%r11),%r8\n"
+        " movq 72(%r11),%r9\n"
+        " movq 80(%r11),%r10\n"
+        " movq 96(%r11),%r12\n"
+        " movq 104(%r11),%r13\n"
+        " movq 112(%r11),%r14\n"
+        " movq 120(%r11),%r15\n"
+        " movq 88(%r11),%r11\n"        /* the buffer's own register is the last one back */
+        " movq -16(%rsp),%rax\n"       /* the value the jump returns */
+        " ret\n");
 #ifndef _WIN32
 /* BB_FAULT_WAIT=1: a fatal fault or a GPU-library assertion leaves the process alive, stopped
  * in its handler, so a debugger can attach to the faulting thread with its registers and stack
@@ -315,6 +381,16 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
                     for (DWORD i=0;i<length;++i) *at++=path[i];
                 }
             }
+            /* The program's own module: the offset in it is what the source can be
+             * looked up by (the module the place is in may be a library). */
+            { const uintptr_t own=(uintptr_t)GetModuleHandle(NULL);
+              const char *self=" self 0x";
+              while (*self) *at++=*self++;
+              for (int shift=60;shift>=0;shift-=4) *at++=digits[(own>>shift)&0xf];
+              const char *at2="+0x";
+              while (*at2) *at++=*at2++;
+              for (int shift=60;shift>=0;shift-=4) *at++=digits[((rip-own)>>shift)&0xf];
+            }
         }
         *at++='\n';
         HANDLE handle=GetStdHandle(STD_OUTPUT_HANDLE);
@@ -322,6 +398,17 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
         if (handle && handle!=INVALID_HANDLE_VALUE)
             WriteFile(handle,first,(DWORD)(at-first),&written,NULL);
     }
+    /* The report of the fault (the thread, its registers and its stack) is written for
+     * every kind of exception but the debug ones: a program that writes to the debug
+     * output raises one of those on every line (the graphics driver's overlay does it
+     * constantly), and they say nothing about a fault. */
+    { const DWORD quiet[]={0x40010006u,0x4001000au,0x406D1388u};
+      int say=1;
+      for (size_t q=0;q<sizeof(quiet)/sizeof(*quiet);++q) if (code==quiet[q]) say=0;
+      if (say) {
+        PlatformContext uc = { exception, exception->ContextRecord };
+        report_fault(exception, (void *)platform_context_fault_address(&uc), (int)code);
+      } }
     if (code!=EXCEPTION_ACCESS_VIOLATION && code!=EXCEPTION_IN_PAGE_ERROR &&
         code!=EXCEPTION_ILLEGAL_INSTRUCTION && code!=EXCEPTION_INT_DIVIDE_BY_ZERO &&
         code!=EXCEPTION_PRIV_INSTRUCTION && code!=EXCEPTION_STACK_OVERFLOW) {
@@ -345,7 +432,6 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
         siglongjmp(*recover, 1);
 #endif
     }
-    report_fault(exception, (void *)platform_context_fault_address(&uc), (int)code);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
@@ -516,6 +602,34 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
         if (address >= segments[i].address && bytes <= segments[i].size &&
             address - segments[i].address <= segments[i].size - bytes) return 1;
     return 0;
+}
+/* The guest reads its thread pointer with `mov rax, gs:[0]` (the loader turns the game's
+ * `fs:[0]` into it, because the C library of the host owns FS). On Linux the runtime
+ * points the GS base at the guest's thread block, so the read gives the right thing.
+ * Windows keeps the GS base for itself: GS:[0] is the kernel's exception list, and the
+ * guest read that instead (nothing), then used it as a pointer.
+ *
+ * Windows' thread block has a word of its own for the program (ArbitraryUserPointer);
+ * the runtime keeps the guest's thread block pointer in it. The read is pointed there
+ * instead, which is the same length, so nothing else moves. */
+static void rewrite_tls_reads(unsigned char *image, uint64_t size) {
+#ifdef _WIN32
+    /* mov rax, gs:[disp32]: 65 48 8b 04 25 <disp32> */
+    static const unsigned char load[]={0x65,0x48,0x8b,0x04,0x25};
+    const uint32_t slot=runtime_tls_guest_index();
+    unsigned patched=0;
+    for (uint64_t at=0;at+9<=size;++at) {
+        if (memcmp(image+at,load,sizeof(load))) continue;
+        uint32_t offset;
+        memcpy(&offset,image+at+5,4);
+        if (offset) continue; /* not the thread pointer read */
+        memcpy(image+at+5,&slot,4);
+        ++patched;
+    }
+    if (patched) printf("Runtime: the guest's thread pointer reads point at the thread's own word (%u places)\n",patched);
+#else
+    (void)image; (void)size;
+#endif
 }
 /* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
  * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
@@ -784,6 +898,25 @@ int main(int argc, char **argv) {
     /* The fault handler: the vectored exception handler sees the access violations, the illegal
      * instructions and the breakpoints before the process is torn down. */
     AddVectoredExceptionHandler(1, fault_handler);
+    /* The modules of the process, so a fault's place can be looked up in one of them. */
+    if (getenv("BB_LIST_MODULES")) {
+        HMODULE modules[256];
+        DWORD count=GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,NULL,NULL);
+        (void)count;
+        HMODULE *list=(HMODULE *)malloc(sizeof(modules));
+        DWORD needed=0;
+        if (list && EnumProcessModules(GetCurrentProcess(),list,sizeof(modules),&needed)) {
+            printf("Modules (%lu):\n",(unsigned long)needed);
+            for (DWORD i=0;i<needed/sizeof(HMODULE);++i) {
+                char path[MAX_PATH]="?";
+                GetModuleFileNameA(list[i],path,sizeof(path));
+                const char *slash=strrchr(path,'\\');
+                printf("  %p %s\n",(void *)list[i],slash?slash+1:path);
+            }
+        }
+        free(list);
+    }
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
@@ -978,6 +1111,7 @@ int main(int argc, char **argv) {
       } }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     if (!cpu_only) bbgpu_patch_image(image, size);
+    rewrite_tls_reads(image, size);
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;
@@ -987,6 +1121,9 @@ int main(int argc, char **argv) {
             executable_entry = 1;
     }
     if (!executable_entry) fail("entry is not executable");
+#ifdef _WIN32
+    runtime_tls_init();
+#endif
     runtime_count_install(image);
     cpu_watch_install();
     THREAD_COUNT_NOTE("after the modules are loaded");

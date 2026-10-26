@@ -15,37 +15,41 @@
 /* The semaphore's own parts: the host's critical section and condition variable on
  * Windows, the C library's elsewhere. */
 #ifdef _WIN32
-typedef CRITICAL_SECTION bb_sema_lock_t;
+/* A critical section has to be made before it is used: a zeroed one is not a
+ * section (the host's own code reads a field of it that says what it is), and
+ * making it once per lock keeps the lock and the making of it together. */
+typedef struct {
+    CRITICAL_SECTION section;
+    INIT_ONCE once;
+} bb_sema_lock_t;
 typedef CONDITION_VARIABLE bb_cond_t;
-static INIT_ONCE bb_lock_once = INIT_ONCE_STATIC_INIT;
-static CRITICAL_SECTION bb_lock_section;
 static BOOL CALLBACK bb_lock_init(PINIT_ONCE once, PVOID parameter, PVOID *context) {
-    (void)once; (void)parameter; (void)context;
-    InitializeCriticalSection(&bb_lock_section);
+    (void)once; (void)context;
+    InitializeCriticalSection(&((bb_sema_lock_t *)parameter)->section);
     return TRUE;
 }
-/* The section is ready before the first use (the static initializer of the C library has
- * no counterpart here). */
-#define bb_lock_ready() InitOnceExecuteOnce(&bb_lock_once,bb_lock_init,NULL,NULL)
-#define bb_lock(l)   do { bb_lock_ready(); EnterCriticalSection(l); } while (0)
-#define bb_unlock(l) LeaveCriticalSection(l)
+#define bb_lock_ready(l) InitOnceExecuteOnce(&(l)->once,bb_lock_init,(l),NULL)
+#define bb_lock(l)   do { bb_lock_ready(l); EnterCriticalSection(&(l)->section); } while (0)
+#define bb_unlock(l) LeaveCriticalSection(&(l)->section)
+#define BB_LOCK_INITIAL { {0}, INIT_ONCE_STATIC_INIT }
 #define bb_cond_init(c) do { InitializeConditionVariable(c); } while (0)
 #define bb_cond_destroy(c) do { (void)(c); } while (0)
 #define bb_cond_signal(c) (WakeConditionVariable(c), 0)
 #define bb_cond_broadcast(c) (WakeAllConditionVariable(c), 0)
 static int bb_cond_wait(bb_cond_t *c, bb_sema_lock_t *l) {
-    return SleepConditionVariableCS(c,l,INFINITE) ? 0 : ETIMEDOUT;
+    return SleepConditionVariableCS(c,&l->section,INFINITE) ? 0 : ETIMEDOUT;
 }
 static int bb_cond_timedwait(bb_cond_t *c, bb_sema_lock_t *l, uint32_t milliseconds) {
-    return SleepConditionVariableCS(c,l,milliseconds) ? 0 : ETIMEDOUT;
+    return SleepConditionVariableCS(c,&l->section,milliseconds) ? 0 : ETIMEDOUT;
 }
 static uint64_t now_ns(void) { return platform_realtime_ns(); }
 #else
 typedef pthread_mutex_t bb_sema_lock_t;
 typedef pthread_cond_t bb_cond_t;
-#define bb_lock_ready() (void)0
+#define bb_lock_ready(l) (void)(l)
 #define bb_lock(l) pthread_mutex_lock(l)
 #define bb_unlock(l) pthread_mutex_unlock(l)
+#define BB_LOCK_INITIAL PTHREAD_MUTEX_INITIALIZER
 #define bb_cond_init(c) pthread_cond_init(c,NULL)
 #define bb_cond_destroy(c) pthread_cond_destroy(c)
 #define bb_cond_signal(c) bb_cond_signal(c)
@@ -80,7 +84,7 @@ typedef struct Sema {
     Waiter *first;
     struct Sema *next;
 } Sema;
-static bb_sema_lock_t lock;
+static bb_sema_lock_t lock = BB_LOCK_INITIAL;
 static Sema *registry;
 static uint32_t next_id=1;
 static size_t created, deleted, acquired, signaled, timed_out;

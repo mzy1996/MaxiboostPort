@@ -220,6 +220,18 @@ uint64_t platform_thread_id(void) {
     return (uint64_t)GetCurrentThreadId();
 }
 
+uint64_t platform_thread_stack_limit(void) {
+    /* The thread environment block's StackLimit (GS:[0x10]): where the thread's own
+     * stack ends. */
+    uint64_t limit;
+    __asm__ volatile("mov %%gs:0x10, %0" : "=r"(limit));
+    return limit;
+}
+
+void platform_set_thread_stack_limit(uint64_t limit) {
+    __asm__ volatile("mov %0, %%gs:0x10" : : "r"(limit) : "memory");
+}
+
 uint64_t platform_monotonic_ns(void) {
     static LARGE_INTEGER frequency;
     if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);

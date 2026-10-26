@@ -58,7 +58,7 @@ typedef struct GuestThread {
     ThreadAttr attr;
     char name[32];
     int detached, finished, joined, host_owned;
-    jmp_buf exit_jump;
+    runtime_thread_jump exit_jump;
     struct GuestThread *next;
 } GuestThread;
 
@@ -77,8 +77,8 @@ void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64
 static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1); }
 #ifdef _WIN32
 /* Windows keeps the GS base for itself: the program cannot set it. The guest's TCB pointer
- * lives in the thread's own TLS slot instead (src/runtime_tls_win32.c), and the loader's
- * rewrite reads that slot. */
+ * lives in the thread's own word instead (src/runtime_tls_win32.c), and the loader's
+ * rewrite reads that word. */
 static void set_gs(void *base) { runtime_tls_set_tcb(base); }
 #else
 static void set_gs(void *base) {
@@ -259,8 +259,11 @@ static void set_host_name(const char *name) {
 /* Calls fn(arg) with rsp at stack_top (16-byte aligned), then returns on the caller's stack: a
  * thread created with a stack of the game's own (scePthreadAttrSetstack) runs its guest code on
  * it, as on a PS4 (MAXIBOOST ON reads its callers' frames there, above the entry's own). The
- * thread's exit (longjmp to host_start) leaves it as any return does. */
-void *runtime_call_on_stack(void *(ABI *fn)(void *),void *arg,uintptr_t stack_top);
+ * thread's exit (longjmp to host_start) leaves it as any return does.
+ * The hand-written code takes its arguments in %rdi, %rsi and %rdx (the System V way, which the
+ * guest's code follows), so the declaration says so: the host's compiler has to put them there
+ * (its own convention puts them in %rcx, %rdx and %r8). */
+void *runtime_call_on_stack(void *(ABI *fn)(void *),void *arg,uintptr_t stack_top) ABI;
 __asm__(BB_ASM_TEXT BB_ASM_GLOBAL("runtime_call_on_stack") BB_ASM_TYPE("runtime_call_on_stack")
         "runtime_call_on_stack:\n"
         "  push %rbp\n  mov %rsp,%rbp\n"
@@ -278,9 +281,20 @@ static void *host_start(void *p) {
     t->host_id=platform_thread_id();
     attach(t);
     set_host_name(t->name);
-    if (!setjmp(t->exit_jump))
-        t->result=t->attr.stack_address ? runtime_call_on_stack(t->entry,t->argument,t->attr.stack_address+t->attr.stack)
-                                        : t->entry(t->argument);
+    if (!runtime_setjmp(&t->exit_jump)) {
+        /* A thread of the game may run on a stack of the game's own: the C library's
+         * stack probe (which the host's own functions use for their big frames) walks
+         * down from the thread's stack limit, which is somewhere else entirely then, and
+         * touches pages that are not the stack's. While the thread is on a stack of the
+         * game's, the limit is put out of the way (nothing is probed then). */
+        if (t->attr.stack_address) {
+            const uint64_t limit=platform_thread_stack_limit();
+            platform_set_thread_stack_limit(0);
+            t->result=runtime_call_on_stack(t->entry,t->argument,t->attr.stack_address+t->attr.stack);
+            platform_set_thread_stack_limit(limit);
+        } else
+            t->result=t->entry(t->argument);
+    }
     if (thread_dtors) thread_dtors();
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
@@ -344,7 +358,7 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     if (t->host_owned) { fputs("STOP: pthread_exit on host-owned/main thread\n",stderr); exit(21); }
     t->result=value;
     /* No host unwinder: guest frames have no registered FDEs. */
-    longjmp(t->exit_jump,1);
+    runtime_longjmp(&t->exit_jump,1);
 }
 static ABI int32_t thread_yield(void) { sched_yield(); return 0; }
 static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {

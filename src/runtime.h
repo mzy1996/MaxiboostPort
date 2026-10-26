@@ -15,12 +15,35 @@ void runtime_restart(void);
 #include <setjmp.h>
 /* The recovery point for speculative guest memory reads on this thread (probe.c fault handler).
  * Windows has no signals, so the plain jump/long jump pair is used (it does not restore a
- * signal mask, which Windows does not have). */
+ * signal mask, which Windows does not have). The GPU library shares this one (the type is the
+ * same there), and both sides jump on a host stack, where the C library's jump is fine. */
 typedef jmp_buf runtime_jmp_buf;
 extern __thread runtime_jmp_buf *runtime_fault_recover;
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
 #endif
+/* A thread's own jump, for leaving a guest thread. It does not unwind: the C library's long
+ * jump walks the frames between the two points, and the guest's frames have no unwind
+ * information for it (the walk goes off into nonsense and the process dies). This one only
+ * puts the registers and the stack pointer back, which is what leaving a thread needs - and
+ * it has to work when the two points are on different stacks (a guest thread may run on a
+ * stack of the game's own, and a fiber on a stack of the guest's memory).
+ *
+ * Every register is put back, not only the ones the convention keeps: the host's compiler
+ * keeps values that are live across the jump in the registers the convention does not keep
+ * (on Windows the first argument is in %rcx), and a jump that leaves those alone brings the
+ * thread back with nonsense in hand. */
+typedef struct {
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rip;    /* where to continue there */
+    uint64_t rflags; /* the flags of that point */
+    uint64_t fp;     /* the FPU state: the control word and the MXCSR */
+} runtime_thread_jump;
+/* The hand-written code takes its arguments in %rdi (the System V way), so the declarations say
+ * so: the host's compiler has to put them there (its own convention puts them in %rcx). */
+int runtime_setjmp(runtime_thread_jump *buffer) __attribute__((sysv_abi));
+void runtime_longjmp(runtime_thread_jump *buffer, int value) __attribute__((sysv_abi));
 /* The GPU library reads these (the guest memory's caching and the fault recovery point). */
 extern uint64_t runtime_disabled_optimizations;
 extern uint64_t runtime_experiment_bits;

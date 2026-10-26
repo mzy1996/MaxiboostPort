@@ -101,6 +101,12 @@ int platform_read_memory_checked(void *address, void *buffer, size_t size);
 
 /* The thread's own id, as the guest's sceKernelGetTid would report it. */
 uint64_t platform_thread_id(void);
+/* The thread's own stack limit (where its stack ends). The C library's stack probe
+ * (which the host's own functions use for their big frames) walks down from it, so a
+ * thread that runs on a stack of the guest's - which is somewhere else entirely - has
+ * to put it out of the way (nothing is probed then). Zero means "no probing". */
+uint64_t platform_thread_stack_limit(void);
+void platform_set_thread_stack_limit(uint64_t limit);
 /* The host's clock in nanoseconds, monotonic. */
 uint64_t platform_monotonic_ns(void);
 /* The host's wall clock in nanoseconds since the epoch (the guest's timed waits use it). */

@@ -11,12 +11,18 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
-#ifndef _WIN32
 #include <dirent.h>
 #include <errno.h>
 #include <ftw.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#define mkdir(path,mode) _mkdir(path)
+#define rmdir(path) _rmdir(path)
+#define fsync(fd) _commit(fd)
+#endif
 
 #define ERR_PARAMETER ((int32_t)0x809F0000)
 #define ERR_NOT_INITIALIZED ((int32_t)0x809F0001)
@@ -422,8 +428,3 @@ static const RuntimeExport exports[]={
 };
 uintptr_t runtime_savedata_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_savedata_report(void) { printf("Runtime: save data mounts=%zu, memory writes=%zu\n",mounts_done,memory_writes); }
-#else
-void runtime_savedata_configure(const char *title) { (void)title; }
-uintptr_t runtime_savedata_resolve(const char *name) { (void)name; return 0; }
-void runtime_savedata_report(void) {}
-#endif
