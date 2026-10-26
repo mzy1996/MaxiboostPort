@@ -56,6 +56,13 @@ typedef struct {
 } Fiber;
 _Static_assert(sizeof(Fiber) <= 256, "SceFiber is 256 bytes");
 
+/* BB_TRACE_FIBER=1 traces the fibers (the switch between them and the stack each one
+ * runs on). */
+static int fiber_trace(void) {
+    static int trace=-1;
+    if (trace<0) { const char *t=getenv("BB_TRACE_FIBER"); trace=t && t[0]=='1'; }
+    return trace;
+}
 /* The fiber state of the thread now running: the fiber (NULL outside Run), where the thread's
  * own context waits, the value passed with the last switch into this context. */
 typedef struct {
@@ -122,17 +129,18 @@ __asm__(
 /* The first thing that runs on the fiber's own stack: it says so, so the place where a
  * fiber stops is known. */
 __attribute__((used, noreturn)) void fiber_boot(void) {
-    fprintf(stderr,"Fiber: boot (rsp %p)\n",(void *)__builtin_frame_address(0));
+    if (fiber_trace()) fprintf(stderr,"Fiber: boot (rsp %p)\n",(void *)__builtin_frame_address(0));
     fiber_main();
 }
 
 __attribute__((used, noreturn)) void fiber_main(void) {
-    fprintf(stderr,"Fiber: entered (rsp %p)\n",(void *)__builtin_frame_address(0));
+    if (fiber_trace()) fprintf(stderr,"Fiber: entered (rsp %p)\n",(void *)__builtin_frame_address(0));
     ThreadFibers *t=here();
     Fiber *fiber=t->current;
-    fprintf(stderr,"Fiber: entered (fiber %p, entry %p, arg %llu)\n",(void *)fiber,
-            fiber?(void *)(uintptr_t)fiber->entry:NULL,
-            (unsigned long long)(fiber?fiber->arg_on_initialize:0));
+    if (fiber_trace())
+        fprintf(stderr,"Fiber: entered (fiber %p, entry %p, arg %llu)\n",(void *)fiber,
+                fiber?(void *)(uintptr_t)fiber->entry:NULL,
+                (unsigned long long)(fiber?fiber->arg_on_initialize:0));
     if (t->left) { atomic_store(&t->left->state,STATE_IDLE); t->left=NULL; }
     fiber->entry(fiber->arg_on_initialize,t->transfer);
     fprintf(stderr,"STOP: fiber %.31s returned from its entry (the PS4 does not allow it)\n",fiber->name);
@@ -150,8 +158,9 @@ static void *first_frame(Fiber *fiber) {
         }
         top=fiber->own_stack+OWN_STACK;
     }
-    fprintf(stderr,"Fiber: first frame (context %p, size %llu, top %p)\n",(void *)fiber->context,
-            (unsigned long long)fiber->context_size,(void *)top);
+    if (fiber_trace())
+        fprintf(stderr,"Fiber: first frame (context %p, size %llu, top %p)\n",(void *)fiber->context,
+                (unsigned long long)fiber->context_size,(void *)top);
     uint64_t *sp=(uint64_t *)((uintptr_t)top&~(uintptr_t)15);
     *--sp=0;                          /* alignment */
     *--sp=(uint64_t)(uintptr_t)fiber_start;
@@ -241,11 +250,11 @@ static ABI int32_t fiber_run(Fiber *fiber,uint64_t arg_on_run,uint64_t *arg_on_r
     if (!atomic_compare_exchange_strong(&fiber->state,&idle,STATE_RUN)) return FIBER_ERROR_STATE;
     atomic_fetch_add_explicit(&fiber_runs,1,memory_order_relaxed);
     t->current=fiber; t->transfer=arg_on_run; t->left=NULL;
-    fprintf(stderr,"Fiber: run (fiber %p, arg %llu)\n",(void *)fiber,(unsigned long long)arg_on_run);
+    if (fiber_trace()) fprintf(stderr,"Fiber: run (fiber %p, arg %llu)\n",(void *)fiber,(unsigned long long)arg_on_run);
     enter_guest_stack();
     fiber_swap(&t->thread_sp,resume_point(fiber));
     leave_guest_stack();
-    fprintf(stderr,"Fiber: back in the thread\n");
+    if (fiber_trace()) fprintf(stderr,"Fiber: back in the thread\n");
     t=here();                         /* back on this thread: ReturnToThread */
     if (t->left) { atomic_store(&t->left->state,STATE_IDLE); t->left=NULL; }
     t->current=NULL;
