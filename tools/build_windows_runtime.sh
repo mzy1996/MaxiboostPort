@@ -76,6 +76,9 @@ echo "Compiling for Windows: ${#sources[@]} sources -> $out/bb-probe.exe"
 # recovery). On Linux the dynamic linker does this (the runtime is linked with -rdynamic);
 # Windows needs a module definition file, and the same file gives the library the import
 # library (the GPU build makes it in gpu/CMakeLists.txt).
+# The GPU library imports these from the runtime by the module's name ("bb-probe.exe"), so
+# the runtime has to keep that name: under any other name the loader cannot resolve the
+# library's imports and it calls through an unresolved import.
 exports="$root/src/runtime_exports.txt"
 runtime_def="$out_win/bb-probe.def"
 if [ -f "$exports" ]; then

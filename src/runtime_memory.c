@@ -1441,12 +1441,29 @@ int runtime_memory_restore_access(void *context, uintptr_t address, int repeated
     if (platform_context_is_fetch(view)) return 0; /* instruction fetch */
     const uintptr_t page=address&~(uintptr_t)4095;
     int restored=0;
+    /* Why the access was not restored: the report says it, so a fault that ends the game
+     * can be told apart from a page the guest itself asked to be read-only. */
+    const char *why="restored";
+    unsigned vma_prot=0;
+    int vma_kind=-1;
     read_lock();
     const size_t i=vma_index(address);
-    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED) {
-        const int guest=host_prot(vmas[i].prot);
-        if (guest & (is_write ? BB_PROT_WRITE : BB_PROT_READ))
-            restored=!platform_protect((void *)page,4096,guest);
+    if (i>=vma_count || vmas[i].start>address) {
+        why="no region of the guest's own";
+    } else {
+        vma_prot=(unsigned)vmas[i].prot;
+        vma_kind=vmas[i].kind;
+        if (vmas[i].kind==KIND_RESERVED) {
+            why="a region the guest reserved";
+        } else {
+            const int guest=host_prot(vmas[i].prot);
+            if (!(guest & (is_write ? BB_PROT_WRITE : BB_PROT_READ))) {
+                why="the guest's own protection forbids it";
+            } else {
+                restored=!platform_protect((void *)page,4096,guest);
+                if (!restored) why="the protection could not be restored";
+            }
+        }
     }
     read_unlock();
     if (restored) {
@@ -1462,8 +1479,38 @@ int runtime_memory_restore_access(void *context, uintptr_t address, int repeated
             if (length>=(int)sizeof(line)) length=(int)sizeof(line)-1;
             platform_write_stdout(line,(size_t)length);
         }
+    } else {
+        static _Atomic unsigned notes;
+        const unsigned n=atomic_fetch_add(&notes,1)+1;
+        if (n<=8 || !(n&(n-1))) {
+            char line[256];
+            int length=snprintf(line,sizeof(line),
+                "Runtime: %s fault at %#llx not restored: %s (region prot %#x kind %d, %u so far)\n",
+                is_write ? "write" : "read", (unsigned long long)address, why, vma_prot, vma_kind, n);
+            if (length<0) length=0;
+            if (length>=(int)sizeof(line)) length=(int)sizeof(line)-1;
+            platform_write_stdout(line,(size_t)length);
+        }
     }
     return restored;
+}
+/* The guest's own view of an address: the region it is in, its kind and its protection.
+ * The fault report uses it to tell a page the GPU left protected from a page the guest
+ * asked to be read-only. */
+int runtime_memory_describe(uintptr_t address, char *buffer, size_t size) {
+    if (!buffer || !size) return 0;
+    buffer[0]=0;
+    read_lock();
+    const size_t i=vma_index(address);
+    if (i<vma_count && vmas[i].start<=address && address<vmas[i].end) {
+        snprintf(buffer,size,"region %#" PRIx64 "-%#" PRIx64 " kind %d prot %#x phys %#" PRIx64,
+                 (uint64_t)vmas[i].start,(uint64_t)vmas[i].end,vmas[i].kind,(unsigned)vmas[i].prot,
+                 (uint64_t)vmas[i].phys);
+    } else {
+        snprintf(buffer,size,"no region");
+    }
+    read_unlock();
+    return 1;
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {

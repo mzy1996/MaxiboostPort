@@ -64,6 +64,10 @@ void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
+int runtime_memory_describe(uintptr_t address, char *buffer, size_t size);
+/* Puts the guest's own protection back on a page the GPU tracking left write-protected,
+ * so the write that faulted goes on. The thread's context is not touched. */
+int runtime_memory_restore_access(void *context, uintptr_t address, int repeated);
 int runtime_memory_guest_chunk_gpu(uint64_t phys, uint64_t size);
 void runtime_memory_set_guest_chunk_lazy(int lazy);
 /* The CPU is about to write the range outside guest code (a file read): tells the GPU side. */

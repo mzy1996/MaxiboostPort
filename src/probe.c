@@ -43,6 +43,11 @@ typedef struct { uint64_t address, size, flags; } Segment;
 typedef struct { uint64_t target, kind, value, addend; } Reloc;
 static char (*names)[128];
 static uint64_t import_count;
+/* The import slots of the image: where the game keeps the address of every symbol it
+ * imports. The guest's own linker fills them; a slot that is still empty when the game
+ * calls through it is a NULL call, and the name of the symbol says which one. */
+static struct ImportSlot { uint64_t target; uint64_t name; uint64_t kind; } *import_slots;
+static uint64_t import_slot_count;
 static unsigned char *image;
 static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
@@ -249,6 +254,154 @@ void bb_fault_wait(const char *what) {
  * host's call chain. The context is the host's own (a ucontext on Linux, a CONTEXT on
  * Windows); the address is the one the fault was about. */
 void bb_fault_wait(const char *what);
+
+/* Diagnostic: dump the game's object registry R1 (buckets 0x160b600/0x160b700,
+ * sentinel 0x160b698, node {+0x0,+0x8}=BST links,+0x10=key(dw),+0x18=value}) so a fault
+ * shows whether the id the walker wanted (0x1001 and friends) is actually present. The
+ * registry is walked with the same hash/compare the game uses; platform_read_memory makes
+ * every read bounds-safe. */
+static void dump_registry_r1(uint32_t key) {
+    char line[256];
+    uint64_t v;
+    uint32_t d;
+    /* The guest RAM is identity-mapped at the image base: a guest virtual address X lives at
+     * host address (image + X). The game stores node/sentinel addresses as guest VAs, so every
+     * read of registry memory must be translated through `image`, otherwise platform_read_memory
+     * probes the wrong (often unmapped) place and returns UNREADABLE. rsp is already a true host
+     * pointer so the stack dump needs no translation; the registry's fixed addresses do. */
+    uintptr_t base = (uintptr_t)image;
+    if (platform_read_memory((void *)(base + 0x160b688), &v, 8) == 0)
+        snprintf(line, sizeof(line), "  [R1] free_head=%#llx", (unsigned long long)v);
+    else
+        snprintf(line, sizeof(line), "  [R1] free_head=UNREADABLE");
+    platform_write_stdout(line, strlen(line));
+    if (platform_read_memory((void *)(base + 0x160b600), &d, 4) == 0) {
+        snprintf(line, sizeof(line), " next_id=%#x", d);
+        platform_write_stdout(line, strlen(line));
+    }
+    if (platform_read_memory((void *)(base + 0x160b694), &d, 4) == 0) {
+        snprintf(line, sizeof(line), " used=%#x", d);
+        platform_write_stdout(line, strlen(line));
+    }
+    if (platform_read_memory((void *)(base + 0x160b690), &d, 4) == 0) {
+        snprintf(line, sizeof(line), " limit=%#x\n", d);
+        platform_write_stdout(line, strlen(line));
+    } else
+        platform_write_stdout("\n", 1);
+    /* The node pool and the free list. The pool is 0x19000 nodes of 0x20 bytes; a free
+     * node keeps the next one in its first word. A free list that is empty (the head's
+     * next is zero) means the register function hands out ids without ever putting a
+     * node in the table: every lookup then finds nothing. The pool is in the guest's
+     * own heap, not in the image, so its address is a host address already. */
+    {
+        uint64_t pool = 0, pool2 = 0, head = 0;
+        platform_read_memory((void *)(base + 0x161d080), &pool, 8);
+        platform_read_memory((void *)(base + 0x160b680), &pool2, 8);
+        platform_read_memory((void *)(base + 0x160b688), &head, 8);
+        snprintf(line, sizeof(line), "  [R1] pool=%#llx pool2=%#llx free_head=%#llx\n",
+                 (unsigned long long)pool, (unsigned long long)pool2, (unsigned long long)head);
+        platform_write_stdout(line, strlen(line));
+        if (head) {
+            uint64_t words[4] = {0, 0, 0, 0};
+            if (platform_read_memory((void *)(uintptr_t)head, words, sizeof(words)) == 0) {
+                snprintf(line, sizeof(line), "    head words: %#llx %#llx %#llx %#llx\n",
+                         (unsigned long long)words[0], (unsigned long long)words[1],
+                         (unsigned long long)words[2], (unsigned long long)words[3]);
+                platform_write_stdout(line, strlen(line));
+            } else
+                platform_write_stdout("    head words: UNREADABLE\n", 24);
+            uint64_t node = head;
+            for (int n = 0; n < 4; ++n) {
+                uint64_t next = 0;
+                if (platform_read_memory((void *)(uintptr_t)node, &next, 8) != 0) break;
+                snprintf(line, sizeof(line), "    node %#llx next=%#llx\n", (unsigned long long)node,
+                         (unsigned long long)next);
+                platform_write_stdout(line, strlen(line));
+                if (!next) break;
+                node = next;
+            }
+        }
+    }
+    /* Walk the bucket for `key` with the game's own hash. */
+    uint64_t n = (uint64_t)key * 0x747ed91f; n >>= 0x2c;
+    uint32_t eax = (uint32_t)(n * 0x2329);
+    int32_t bkt = (int32_t)key - (int32_t)eax;
+    uint64_t node = 0x160b698; /* sentinel (guest VA, matches the values the game stores) */
+    if (platform_read_memory((void *)(base + 0x160b700 + (uint64_t)(uint32_t)bkt * 8), &node, 8) == 0) {
+        int depth = 0, found = 0;
+        uint64_t val = 0;
+        while (node != 0x160b698 && depth < 4096) {
+            uint32_t k = 0;
+            if (platform_read_memory((void *)(base + node + 0x10), &k, 4) != 0) { node = 0x160b698; break; }
+            if (k == key) { found = 1; platform_read_memory((void *)(base + node + 0x18), &val, 8); break; }
+            uint64_t child_off = (k > key) ? node + 0x8 : node + 0x0;
+            if (platform_read_memory((void *)(base + child_off), &node, 8) != 0) { node = 0x160b698; break; }
+            ++depth;
+        }
+        if (found)
+            snprintf(line, sizeof(line), "  [R1] key %#x: FOUND value=%#llx (bucket %d, depth %d)\n",
+                     key, (unsigned long long)val, bkt, depth);
+        else
+            snprintf(line, sizeof(line), "  [R1] key %#x: ABSENT (bucket %d)\n", key, bkt);
+        platform_write_stdout(line, strlen(line));
+    }
+}
+
+/* Print the guest call stack (the faulting thread's Rsp, read with platform_read_memory, which
+ * maps guest virtual addresses directly). The runtime executes the guest natively, so the
+ * return address into the caller of a leaf helper (like the 0x66b280 node destructor) is the
+ * word at [Rsp]; the frame chain below it is the call chain. This is how the indirect callers
+ * that leave stale node pointers get found. */
+static void dump_guest_stack(uint64_t rsp) {
+    if (!rsp) return;
+    char line[256];
+    snprintf(line, sizeof(line), "  guest stack @ %#llx:\n", (unsigned long long)rsp);
+    platform_write_stdout(line, strlen(line));
+    uint64_t words[32];
+    if (platform_read_memory((void *)(uintptr_t)rsp, words, sizeof(words)) != 0) {
+        platform_write_stdout("    (unreadable)\n", 15);
+        return;
+    }
+    for (int i = 0; i < 32; ++i) {
+        uint64_t v = words[i];
+        char tag[80] = "";
+        uint64_t off = 0; const char *mod = NULL;
+        if (runtime_guest_address(v, &off, &mod) && mod)
+            snprintf(tag, sizeof(tag), "  <%s+%#llx>", mod, (unsigned long long)off);
+        snprintf(line, sizeof(line), "    [%d] %#llx%s\n", i, (unsigned long long)v, tag);
+        platform_write_stdout(line, strlen(line));
+    }
+}
+
+/* The guest's frame chain: the game keeps its frame pointer, so every frame's saved rbp
+ * points at the frame of its caller, and the return address of each frame is just above
+ * it. This is the way to find the code that made a call the guest could not return from
+ * (a call through a null pointer leaves no return address of its own on the stack). */
+static void dump_guest_frames(uint64_t rbp) {
+    if (!rbp) return;
+    char line[256];
+    platform_write_stdout("  guest frames (rbp chain):\n", 24);
+    for (int depth = 0; depth < 40; ++depth) {
+        uint64_t frame[2];
+        if (platform_read_memory((void *)(uintptr_t)rbp, frame, sizeof(frame)) != 0) {
+            snprintf(line, sizeof(line), "    #%d rbp %#llx (unreadable)\n", depth,
+                     (unsigned long long)rbp);
+            platform_write_stdout(line, strlen(line));
+            return;
+        }
+        const uint64_t saved = frame[0], ret = frame[1];
+        uint64_t off = 0; const char *mod = NULL;
+        char tag[80] = "";
+        if (runtime_guest_address(ret, &off, &mod) && mod)
+            snprintf(tag, sizeof(tag), "  <%s+%#llx>", mod, (unsigned long long)off);
+        snprintf(line, sizeof(line), "    #%d rbp %#llx ret %#llx%s\n", depth,
+                 (unsigned long long)rbp, (unsigned long long)ret, tag);
+        platform_write_stdout(line, strlen(line));
+        if (!saved || saved == rbp) return;
+        rbp = saved;
+    }
+}
+
 static void report_fault(void *context, void *fault_address, int sig) {
     /* The context is the exception's pointers on Windows and the ucontext on Linux:
      * the shape of the view of it is not the same. */
@@ -287,6 +440,30 @@ static void report_fault(void *context, void *fault_address, int sig) {
             platform_write_stdout("none\n", 5);
         }
     }
+    /* Where the faulting address is: a pointer into memory the guest has released shows
+     * as an unmapped address, a page the GPU write-protected shows as read-only. The two
+     * need different fixes, so the report says which one it is. */
+    if (fault_address) {
+        char mapping[512];
+        if (platform_mapping_of(fault_address, mapping, sizeof(mapping)) && mapping[0]) {
+            snprintf(line, sizeof(line), "  fault address %p mapping: ", fault_address);
+            platform_write_stdout(line, strlen(line));
+            platform_write_stdout(mapping, strlen(mapping));
+        } else {
+            snprintf(line, sizeof(line), "  fault address %p: no mapping\n", fault_address);
+            platform_write_stdout(line, strlen(line));
+        }
+        /* The guest's own view of the address: its region and the protection the guest
+         * asked for. A page the GPU left protected differs from a page the guest made
+         * read-only, and only the first one is a fault of ours. */
+        {
+            char region[256];
+            if (runtime_memory_describe((uintptr_t)fault_address, region, sizeof(region)) && region[0]) {
+                snprintf(line, sizeof(line), "  fault address %p %s\n", fault_address, region);
+                platform_write_stdout(line, strlen(line));
+            }
+        }
+    }
     snprintf(line, sizeof(line),
              "  rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx r12 %llx r13 %llx r14 %llx r15 %llx\n",
              (unsigned long long)platform_context_register(&uc, 0), (unsigned long long)platform_context_register(&uc, 3),
@@ -295,6 +472,14 @@ static void report_fault(void *context, void *fault_address, int sig) {
              (unsigned long long)platform_context_register(&uc, 12), (unsigned long long)platform_context_register(&uc, 13),
              (unsigned long long)platform_context_register(&uc, 14), (unsigned long long)platform_context_register(&uc, 15));
     platform_write_stdout(line, strlen(line));
+    /* The guest call chain: how a leaf helper like the 0x66b280 node destructor got here,
+     * and which indirect caller left the stale node pointer the destructor trips on. */
+    {
+        const uintptr_t grsp = (uintptr_t)platform_context_stack(&uc);
+        const uintptr_t grbp = (uintptr_t)platform_context_frame(&uc);
+        dump_guest_stack((uint64_t)grsp);
+        dump_guest_frames((uint64_t)grbp);
+    }
     /* Outside the image and any shared object (generated code, a freed mapping): the mapping
      * the address is in, and the thread. */
     if (rip - (uintptr_t)image >= 0x10000000 && !in_module) {
@@ -321,6 +506,45 @@ static void report_fault(void *context, void *fault_address, int sig) {
             snprintf(line, sizeof(line), "  #%d %p\n", i, frames[i]);
         platform_write_stdout(line, strlen(line));
     }
+    /* The registry's node pool: where it is and what it holds. The pool is the game's
+     * own memory, and the free list that threads it is written into the pool itself,
+     * so a pool whose memory was recycled leaves a chain of zeros. */
+    {
+        uint64_t pool = 0, head = 0, link = 0;
+        platform_read_memory((void *)((uintptr_t)image + 0x161d080), &pool, 8);
+        platform_read_memory((void *)((uintptr_t)image + 0x160b688), &head, 8);
+        if (pool) platform_read_memory((void *)(uintptr_t)pool, &link, 8);
+        char region[192];
+        region[0] = 0;
+        if (pool) runtime_memory_describe((uintptr_t)pool, region, sizeof(region));
+        snprintf(line, sizeof(line), "  R1 pool=%#llx head=%#llx chain[0]=%#llx %s\n",
+                 (unsigned long long)pool, (unsigned long long)head,
+                 (unsigned long long)link, region);
+        platform_write_stdout(line, strlen(line));
+    }
+    /* The import slots that are still empty: the game calls through one of them and
+     * the address is zero, so the call goes to address zero. Which symbol it is says
+     * what the linker failed to resolve. */
+    {
+        unsigned shown = 0, empty = 0;
+        for (uint64_t i = 0; i < import_slot_count; ++i) {
+            uint64_t at = 0;
+            if (platform_read_memory(image + import_slots[i].target, &at, 8) != 0) continue;
+            if (at) continue;
+            ++empty;
+            if (shown++ >= 24) continue;
+            const uint64_t n = import_slots[i].name;
+            const char *symbol = n < import_count ? runtime_symbol(names[n]) : NULL;
+            snprintf(line, sizeof(line), "  import slot %s is empty (%s, kind %llu)\n",
+                     n < import_count ? names[n] : "?", symbol ? symbol : "(no name)",
+                     (unsigned long long)import_slots[i].kind);
+            platform_write_stdout(line, strlen(line));
+        }
+        if (empty) {
+            snprintf(line, sizeof(line), "  %u import slots are empty\n", empty);
+            platform_write_stdout(line, strlen(line));
+        }
+    }
     snprintf(line, sizeof(line), "fault (signal %d)", sig);
     bb_fault_wait(line);
     /* The game's own linker: it looks the symbol up by its address, and the address is
@@ -339,6 +563,7 @@ static void report_fault(void *context, void *fault_address, int sig) {
                          at, inside ? "in the image" : "not in the image",
                          inside ? "" : " - the kernel's answer, which the image does not know");
                 platform_write_stdout(line,strlen(line));
+                dump_registry_r1(at);
             }
         }
     }
@@ -353,6 +578,56 @@ void bb_fault_wait(const char *what) {
 }
 static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
     const DWORD code = exception->ExceptionRecord->ExceptionCode;
+    /* The exception's own view: the address it was about, and the context it carries. */
+    PlatformContext uc0 = { exception, exception->ContextRecord };
+
+    /* A fault the runtime can resolve itself is resolved before the report, because the
+     * report ends the game. A page the GPU page tracking left write-protected is such a
+     * fault: the guest's own protection allows the write (the report says which region it
+     * is and what protection it has), and the POSIX build resolves it before the report
+     * too. Here the report came first, so the recovery was dead code, and a write of the
+     * game into a page the tracker had protected ended the game instead of being let
+     * through (guest+0x66b346: the game's own allocator writing into its heap).
+     *
+     * Only the protection of the page is put back: the thread's context is left alone, so
+     * the thread resumes exactly where it faulted. (The GPU library's own resolution is not
+     * used here: on Windows it expects the exception's pointers in one place and the
+     * context in another, and it rewrites the context to retry the instruction - driven
+     * from this handler it faulted inside itself, and the handler called itself until the
+     * thread's stack was gone.) */
+    if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR) {
+        /* BB_FAULT_RECOVER=0 turns the recovery off (the fault ends the game as before). */
+        static int recover=-1;
+        if (recover<0) { const char *e=getenv("BB_FAULT_RECOVER"); recover=!(e && e[0]=='0'); }
+        if (recover) {
+            const uintptr_t where=(uintptr_t)platform_context_fault_address(&uc0);
+            /* The page gets the guest's own protection back: the write the guest is doing
+             * is one that protection allows. */
+            if (runtime_memory_restore_access(exception, where, 0))
+                return EXCEPTION_CONTINUE_EXECUTION;
+            {   /* The ones that were not resolved are said out loud: which page faulted,
+                 * what the guest's own protection of it is, and which thread it was. */
+                static unsigned notes;
+                const unsigned n=__atomic_fetch_add(&notes,1,__ATOMIC_RELAXED)+1;
+                if (n<=8 || !(n&(n-1))) {
+                    char note[256];
+                    const uintptr_t rip=(uintptr_t)platform_context_rip(&uc0);
+                    char region[192];
+                    char thread[32]="?";
+                    platform_thread_name_get(thread,sizeof(thread));
+                    runtime_memory_describe(where,region,sizeof(region));
+                    int length=snprintf(note,sizeof(note),
+                        "Runtime: access violation at %#llx (rip %#llx) in thread %s: %s (%u so far)\n",
+                        (unsigned long long)where,(unsigned long long)rip,thread,region,n);
+                    if (length>0) platform_write_stdout(note,(size_t)length);
+                    /* The registry's state: how many objects are in it and what the next
+                     * id is. The ids the linker hands out start at 0x1001, so a registry
+                     * that is empty says that no entry was ever converted. */
+                    dump_registry_r1(0);
+                }
+            }
+        }
+    }
 
     /* The first line is written with almost no stack: a stack overflow leaves the
      * thread nearly without one, and the report has to survive it (the rest of the
@@ -417,7 +692,7 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
         if (handle && handle!=INVALID_HANDLE_VALUE)
             WriteFile(handle,first,(DWORD)(at-first),&written,NULL);
     }
-    /* The report of the fault (the thread, its registers and its stack) is written for
+/* The report of the fault (the thread, its registers and its stack) is written for
      * every kind of exception but the debug ones: a program that writes to the debug
      * output raises one of those on every line (the graphics driver's overlay does it
      * constantly), and they say nothing about a fault. */
@@ -425,32 +700,11 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
       int say=1;
       for (size_t q=0;q<sizeof(quiet)/sizeof(*quiet);++q) if (code==quiet[q]) say=0;
       if (say) {
-        PlatformContext uc = { exception, exception->ContextRecord };
-        report_fault(exception, (void *)platform_context_fault_address(&uc), (int)code);
+          PlatformContext uc = { exception, exception->ContextRecord };
+          report_fault(exception, (void *)platform_context_fault_address(&uc), (int)code);
       } }
-    if (code!=EXCEPTION_ACCESS_VIOLATION && code!=EXCEPTION_IN_PAGE_ERROR &&
-        code!=EXCEPTION_ILLEGAL_INSTRUCTION && code!=EXCEPTION_INT_DIVIDE_BY_ZERO &&
-        code!=EXCEPTION_PRIV_INSTRUCTION && code!=EXCEPTION_STACK_OVERFLOW) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    /* The guest's code is counted first (the single-step counter's int3s). */
+    /* The guest's code is counted (the single-step counter's int3s). */
     if (runtime_count_trap(exception)) return EXCEPTION_CONTINUE_EXECUTION;
-    /* GPU page tracking (write-protected guest pages) is resolved next. */
-    PlatformContext uc = { exception, exception->ContextRecord };
-    if (gpu_enabled && bbgpu_handle_fault(exception, (void *)platform_context_fault_address(&uc)))
-        return EXCEPTION_CONTINUE_EXECUTION;
-    /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
-    if (runtime_fault_recover) {
-#ifdef _WIN32
-        runtime_jmp_buf *recover = runtime_fault_recover;
-        runtime_fault_recover = NULL;
-        longjmp(*recover, 1);
-#else
-        sigjmp_buf *recover = runtime_fault_recover;
-        runtime_fault_recover = NULL;
-        siglongjmp(*recover, 1);
-#endif
-    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
@@ -790,7 +1044,60 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
     const unsigned interval=watchdog_seconds?watchdog_seconds:10;
     FILE *out=fopen("watchdog.txt","w");
     if (!out) out=stderr;
+    /* The registry's node pool: its free list is threaded through the nodes themselves, so
+     * a node whose memory is recycled (zeroed) breaks the chain. The register function then
+     * hands out ids without ever putting a node in the table, and every lookup of one of
+     * them finds nothing. The watch shows the chain and the counters as they change. */
+    const int watch_r1 = getenv("BB_R1_WATCH") != NULL;
+    unsigned last_used = 0xffffffffu, last_next = 0xffffffffu, last_head = 0xffffffffu;
+    uint64_t last_link = 0, last_link_was = 0;
     for (unsigned round=0;;++round) {
+        if (watch_r1) {
+            uint64_t head = 0, next = 0;
+            platform_read_memory((void *)((uintptr_t)image + 0x160b688), &head, 8);
+            if (head) platform_read_memory((void *)(uintptr_t)head, &next, 8);
+            uint32_t used = 0, next_id = 0;
+            platform_read_memory((void *)((uintptr_t)image + 0x160b694), &used, 4);
+            platform_read_memory((void *)((uintptr_t)image + 0x160b600), &next_id, 4);
+            if (used != last_used || next_id != last_next || head != last_head) {
+                last_used = used;
+                last_next = next_id;
+                last_head = (unsigned)head;
+                char note[192];
+                int length = snprintf(note, sizeof(note),
+                    "Runtime: R1 free_head=%#llx head.next=%#llx used=%#x next_id=%#x\n",
+                    (unsigned long long)head, (unsigned long long)next, used, next_id);
+                if (length > 0) platform_write_stdout(note, (size_t)length);
+                /* The head node's own words: the chain is threaded through them, so they
+                 * say whether the pool still holds what the init wrote. */
+                if (head) {
+                    uint64_t words[4] = {0,0,0,0};
+                    if (platform_read_memory((void *)(uintptr_t)head, words, sizeof(words)) == 0) {
+                        length = snprintf(note, sizeof(note),
+                            "    head node %#llx: %#llx %#llx %#llx %#llx\n",
+                            (unsigned long long)head, (unsigned long long)words[0],
+                            (unsigned long long)words[1], (unsigned long long)words[2],
+                            (unsigned long long)words[3]);
+                        if (length > 0) platform_write_stdout(note, (size_t)length);
+                    }
+                }
+            }
+            /* The chain's head word on its own: it is the first thing that goes. */
+            if (head) {
+                uint64_t link = 1;
+                if (platform_read_memory((void *)(uintptr_t)head, &link, 8) == 0 && link != last_link) {
+                    last_link = link;
+                    char note[128];
+                    int length = snprintf(note, sizeof(note),
+                        "Runtime: R1 chain head word = %#llx (was %#llx)\n",
+                        (unsigned long long)link, (unsigned long long)last_link_was);
+                    if (length > 0) platform_write_stdout(note, (size_t)length);
+                    last_link_was = link;
+                }
+            }
+            platform_sleep_ns(20*1000*1000);
+            continue;
+        }
         Sleep(interval*200);
         fprintf(out,"--- round %u ---\n",round);
         fflush(out); /* the round is said before the threads are looked at: a hang in
@@ -1133,6 +1440,8 @@ int main(int argc, char **argv) {
     }
     unsigned char *traps = allocate(round_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
+    import_slots = calloc(nr ? nr : 1, sizeof(*import_slots));
+    if (!import_slots) fail("allocation failed");
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
         unsigned char *t = traps + i * 32;
@@ -1170,6 +1479,17 @@ int main(int argc, char **argv) {
             }
         }
         memcpy(image + relocs[i].target, &value, 8);
+        if (relocs[i].kind) {
+            /* The slot is remembered: the guest's own linker overwrites it when it
+             * resolves the import, and a slot that is still empty when the game calls
+             * through it is the NULL call the fault report has to name. */
+            if (import_slot_count < nr) {
+                import_slots[import_slot_count].target = relocs[i].target;
+                import_slots[import_slot_count].name = relocs[i].value;
+                import_slots[import_slot_count].kind = relocs[i].kind;
+                ++import_slot_count;
+            }
+        }
         if (relocs[i].kind==1 && value>=(uintptr_t)traps &&
             value<(uintptr_t)traps+(import_count+1)*32) {
             /* The import has no address: the game will find the trap when its own
@@ -1266,7 +1586,7 @@ int main(int argc, char **argv) {
             watchdog_set_image((uintptr_t)info.BaseAddress,(uintptr_t)info.BaseAddress+info.RegionSize);
         else watchdog_set_image((uintptr_t)image,(uintptr_t)image+64*1024*1024);
     }
-    if (timeout_seconds) {
+    if (timeout_seconds || getenv("BB_R1_WATCH")) {
         HANDLE watchdog=CreateThread(NULL,0,watchdog_thread,NULL,0,NULL);
         if (watchdog) CloseHandle(watchdog);
     }
