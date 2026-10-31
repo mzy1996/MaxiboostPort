@@ -65,6 +65,11 @@ uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_describe(uintptr_t address, char *buffer, size_t size);
+/* bbport: the guest's own memory regions (their start, end, physical address and kind) for the
+ * crash diagnostics: where a value that should not be there lives. The number of regions is
+ * returned; the arrays are filled up to max of them. The regions are the guest's address space,
+ * which is the host's, so their contents can be read directly. */
+int runtime_memory_regions(uintptr_t *starts, uintptr_t *ends, uintptr_t *phys, int *kinds, int max);
 /* bbport (diagnostics): dumps the ring of recent mapping operations (place/unmap/release/
  * protect/write-backing) with guest call sites, so the pool watch can see what remapped the
  * pool's physical range even after the fact. Returns characters written. */

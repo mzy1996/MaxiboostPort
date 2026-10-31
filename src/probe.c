@@ -52,6 +52,7 @@ static uint64_t import_count;
 static struct ImportSlot { uint64_t target; uint64_t name; uint64_t kind; } *import_slots;
 static uint64_t import_slot_count;
 static unsigned char *image;
+static uint64_t image_bytes;   /* the image's length (the crash diagnostics search in it) */
 static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
 static LinkedModule modules[16];
@@ -105,10 +106,23 @@ static uint64_t read64(FILE *f) {
     return n;
 }
 static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
+/* bbport: the blocks the runtime allocates for the game (the import traps, the data traps, the
+ * guest's main stack). A guest address that lands in one of them says the game and the runtime
+ * share that memory, which is one way a host address ends up in a guest object. */
+#define RUNTIME_ALLOCS 128
+static struct { void *address; size_t size; } runtime_allocs[RUNTIME_ALLOCS];
+static int runtime_alloc_count;
+static void note_runtime_alloc(void *address, size_t size) {
+    if (runtime_alloc_count < RUNTIME_ALLOCS) {
+        runtime_allocs[runtime_alloc_count].address = address;
+        runtime_allocs[runtime_alloc_count].size = size;
+        ++runtime_alloc_count;
+    }
+}
 static void *allocate(size_t size) {
 #ifndef _WIN32
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
-    if (low) return low;
+    if (low) { note_runtime_alloc(low,size); return low; }
 #endif
 #ifdef _WIN32
     void *p = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -117,6 +131,7 @@ static void *allocate(size_t size) {
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) fail("mmap failed");
 #endif
+    note_runtime_alloc(p,size);
     return p;
 }
 /* The relink bakes vtable / function / static-data pointers as absolute
@@ -473,6 +488,87 @@ static void dump_guest_stack_wide(uint64_t rsp) {
     if (!shown) platform_write_stdout("    (no guest addresses in window)\n", 33);
 }
 
+/* bbport: what kind of host memory is this address in? The guest's memory is the host's, so an
+ * address that the runtime does not track as a region of the guest's own is still a piece of the
+ * host's memory, and what it is (the C library's heap, a private region, a module's data) says
+ * who handed it out. */
+static void describe_host_address(uintptr_t address, char *buffer, size_t size) {
+    if (!buffer || !size) return;
+    buffer[0]=0;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((const void *)address, &mbi, sizeof(mbi))) {
+        static const char *const states[3] = {"commit","reserve","free"};
+        const char *state = mbi.State<=2 ? states[mbi.State] : "?";
+        char prot[8]={0};
+        const DWORD p=mbi.Protect & 0xff;
+        if (p==PAGE_READWRITE) snprintf(prot,sizeof(prot),"rw");
+        else if (p==PAGE_READONLY) snprintf(prot,sizeof(prot),"r");
+        else if (p==PAGE_EXECUTE_READWRITE) snprintf(prot,sizeof(prot),"rwx");
+        else if (p==PAGE_EXECUTE_READ) snprintf(prot,sizeof(prot),"rx");
+        else if (p==PAGE_NOACCESS) snprintf(prot,sizeof(prot),"---");
+        else if (p==PAGE_WRITECOPY) snprintf(prot,sizeof(prot),"rwc");
+        else snprintf(prot,sizeof(prot),"p%lu",(unsigned long)p);
+        snprintf(buffer,size,"host %p-%p %s %s type=%lu",
+                 mbi.BaseAddress,(char *)mbi.BaseAddress+mbi.RegionSize,state,prot,
+                 (unsigned long)mbi.Type);
+        return;
+    }
+    snprintf(buffer,size,"host region unknown");
+#else
+    snprintf(buffer,size,"host region unknown");
+#endif
+}
+/* bbport: where does this value live? The guest's memory is the host's memory (the guest's
+ * address space is the host's), so a value that leaked from the host into the guest's heap is
+ * found by the same search: the guest's own copy (the corrupted one) and the host's own (the
+ * table it was copied from) both show up, and the distance between them says what happened. */
+static void dump_value_places(uint64_t value, const char *what) {
+    uintptr_t hits[12];
+    uint64_t scanned=0;
+    const int found=platform_scan_memory(value, hits, 12, &scanned);
+    char line[320];
+    int n=snprintf(line,sizeof(line),"  %s = %#llx lives in %d place(s) (%llu MiB looked at):\n",
+                   what,(unsigned long long)value,found,(unsigned long long)(scanned>>20));
+    if (n>0 && n<(int)sizeof(line)) platform_write_stdout(line,(size_t)n);
+    for (int i=0;i<found;++i) {
+        char where[192]={0};
+        uint64_t offset=0; const char *module=NULL;
+        if (runtime_guest_address(hits[i],&offset,&module) && module)
+            snprintf(where,sizeof(where),"in the image (%s+%#llx)",module,(unsigned long long)offset);
+        else {
+            char region[160]={0};
+            runtime_memory_describe(hits[i],region,sizeof(region));
+            snprintf(where,sizeof(where),"%s",region);
+        }
+        char host[160]={0};
+        describe_host_address(hits[i],host,sizeof(host));
+        n=snprintf(line,sizeof(line),"    %#llx  %s | %s\n",(unsigned long long)hits[i],where,host);
+        if (n>0 && n<(int)sizeof(line)) platform_write_stdout(line,(size_t)n);
+    }
+}
+/* bbport: the same search, but only in the guest's image: the loader's bookkeeping (a module's
+ * base address, its path) is in there, so a value that should be a vtable but is a module's base
+ * address is found next to the other module entries. */
+static void dump_value_in_image(uint64_t value, const char *what) {
+    if (!image || !image_bytes) return;
+    char line[320];
+    int found=0;
+    const unsigned char *p=image;
+    for (uint64_t i=0;i+8<=image_bytes;++i) {
+        uint64_t v; memcpy(&v,p+i,sizeof(v));
+        if (v!=value) continue;
+        if (found<12) {
+            const int n=snprintf(line,sizeof(line),"    image+%#llx\n",(unsigned long long)i);
+            if (n>0 && n<(int)sizeof(line)) platform_write_stdout(line,(size_t)n);
+        }
+        ++found;
+        i+=7;
+    }
+    const int n=snprintf(line,sizeof(line),"  %s = %#llx lives in %d place(s) of the image\n",
+                         what,(unsigned long long)value,found);
+    if (n>0 && n<(int)sizeof(line)) platform_write_stdout(line,(size_t)n);
+}
 /* A null-jump that lands at rip=0 from a `jmp [rax+off]` / `call [rax+off]` vtable thunk: the
  * target read was zero. The first argument (rdi) is `this`; read it to tell a null vtable
  * pointer (object not constructed) from a null vtable slot (vtable present but empty). */
@@ -520,6 +616,97 @@ static void dump_null_jump_target(uint64_t rdi) {
                  (unsigned long long)rdi);
         platform_write_stdout(line, strlen(line));
     }
+    /* Which region of the guest's own address space is the object in? */
+    { char region[192]={0};
+      if (runtime_memory_describe((uintptr_t)rdi,region,sizeof(region)) && region[0]) {
+          snprintf(line,sizeof(line),"  'this' is in: %s\n",region);
+          platform_write_stdout(line,strlen(line));
+      } }
+    /* ... and which host memory is it? The runtime does not track it as a region of the guest's
+     * own, so it says what the host has there: the C library's heap, a private region, a
+     * module's data. The nearest region of the guest's own on both sides is said too. */
+    { char host[192]={0};
+      describe_host_address((uintptr_t)rdi,host,sizeof(host));
+      snprintf(line,sizeof(line),"  'this' is in %s\n",host);
+      platform_write_stdout(line,strlen(line)); }
+    /* Does one of the runtime's own blocks cover the object? (the import traps, the data traps,
+     * the guest's main stack: the memory the game and the runtime share.) */
+    { int inside=0;
+      for (int i=0;i<runtime_alloc_count;++i) {
+          const uintptr_t a=(uintptr_t)runtime_allocs[i].address;
+          if (rdi>=a && rdi<a+runtime_allocs[i].size) { inside=1; break; }
+      }
+      snprintf(line,sizeof(line),"  the runtime's own blocks: %d; the object is %sinside one of them\n",
+               runtime_alloc_count, inside ? "" : "NOT ");
+      platform_write_stdout(line,strlen(line));
+      for (int i=0;i<runtime_alloc_count && i<8;++i) {
+          const int n=snprintf(line,sizeof(line),"    %p +%zu\n",
+                               runtime_allocs[i].address,runtime_allocs[i].size);
+          if (n>0 && n<(int)sizeof(line)) platform_write_stdout(line,(size_t)n);
+      } }
+    { uintptr_t starts[64], ends[64], phys[64]; int kinds[64];
+      const int n=runtime_memory_regions(starts,ends,phys,kinds,64);
+      uintptr_t below=0, above=0; int have_below=0, have_above=0;
+      for (int i=0;i<n;++i) {
+          if (ends[i]<=rdi) { below=starts[i]; have_below=1; }
+          if (starts[i]>rdi && (!have_above || starts[i]<above)) { above=starts[i]; have_above=1; }
+      }
+      snprintf(line,sizeof(line),"  the guest's own regions: %d; below %#llx, above %#llx\n",
+               n,(unsigned long long)below,(unsigned long long)above);
+      platform_write_stdout(line,strlen(line)); }
+#ifdef _WIN32
+    /* The host region the object is in: what else lives there? The loader's module table is a
+     * run of entries that begin with a module's base address, so a region full of the image's
+     * base address says the object shares its block with that table. */
+    { MEMORY_BASIC_INFORMATION mbi;
+      if (VirtualQuery((const void *)rdi, &mbi, sizeof(mbi)) && mbi.RegionSize) {
+          const uintptr_t base=(uintptr_t)mbi.BaseAddress, size=mbi.RegionSize;
+          const unsigned char *p=(const unsigned char *)base;
+          int hits=0; uintptr_t first=0;
+          for (uintptr_t i=0;i+8<=size;++i) {
+              uint64_t v; memcpy(&v,p+i,sizeof(v));
+              if (v!=0x10000000ull) continue;
+              if (!hits) first=base+i;
+              ++hits;
+          }
+          snprintf(line,sizeof(line),"  that host region (%p+%zu): %d image-base word(s), first at %p\n",
+                   (void *)base,size,hits,(void *)first);
+          platform_write_stdout(line,strlen(line));
+          /* The words around the object: its own neighbours say what structure it is. */
+          const uintptr_t from=(rdi>base+0x40) ? rdi-0x40 : base;
+          const uintptr_t to=(rdi+0x80<base+size) ? rdi+0x80 : base+size;
+          uint64_t words[32]; const size_t count=(size_t)((to-from)/8);
+          if (count && platform_read_memory((void *)from, words, count*8)==0) {
+              for (size_t i=0;i<count;++i) {
+                  const int n=snprintf(line,sizeof(line),"    %p: %#llx%s\n",
+                                       (void *)(from+i*8),(unsigned long long)words[i],
+                                       (from+i*8==rdi) ? "   <== 'this'" : "");
+                  if (n>0 && n<(int)sizeof(line)) platform_write_stdout(line,(size_t)n);
+              }
+          }
+      } }
+#endif
+    /* A wider window: the object is usually a part of a bigger structure, and what is around
+     * it says who owns it. */
+    { uint64_t more[4];
+      if (platform_read_memory((void *)(uintptr_t)(rdi+0x20), more, sizeof(more)) == 0) {
+          snprintf(line,sizeof(line),"  after 'this' (+0x20..+0x3f): %#llx %#llx %#llx %#llx\n",
+                   (unsigned long long)more[0],(unsigned long long)more[1],
+                   (unsigned long long)more[2],(unsigned long long)more[3]);
+          platform_write_stdout(line,strlen(line));
+      } }
+    /* A value that is a host address says the host's memory leaked into the guest's heap; a
+     * value that is the image's base says the loader's bookkeeping is here. Both are looked for
+     * everywhere, so the place they come from is named. */
+    for (int i=0;i<4;++i) {
+        if (obj[i]>=0x7ff000000000ull) {
+            char what[64];
+            snprintf(what,sizeof(what),"the host address at +%#x",i*8);
+            dump_value_places(obj[i],what);
+        }
+    }
+    if (obj[0] && obj[0]>=0x10000000ull && obj[0]<0x30000000ull)
+        dump_value_in_image(obj[0],"the image base at +0");
 }
 
 static void report_fault(void *context, void *fault_address, int sig) {
@@ -1784,16 +1971,24 @@ void bb_fault_wait(const char *what) {
 /* BB_CPU_WATCH on Windows: the page the watch protects has no signal handler here (the signal
  * path is the POSIX build's), so the vectored handler does the job the way the pool's trap
  * does it: the write is named, one store is let through, and the Trap Flag's single-step
- * (handled at the top of this handler) re-protects the page. */
-static unsigned char *cpu_watch_page;      /* the shared definitions live further down */
-static _Atomic int cpu_watch_hits;         /* (tentative; defined next to cpu_watch_install) */
+ * (handled at the top of this handler) re-protects the page.
+ *
+ * The watch is a small table of pages, so the image's own pages (BB_CPU_WATCH=<image offset>)
+ * and any page of the guest's memory (BB_GUEST_WATCH=<guest address>) can be watched at the
+ * same time. The guest's address space is the host's, so a guest address is a host address. */
+#define CPU_WATCH_PAGES 4
+typedef struct { unsigned char *page; uintptr_t lo, hi; int is_guest; } CpuWatch;
+static CpuWatch cpu_watch[CPU_WATCH_PAGES];
+static int cpu_watch_count;
+static _Atomic int cpu_watch_hits;
 static volatile uintptr_t cpu_watch_reprotect;
+static volatile uintptr_t cpu_watch_open;   /* the page that was opened for one store (POSIX) */
 #define CPU_WATCH_SITES 24
 #define CPU_WATCH_STORM_LIMIT 10000L
 static struct { uintptr_t rip, at; long count; } cpu_watch_sites[CPU_WATCH_SITES];
 static int cpu_watch_site_count;
 static _Atomic long cpu_watch_storm;
-static void cpu_watch_note(uintptr_t rip, uintptr_t at) {
+static void cpu_watch_note(uintptr_t rip, uintptr_t at, const CpuWatch *watch) {
     const long hits=atomic_fetch_add(&cpu_watch_hits,1)+1;
     int slot=-1;
     for (int i=0;i<cpu_watch_site_count;++i)
@@ -1804,10 +1999,22 @@ static void cpu_watch_note(uintptr_t rip, uintptr_t at) {
     }
     if (slot>=0 && cpu_watch_sites[slot].count==1) {
         char line[320];
-        int n=snprintf(line,sizeof(line),"CPU watch: write to image+%#llx from rip %#llx",
-                       (unsigned long long)(at-(uintptr_t)image),(unsigned long long)rip);
+        int n=snprintf(line,sizeof(line),"CPU watch: write to %s",
+                       (watch && watch->is_guest) ? "guest" : "image");
         if (n<=0) n=0;
         if (n>=(int)sizeof(line)) n=(int)sizeof(line)-1;
+        if (watch && watch->is_guest) {
+            const int m=snprintf(line+n,sizeof(line)-(size_t)n,"+%#llx",
+                                 (unsigned long long)(at-(uintptr_t)watch->page));
+            if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+        } else {
+            const int m=snprintf(line+n,sizeof(line)-(size_t)n,"+%#llx",
+                                 (unsigned long long)(at-(uintptr_t)image));
+            if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+        }
+        const int m=snprintf(line+n,sizeof(line)-(size_t)n," from rip %#llx",
+                             (unsigned long long)rip);
+        if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
         if (rip>=(uintptr_t)image && rip<(uintptr_t)image+0x20000000) {
             const int m=snprintf(line+n,sizeof(line)-(size_t)n," (guest+%#llx)",
                                  (unsigned long long)(rip-(uintptr_t)image));
@@ -1885,19 +2092,20 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
         }
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    /* The cpu-watch page (BB_CPU_WATCH=<image offset>): a write into it is named - the place,
-     * the module, the thread - and exactly one store is let through (the page is made writable
-     * and the thread's Trap Flag is set; the single-step at the top of this handler re-protects
-     * it read-only). This runs before the runtime's own recovery below, which would give the
-     * page back without naming anybody. */
-    if ((code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR) && cpu_watch_page) {
+    /* The cpu-watch page (BB_CPU_WATCH=<image offset>, BB_GUEST_WATCH=<guest address>): a write
+     * into it is named - the place, the module, the thread - and exactly one store is let through
+     * (the page is made writable and the thread's Trap Flag is set; the single-step at the top of
+     * this handler re-protects it read-only). This runs before the runtime's own recovery below,
+     * which would give the page back without naming anybody. */
+    if ((code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR) && cpu_watch_count) {
         const EXCEPTION_RECORD *record=exception->ExceptionRecord;
         const int is_write=(record->NumberParameters>=2 && record->ExceptionInformation[0]==1);
         const uintptr_t at=(record->NumberParameters>=2)
                                ? (uintptr_t)record->ExceptionInformation[1] : 0;
-        const uintptr_t page=(uintptr_t)cpu_watch_page;
-        if (is_write && at>=page && at<page+4096) {
-            cpu_watch_note((uintptr_t)exception->ContextRecord->Rip,at);
+        for (int w=0;w<cpu_watch_count;++w) {
+            const uintptr_t page=(uintptr_t)cpu_watch[w].page;
+            if (!page || !is_write || at<page || at>=page+4096) continue;
+            cpu_watch_note((uintptr_t)exception->ContextRecord->Rip,at,&cpu_watch[w]);
             const long seen=atomic_fetch_add(&cpu_watch_storm,1)+1;
             if (seen>CPU_WATCH_STORM_LIMIT) {
                 /* Too many faults: leave the page writable for the rest of the run. */
@@ -2155,52 +2363,101 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
 /* BB_CPU_WATCH=<image offset>[:<length>] (diagnostics): the game's code that writes those bytes of
  * its image (data, bss). Their page is write-protected; a write anywhere in it is let through by
  * single-stepping that one instruction (the page is closed again after it); writes into the range
- * are logged with their code offset (the first 64). */
-static unsigned char *cpu_watch_page;
-static uintptr_t cpu_watch_lo, cpu_watch_hi;
-static _Atomic int cpu_watch_hits;
+ * are logged with their code offset (the first 64).
+ *
+ * BB_GUEST_WATCH=<guest address>[:<length>][;<guest address>...] watches a page of the guest's
+ * own memory the same way. The guest's address space is the host's, so a guest address is a host
+ * address and its page can be protected the same way. This is how the game's heap can be watched:
+ * the address of the block that was corrupted is not known before the run that corrupts it, but
+ * once a run has said where it was, the next run can watch exactly that place. The copies the
+ * runtime does on the game's behalf (memset, memcpy, memmove) are named as well
+ * (bb_cpu_copy_note), which catches the bulk of the writes without touching the protection. */
 #ifndef _WIN32
 static void cpu_watch_step(int sig, siginfo_t *info, void *context) {
     (void)sig; (void)info;
     ucontext_t *uc = context;
     uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
-    mprotect(cpu_watch_page, 4096, PROT_READ);
+    if (cpu_watch_open) mprotect((void *)cpu_watch_open, 4096, PROT_READ);
+    cpu_watch_open = 0;
 }
 #endif
 static void cpu_watch_install(void) {
-    const char *env = getenv("BB_CPU_WATCH");
-    if (!env || !*env) return;
-    char *end = NULL;
-    const unsigned long long at = strtoull(env, &end, 16);
-    const unsigned long long length = end && *end == ':' ? strtoull(end + 1, NULL, 0) : 4;
-    cpu_watch_lo = (uintptr_t)(image + at); cpu_watch_hi = cpu_watch_lo + length;
-    cpu_watch_page = image + (at & ~0xfffull);
-    { extern uintptr_t runtime_cpu_watch_lo, runtime_cpu_watch_hi; runtime_cpu_watch_lo = cpu_watch_lo; runtime_cpu_watch_hi = cpu_watch_hi; }
 #ifndef _WIN32
-    struct sigaction step = {0};
-    step.sa_sigaction = cpu_watch_step; step.sa_flags = SA_SIGINFO;
-    sigaction(SIGTRAP, &step, NULL);
+    { struct sigaction step = {0};
+      step.sa_sigaction = cpu_watch_step; step.sa_flags = SA_SIGINFO;
+      sigaction(SIGTRAP, &step, NULL); }
 #endif
-    platform_protect(cpu_watch_page, 4096, BB_PROT_READ);
-    printf("CPU watch: writes to image+%#llx (%llu bytes)\n", at, length);
+    /* BB_CPU_WATCH: an offset in the image. */
+    const char *env = getenv("BB_CPU_WATCH");
+    if (env && *env) {
+        char *end = NULL;
+        const unsigned long long at = strtoull(env, &end, 16);
+        const unsigned long long length = end && *end == ':' ? strtoull(end + 1, NULL, 0) : 4;
+        if (cpu_watch_count < CPU_WATCH_PAGES) {
+            CpuWatch *w = &cpu_watch[cpu_watch_count++];
+            w->page = image + (at & ~0xfffull);
+            w->lo = (uintptr_t)(image + at);
+            w->hi = w->lo + length;
+            w->is_guest = 0;
+            { extern uintptr_t runtime_cpu_watch_lo, runtime_cpu_watch_hi;
+              runtime_cpu_watch_lo = w->lo; runtime_cpu_watch_hi = w->hi; }
+            platform_protect(w->page, 4096, BB_PROT_READ);
+            printf("CPU watch: writes to image+%#llx (%llu bytes)\n", at, length);
+        }
+    }
+    /* BB_GUEST_WATCH: addresses in the guest's own memory (';' separates them). */
+    const char *guest = getenv("BB_GUEST_WATCH");
+    if (guest && *guest) {
+        char buffer[512];
+        snprintf(buffer,sizeof(buffer),"%s",guest);
+        char *cursor = buffer;
+        while (cursor && *cursor) {
+            char *sep = strchr(cursor, ';');
+            if (sep) *sep = 0;
+            char *end = NULL;
+            const unsigned long long at = strtoull(cursor, &end, 16);
+            const unsigned long long length = (end && *end == ':') ? strtoull(end + 1, NULL, 0) : 8;
+            if (at && cpu_watch_count < CPU_WATCH_PAGES) {
+                CpuWatch *w = &cpu_watch[cpu_watch_count++];
+                w->page = (unsigned char *)((uintptr_t)at & ~(uintptr_t)0xfffull);
+                w->lo = (uintptr_t)at;
+                w->hi = w->lo + length;
+                w->is_guest = 1;
+                { extern uintptr_t runtime_guest_watch_lo, runtime_guest_watch_hi;
+                  if (!runtime_guest_watch_lo || w->lo < runtime_guest_watch_lo) runtime_guest_watch_lo = w->lo;
+                  if (w->hi > runtime_guest_watch_hi) runtime_guest_watch_hi = w->hi; }
+                const int protected_ok = platform_protect(w->page, 4096, BB_PROT_READ);
+                printf("CPU watch: writes to guest+%#llx (%llu bytes), page %p %s\n",
+                       at, length, (void *)w->page, protected_ok ? "protected" : "NOT PROTECTED");
+            }
+            cursor = sep ? sep + 1 : NULL;
+        }
+    }
 }
 #ifndef _WIN32
 static void fault(int sig, siginfo_t *info, void *context) {
-    if (cpu_watch_page && sig == SIGSEGV && (unsigned char *)info->si_addr >= cpu_watch_page &&
-        (unsigned char *)info->si_addr < cpu_watch_page + 4096) {
-        ucontext_t *uc = context;
-        const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
-        const uintptr_t addr = (uintptr_t)info->si_addr;
-        if (addr + 64 > cpu_watch_lo && addr < cpu_watch_hi && cpu_watch_hits < 64) {
-            char line[160];
-            snprintf(line, sizeof(line), "CPU watch: write to image+%#lx from guest+%#lx\n",
-                     (unsigned long)(addr - (uintptr_t)image), (unsigned long)(rip - (uintptr_t)image));
-            { ssize_t w = write(1, line, strlen(line)); (void)w; }
-            ++cpu_watch_hits;
+    if (cpu_watch_count && sig == SIGSEGV) {
+        for (int w=0;w<cpu_watch_count;++w) {
+            const unsigned char *page = cpu_watch[w].page;
+            if (!page || (unsigned char *)info->si_addr < page ||
+                (unsigned char *)info->si_addr >= page + 4096) continue;
+            ucontext_t *uc = context;
+            const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+            const uintptr_t addr = (uintptr_t)info->si_addr;
+            if (addr + 64 > cpu_watch[w].lo && addr < cpu_watch[w].hi && cpu_watch_hits < 64) {
+                char line[160];
+                snprintf(line, sizeof(line), "CPU watch: write to %s+%#lx from guest+%#lx\n",
+                         cpu_watch[w].is_guest ? "guest" : "image",
+                         (unsigned long)(addr - (cpu_watch[w].is_guest ? 0 : (uintptr_t)image)),
+                         (unsigned long)(rip - (uintptr_t)image));
+                { ssize_t w2 = write(1, line, strlen(line)); (void)w2; }
+                ++cpu_watch_hits;
+            }
+            mprotect((void *)page, 4096, PROT_READ | PROT_WRITE);
+            cpu_watch_open = (uintptr_t)page;
+            uc->uc_mcontext.gregs[REG_EFL] |= 0x100;
+            return;
         }
-        mprotect(cpu_watch_page, 4096, PROT_READ | PROT_WRITE);
-        uc->uc_mcontext.gregs[REG_EFL] |= 0x100;
-        return;
     }
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
@@ -2890,6 +3147,7 @@ int main(int argc, char **argv) {
         }
     }
     image = allocate_image(size);
+    image_bytes = size;
     runtime_trace_set_image(image);
     { /* link_modules.py's unwind.txt beside the boot image: the modules' unwind tables */
         char unwind[4096];

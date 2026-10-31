@@ -63,9 +63,11 @@ BB_R1_WATCH=1 timeout 150 ./bb-probe.exe ../boot-linked.bin \
 |---|---|
 | `BB_R1_WATCH=1` | 每 20 ms 采样 R1 注册表状态（free_head / head.next / used / next_id），链断时打印节点内容。**本轮主线用它。** |
 | `BB_MEMORY_TRACE=1` | 直接内存的分配/释放写进 `memory.txt`（`A <phys> <size>` / `R <phys> <size>`） |
-| `BB_CPU_WATCH=<镜像偏移>[:<长度>]` | 把镜像某页设为只读，捕捉写它的那条指令（POSIX 路径） |
+| `BB_CPU_WATCH=<镜像偏移>[:<长度>]` | 把镜像某页设为只读，捕捉写它的那条指令 |
+| `BB_GUEST_WATCH=<guest 地址>[:<长度>][;<地址>…]` | 监视**任意 guest 地址**（不止镜像内）：把该页设为只读并点名写入者；同时接进运行时的 `memset/memcpy/memmove` 路径，落进该区间的拷贝会直接点名是哪段 guest 代码要求的 |
+| `BB_COPY_WATCH=<字节数>` | 点名 guest 的批量拷贝中**落到运行时不管辖的宿主内存**的那些（默认阈值 4096）。用来抓"guest 的数据写到了宿主的堆里" |
 | `BB_FILE_TRACE=1` | 文件读写打印 guest 调用点 |
-| `BB_FAULT_RECOVER=0` | 关掉访问违例自动恢复，让崩溃直接结束（便于取现场） |
+| `BB_FAULT_RECOVER=0` | 关掉访问违例自动恢复，让崩溃直接结束（便于取现场）。⚠️ **它会同时关掉专为 `guest+0x66b346` 加的恢复路径**，不设它才能看到恢复后的真正崩溃点 |
 | `BB_WAIT_TRACE=1` | 线程等待点 |
 
 ## 4. 最后一个崩溃：已经查清的部分

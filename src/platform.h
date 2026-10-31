@@ -251,6 +251,14 @@ int platform_random(void *buffer, size_t size);
 /* The host's CPU time used by this process and this thread, in nanoseconds. */
 void platform_cpu_times(uint64_t *process_ns, uint64_t *thread_ns);
 
+/* bbport: find the places in this process's memory that hold this 8-byte value (little endian).
+ * The guest's memory is the host's memory (the guest's address space is the host's), so a value
+ * that leaked from the host into the guest is found here. The number of hits is returned; their
+ * addresses are in hits[] (up to max_hits of them). The bytes looked at are in scanned.
+ * The search is bounded (a fixed budget of memory, the huge regions are skipped), so it is a
+ * diagnostic, not an exhaustive search. */
+int platform_scan_memory(uint64_t value, uintptr_t *hits, int max_hits, uint64_t *scanned);
+
 /* The path separator the host uses ('/' or '\\'). */
 #define platform_sep(path) ((path)[0] == '/' ? '/' : '\\')
 

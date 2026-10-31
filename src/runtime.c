@@ -197,11 +197,33 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
     exit(22);
 }
 /* BB_CPU_WATCH (probe.c): copies into the watched range name the game's code that asked for them.
-   A memset is the way a pool is erased, so the same watch is applied to it. */
+   A memset is the way a pool is erased, so the same watch is applied to it.
+   BB_GUEST_WATCH watches an address of the guest's own memory (its heap), which is a host
+   address too: the copies into it are named the same way.
+   BB_COPY_WATCH=<bytes>: name the guest's copies that land outside the guest's own memory
+   (the regions the runtime manages). A copy into memory the guest does not own is how the
+   game's data ends up beside the host's own. */
 uintptr_t runtime_cpu_watch_lo, runtime_cpu_watch_hi;
+uintptr_t runtime_guest_watch_lo, runtime_guest_watch_hi;
+static size_t copy_watch_min = 0;
+static int copy_watch_ready = 0;
 static void watch_copy(const char *what, const void *dst, size_t size, const void *caller) {
     const uintptr_t d=(uintptr_t)dst;
-    if (runtime_cpu_watch_hi && d<runtime_cpu_watch_hi && d+size>runtime_cpu_watch_lo)
+    const int in_image = runtime_cpu_watch_hi && d<runtime_cpu_watch_hi && d+size>runtime_cpu_watch_lo;
+    const int in_guest = runtime_guest_watch_hi && d<runtime_guest_watch_hi && d+size>runtime_guest_watch_lo;
+    if (in_image || in_guest) {
+        bb_cpu_copy_note(what,dst,size,caller);
+        return;
+    }
+    if (!copy_watch_ready) {
+        copy_watch_ready = 1;
+        const char *env = getenv("BB_COPY_WATCH");
+        if (env && *env) {
+            const unsigned long long at = strtoull(env, NULL, 0);
+            copy_watch_min = at ? (size_t)at : 4096;
+        }
+    }
+    if (copy_watch_min && size >= copy_watch_min && !runtime_memory_is_mapped(d, size))
         bb_cpu_copy_note(what,dst,size,caller);
 }
 static ABI void *guest_memset(void *dst, int value, size_t size) {

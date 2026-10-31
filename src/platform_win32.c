@@ -737,4 +737,43 @@ void platform_cpu_times(uint64_t *process_ns, uint64_t *thread_ns) {
     } else if (thread_ns) *thread_ns = 0;
 }
 
+/* bbport: the search for a value that leaked from the host into the guest's memory. The guest's
+ * memory is the host's memory, so every committed, readable region of this process is a place
+ * where the value could be. The budget keeps the crash report quick: the huge regions (the GPU
+ * library's, the image's) are skipped, because a leak into the guest's heap is in a small one. */
+int platform_scan_memory(uint64_t value, uintptr_t *hits, int max_hits, uint64_t *scanned) {
+    if (scanned) *scanned = 0;
+    if (!hits || max_hits <= 0) return 0;
+    unsigned char pattern[8];
+    memcpy(pattern, &value, sizeof(pattern));
+    int found = 0;
+    uint64_t budget = UINT64_C(1) << 30; /* 1 GiB is looked at */
+    uintptr_t address = 0;
+    const uintptr_t limit = (uintptr_t)0x00007FFFFFFF0000ull;
+    MEMORY_BASIC_INFORMATION info;
+    while (address < limit && budget > 0) {
+        if (VirtualQuery((const void *)address, &info, sizeof(info)) == 0) break;
+        const uintptr_t base = (uintptr_t)info.BaseAddress;
+        const uintptr_t end = base + (uintptr_t)info.RegionSize;
+        if (end <= address) break;
+        address = end;
+        if (info.State != MEM_COMMIT) continue;
+        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) continue;
+        const uintptr_t size = (uintptr_t)info.RegionSize;
+        if ((uint64_t)size > budget) continue; /* too big to be worth the time */
+        budget -= size;
+        if (scanned) *scanned += size;
+        const unsigned char *p = (const unsigned char *)base;
+        for (uintptr_t i = 0; i + sizeof(pattern) <= size; ++i) {
+            if (p[i] != pattern[0]) continue;
+            if (memcmp(p + i, pattern, sizeof(pattern)) != 0) continue;
+            if (found < max_hits) hits[found] = base + i;
+            ++found;
+            i += sizeof(pattern) - 1; /* a match cannot start inside itself */
+            if (found >= max_hits) return found;
+        }
+    }
+    return found;
+}
+
 #endif /* _WIN32 */

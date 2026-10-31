@@ -1800,6 +1800,25 @@ int runtime_memory_describe(uintptr_t address, char *buffer, size_t size) {
     read_unlock();
     return 1;
 }
+/* bbport: the guest's own memory regions, for the crash diagnostics: where a value that should
+ * not be there lives. The regions are the guest's address space, which is the host's, so their
+ * contents can be read directly (the physical address is given too: a region that is backed by
+ * the pool can be looked at in the pool's own view as well). */
+int runtime_memory_regions(uintptr_t *starts, uintptr_t *ends, uintptr_t *phys, int *kinds, int max) {
+    if (!starts || !ends || max <= 0) return 0;
+    int count=0;
+    read_lock();
+    for (size_t i=0;i<vma_count && count<max;++i) {
+        if (vmas[i].kind==KIND_RESERVED) continue;
+        starts[count]=vmas[i].start;
+        ends[count]=vmas[i].end;
+        if (phys) phys[count]=(uintptr_t)vmas[i].phys;
+        if (kinds) kinds[count]=vmas[i].kind;
+        ++count;
+    }
+    read_unlock();
+    return count;
+}
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
