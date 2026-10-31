@@ -69,6 +69,30 @@ static _Thread_local GuestThread *current;
 static _Thread_local int32_t guest_errno;
 static const unsigned char *tls_template;
 static uint64_t tls_filesz, tls_memsz, tls_align=16;
+/* bbport: the guest's static TLS (with its TCB) is one host block per guest thread. The crash
+ * report says when an address is inside one: the guest's thread-local variables live in the
+ * host's heap, so a pointer into one of them is a host address. */
+#define STATIC_TLS_BLOCKS 64
+static struct { uintptr_t base; uint64_t size; uint64_t memsz; } static_tls_blocks[STATIC_TLS_BLOCKS];
+static int static_tls_count;
+void runtime_note_static_tls(uintptr_t base, uint64_t size, uint64_t memsz) {
+    if (static_tls_count < STATIC_TLS_BLOCKS) {
+        static_tls_blocks[static_tls_count].base=base;
+        static_tls_blocks[static_tls_count].size=size;
+        static_tls_blocks[static_tls_count].memsz=memsz;
+        ++static_tls_count;
+    }
+}
+int runtime_static_tls_of(uintptr_t address, uint64_t *offset, uint64_t *size, uint64_t *memsz) {
+    for (int i=0;i<static_tls_count;++i)
+        if (address>=static_tls_blocks[i].base && address<static_tls_blocks[i].base+static_tls_blocks[i].size) {
+            if (offset) *offset=address-static_tls_blocks[i].base;
+            if (size) *size=static_tls_blocks[i].size;
+            if (memsz) *memsz=static_tls_blocks[i].memsz;
+            return 1;
+        }
+    return 0;
+}
 static size_t created, joined_count, exited;
 
 void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64_t align) {
@@ -105,6 +129,7 @@ static void attach(GuestThread *t) {
     tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
     t->tls_block=block; t->tcb=tcb;
+    runtime_note_static_tls((uintptr_t)block,(uint64_t)rounded,tls_memsz);
     set_gs(tcb);
     current=t;
 }
@@ -320,6 +345,12 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
     *out=t;
+    /* bbport: the CApplicationBase object's vtable/handler slot is overwritten with the image base
+     * (0x10000000) by a neighbour write. The object is a heap-allocated thread control block whose
+     * address we cannot predict, so we locate it by the "CApplicationBase" name string it keeps and
+     * watch its real page (not the thread's argument page, which is a different allocation). */
+    if (name && !strcmp(name,"CApplicationBase"))
+        runtime_watch_capplicationbase_tcb();
     int e=pthread_create(&t->host,&host,host_start,t);
     pthread_attr_destroy(&host);
     if (e) { fprintf(stderr,"STOP: host pthread_create failed: %d\n",e); exit(21); }

@@ -117,6 +117,22 @@ void runtime_wait_report(double frames);
 /* What the guest asked the direct memory for, by size (the game's pools, the library's heap). */
 void runtime_memory_buckets_report(void);
 void runtime_guest_call_sites(uint64_t out[3]);
+/* bbport: where a guest address lives: the guest's own regions, a thread's stack, a thread's
+ * static TLS (with its TCB), a module's dynamic TLS. The crash report says what a piece of the
+ * guest's memory is, which is what tells a stale pointer from a live one. */
+enum { BB_MEM_NONE=0, BB_MEM_STACK, BB_MEM_STATIC_TLS, BB_MEM_DYNAMIC_TLS };
+int runtime_guest_memory_of(uintptr_t address, int *kind, int *module, uint64_t *offset, uint64_t *size);
+int runtime_static_tls_of(uintptr_t address, uint64_t *offset, uint64_t *size, uint64_t *memsz);
+/* bbport: install a write watch on the page containing a guest address (the same trap the fault
+ * handler uses for BB_GUEST_WATCH), used to name the writer that corrupts the CApplicationBase
+ * object. The guest's address space is the host's, so a guest address is a host address. */
+void runtime_watch_guest_page(uintptr_t addr);
+/* bbport: locate the CApplicationBase thread control block by its embedded "CApplicationBase"
+ * name string (kept at offset -0x30 of the block, validated by the block's self-pointer at
+ * +0x28) and install a write watch on its page so the neighbour write that overwrites its
+ * vtable/handler slot with the image base (0x10000000) is named. Returns the block address
+ * (0 if not found). */
+uintptr_t runtime_watch_capplicationbase_tcb(void);
 /* bbport: where the guest's image is mapped (it is the guest's own memory, but not one of the
  * regions the runtime manages, so the diagnostics have to know about it separately). */
 extern uintptr_t runtime_image_base;

@@ -51,6 +51,20 @@ static uint64_t import_count;
  * calls through it is a NULL call, and the name of the symbol says which one. */
 static struct ImportSlot { uint64_t target; uint64_t name; uint64_t kind; } *import_slots;
 static uint64_t import_slot_count;
+/* bbport: the runtime's own host tables (the import lists, the image's segment and relocation
+ * tables). A guest address that lands in one of them says the game is using a piece of the
+ * runtime's memory as its own; the crash report names the table it is in. */
+typedef struct { const char *name; const void *base; size_t size; } HostTable;
+static HostTable host_tables[8];
+static int host_table_count;
+static void note_host_table(const char *name, const void *base, size_t size) {
+    if (host_table_count < (int)(sizeof(host_tables)/sizeof(host_tables[0]))) {
+        host_tables[host_table_count].name=name;
+        host_tables[host_table_count].base=base;
+        host_tables[host_table_count].size=size;
+        ++host_table_count;
+    }
+}
 static unsigned char *image;
 static uint64_t image_bytes;   /* the image's length (the crash diagnostics search in it) */
 static size_t page_size;
@@ -628,6 +642,30 @@ static void dump_null_jump_target(uint64_t rdi) {
     { char host[192]={0};
       describe_host_address((uintptr_t)rdi,host,sizeof(host));
       snprintf(line,sizeof(line),"  'this' is in %s\n",host);
+      platform_write_stdout(line,strlen(line)); }
+    /* Whose memory is it? The runtime's own host tables are the pieces of the host's memory the
+     * game could have been handed; a guest address inside one of them means the game is using
+     * a piece of the runtime's memory as its own. */
+    { const char *owner=NULL;
+      for (int i=0;i<host_table_count;++i) {
+          const uintptr_t b=(uintptr_t)host_tables[i].base;
+          if (!b || !host_tables[i].size) continue;
+          if (rdi>=b && rdi<b+host_tables[i].size) { owner=host_tables[i].name; break; }
+      }
+      snprintf(line,sizeof(line),"  'this' is in %s\n",
+               owner ? owner : "no table of the runtime's (its own memory)");
+      platform_write_stdout(line,strlen(line)); }
+    /* What kind of guest memory is it? The guest's thread-local variables live in the host's
+     * heap, so this says whether the object is one of them (and which module's). */
+    { int kind=0,module=-1; uint64_t off=0,sz=0;
+      if (runtime_guest_memory_of((uintptr_t)rdi,&kind,&module,&off,&sz)) {
+          static const char *const kinds[4]={"nothing","the thread's stack","the thread's static TLS",
+                                             "a module's dynamic TLS"};
+          snprintf(line,sizeof(line),"  'this' is in %s (module %d, offset %#llx of %#llx)\n",
+                   kinds[kind>=0&&kind<=3?kind:0],module,(unsigned long long)off,(unsigned long long)sz);
+      } else {
+          snprintf(line,sizeof(line),"  'this' is in no known guest memory (neither a stack nor TLS)\n");
+      }
       platform_write_stdout(line,strlen(line)); }
     /* Does one of the runtime's own blocks cover the object? (the import traps, the data traps,
      * the guest's main stack: the memory the game and the runtime share.) */
@@ -1994,6 +2032,11 @@ static volatile uintptr_t cpu_watch_open;   /* the page that was opened for one 
 static struct { uintptr_t rip, at; long count; } cpu_watch_sites[CPU_WATCH_SITES];
 static int cpu_watch_site_count;
 static _Atomic long cpu_watch_storm;
+/* bbport: the CApplicationBase TCB's vtable slot (offset 0 of the block) we watch; when a store
+ * lands there we capture it on the single-step and say whether it carried the image base. */
+static uintptr_t capp_tcb_vtable;     /* the TCB vtable slot address (0 if not watching) */
+static uintptr_t capp_capture_at;     /* a store hit the vtable slot; read it back on #DB */
+static uintptr_t capp_capture_rip;    /* rip of that store (from the access violation) */
 static void cpu_watch_note(uintptr_t rip, uintptr_t at, const CpuWatch *watch) {
     const long hits=atomic_fetch_add(&cpu_watch_hits,1)+1;
     int slot=-1;
@@ -2043,6 +2086,80 @@ static void cpu_watch_note(uintptr_t rip, uintptr_t at, const CpuWatch *watch) {
         if (n>0) platform_write_stdout(line,(size_t)n);
     }
 }
+/* bbport: a late-installed guest page watch. The CApplicationBase object's vtable/handler slot
+ * is overwritten with the image base (0x10000000) by a neighbour write that we cannot predict the
+ * address of ahead of time (it is a heap address that moves every run), so it is installed from
+ * the runtime the moment the thread that owns the object is created. The guest's address space is
+ * the host's, so a guest address is a host address; the vectored/posix fault handler already names
+ * writes to any cpu_watch page, letting exactly one store through and re-protecting on the single
+ * step, so this is the same path as BB_GUEST_WATCH. */
+void runtime_watch_guest_page(uintptr_t addr) {
+    if (!addr) return;
+    const uintptr_t page = addr & ~(uintptr_t)4095;
+    for (int i=0;i<cpu_watch_count;++i)
+        if ((uintptr_t)cpu_watch[i].page==page) return;  /* already watching this page */
+    if (cpu_watch_count >= CPU_WATCH_PAGES) return;
+    CpuWatch *w = &cpu_watch[cpu_watch_count++];
+    w->page = (unsigned char *)page;
+    w->lo = page; w->hi = page + 4096; w->is_guest = 1;
+    const int ok = platform_protect(w->page, 4096, BB_PROT_READ);
+    char line[200];
+    const int n = snprintf(line,sizeof(line),
+        "Runtime: watch installed on guest page %p (CApplicationBase object region); protected=%d\n",
+        (void *)page, ok);
+    if (n>0) platform_write_stdout(line,(size_t)n);
+}
+/* bbport: find the CApplicationBase thread control block. The game keeps the object's class name
+ * "CApplicationBase" as a 16-byte (null-terminated) string at offset -0x30 of the block; we scan
+ * host memory for it, reject the copies that live in the guest image (RTTI / literals), and accept
+ * the one whose block has a self-pointer at +0x28 (observed in every crash dump). The block's
+ * vtable slot is at offset 0; we note it so the cpu-watch can capture the store that overwrites
+ * it with the image base. Returns the block address, or 0 if it cannot be found yet. */
+uintptr_t runtime_watch_capplicationbase_tcb(void) {
+    const uint64_t first  = 0x6163696c70704143ull; /* little-endian "CApplicationB" */
+    const uint64_t second = 0x657361426e6f6974ull; /* little-endian "ase\0" tail   */
+    uintptr_t hits[16]; uint64_t scanned = 0;
+    const int n = platform_scan_memory(first, hits, 16, &scanned);
+    uintptr_t tcb = 0; int image_hits = 0, name_hits = 0;
+    for (int i = 0; i < n; ++i) {
+        const uintptr_t s = hits[i];
+        /* Skip the literal in the guest image (RTTI / string table): only the live, heap-
+         * allocated block counts, and its neighbours are host addresses, not image bytes. */
+        if ((uintptr_t)image && s >= (uintptr_t)image &&
+            s < (uintptr_t)image + runtime_image_bytes) { ++image_hits; continue; }
+        uint64_t w;
+        if (platform_read_memory((void *)(s + 8), &w, 8) != 0) continue;
+        if (w != second) continue;
+        ++name_hits;
+        const uintptr_t cand = s + 0x30;          /* block start: name is at -0x30 */
+        uint64_t self;
+        if (platform_read_memory((void *)(cand + 0x28), &self, 8) == 0 && self == cand) {
+            tcb = cand; break;                    /* self-pointer validates the block */
+        }
+        if (!tcb) tcb = cand;                      /* keep a name-validated fallback */
+    }
+    char line[256];
+    if (tcb) {
+        uint64_t vtable = 0;
+        platform_read_memory((void *)tcb, &vtable, 8);
+        capp_tcb_vtable = tcb;                     /* capture stores into this slot */
+        const int k = snprintf(line, sizeof(line),
+            "Runtime: CApplicationBase TCB @ %p (scanned %llu bytes, %d string hits, %d image/"
+            "%d name); vtable@0=%#llx%s\n",
+            (void *)tcb, (unsigned long long)scanned, n, image_hits, name_hits,
+            (unsigned long long)vtable,
+            (vtable==0x10000000ull) ? "  <== ALREADY corrupted at thread-create time" : "");
+        if (k>0) platform_write_stdout(line,(size_t)k);
+        runtime_watch_guest_page(tcb);
+    } else {
+        const int k = snprintf(line, sizeof(line),
+            "Runtime: CApplicationBase TCB string not found (scanned %llu bytes, %d hits, %d image/"
+            "%d name) - cannot watch the real object page\n",
+            (unsigned long long)scanned, n, image_hits, name_hits);
+        if (k>0) platform_write_stdout(line,(size_t)k);
+    }
+    return tcb;
+}
 static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
     const DWORD code = exception->ExceptionRecord->ExceptionCode;
     /* The pool's breakpoints (BB_POOL_WATCH=1): a write into the first node of the game's registry
@@ -2058,6 +2175,38 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
             cpu_watch_reprotect=0;
             { DWORD old=0;
               VirtualProtect((void *)pg,4096,PAGE_READONLY,&old); }
+            /* bbport: read back the store that hit the CApplicationBase TCB vtable slot and say
+             * if it carried the image base (the corruption that makes the vtable thunk jump to
+             * rip 0). The rip is the store's own address, from the access violation above. */
+            if (capp_capture_at) {
+                uint64_t v=0;
+                if (platform_read_memory((void *)capp_capture_at,&v,8)==0 && v==0x10000000ull) {
+                    char line[384];
+                    const int k=snprintf(line,sizeof(line),
+                        "CPU watch: *** CORRUPTING STORE of 0x10000000 into CApplicationBase TCB "
+                        "vtable slot %p by rip %p",
+                        (void *)capp_capture_at,(void *)capp_capture_rip);
+                    int m=k;
+                    if (capp_capture_rip>=(uintptr_t)image &&
+                        capp_capture_rip<(uintptr_t)image+0x20000000) {
+                        m+=snprintf(line+m,sizeof(line)-(size_t)m," (guest+%#llx)",
+                                    (unsigned long long)(capp_capture_rip-(uintptr_t)image));
+                    }
+                    { HMODULE where=NULL;
+                      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                             (LPCSTR)capp_capture_rip,&where)) {
+                          char path[MAX_PATH];
+                          const DWORD length=GetModuleFileNameA(where,path,sizeof(path));
+                          if (length && length<sizeof(path))
+                              m+=snprintf(line+m,sizeof(line)-(size_t)m," (in %s+%#llx)",path,
+                                          (unsigned long long)(capp_capture_rip-(uintptr_t)where));
+                      } }
+                    m+=snprintf(line+m,sizeof(line)-(size_t)m,"\n");
+                    if (m>0) platform_write_stdout(line,(size_t)m);
+                }
+                capp_capture_at=0;
+            }
             exception->ContextRecord->Dr6 &= ~0x4000u;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -2112,6 +2261,12 @@ static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
             const uintptr_t page=(uintptr_t)cpu_watch[w].page;
             if (!page || !is_write || at<page || at>=page+4096) continue;
             cpu_watch_note((uintptr_t)exception->ContextRecord->Rip,at,&cpu_watch[w]);
+            /* bbport: a store into the CApplicationBase TCB vtable slot: remember it so the
+             * single-step below can read the value back and name a corruption store. */
+            if (capp_tcb_vtable && at==capp_tcb_vtable) {
+                capp_capture_at = at;
+                capp_capture_rip = (uintptr_t)exception->ContextRecord->Rip;
+            }
             const long seen=atomic_fetch_add(&cpu_watch_storm,1)+1;
             if (seen>CPU_WATCH_STORM_LIMIT) {
                 /* Too many faults: leave the page writable for the rest of the run. */
@@ -3049,6 +3204,8 @@ int main(int argc, char **argv) {
     uint64_t *bindings=calloc(import_count ? import_count : 1,sizeof(*bindings));
     uint64_t *binding_kinds=calloc(import_count ? import_count : 1,sizeof(*binding_kinds));
     if (!bindings || !binding_kinds) fail("allocation failed");
+    note_host_table("the import addresses (bindings)",bindings,(size_t)import_count*sizeof(*bindings));
+    note_host_table("the import kinds",binding_kinds,(size_t)import_count*sizeof(*binding_kinds));
     if (multi) {
         /* BBPROBE5: procparam, eboot TLS, module table, bindings (link_modules.py). */
         procparam=read64(f);
@@ -3186,6 +3343,10 @@ int main(int argc, char **argv) {
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
     import_slots = calloc(nr ? nr : 1, sizeof(*import_slots));
     if (!import_slots) fail("allocation failed");
+    note_host_table("the import slots",import_slots,(size_t)(nr ? nr : 1)*sizeof(*import_slots));
+    note_host_table("the image segments",segments,(size_t)ns*sizeof(*segments));
+    note_host_table("the relocations",relocs,(size_t)nr*sizeof(*relocs));
+    note_host_table("the import names",names,(size_t)import_count*sizeof(*names));
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
         unsigned char *t = traps + i * 32;

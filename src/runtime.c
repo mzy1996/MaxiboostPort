@@ -1,6 +1,7 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
+#include "platform.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,52 @@ static _Atomic size_t memory_calls;
 #define TLS_MODULES 8
 static struct { const void *data; uint64_t filesz, memsz; } tls_modules[TLS_MODULES];
 static _Thread_local unsigned char *tls_blocks[TLS_MODULES];
+/* bbport: the modules' dynamic TLS blocks are host blocks too (one per thread and module), so a
+ * pointer into one of them is a host address. The crash report says when it happens. */
+#define DYN_TLS_BLOCKS 64
+static struct { uintptr_t base; uint64_t size; int module; } dyn_tls_blocks[DYN_TLS_BLOCKS];
+static int dyn_tls_count;
+static void note_dynamic_tls(uintptr_t base, uint64_t size, int module) {
+    for (int i=0;i<dyn_tls_count;++i)
+        if (dyn_tls_blocks[i].base==base && dyn_tls_blocks[i].module==module) return;
+    if (dyn_tls_count < DYN_TLS_BLOCKS) {
+        dyn_tls_blocks[dyn_tls_count].base=base;
+        dyn_tls_blocks[dyn_tls_count].size=size;
+        dyn_tls_blocks[dyn_tls_count].module=module;
+        ++dyn_tls_count;
+    }
+}
+/* bbport: what kind of memory an address is: the current thread's stack, a module's dynamic TLS,
+ * a thread's static TLS. The guest's address space is the host's, so the guest's thread-local
+ * variables live in the host's heap. */
+int runtime_guest_memory_of(uintptr_t address, int *kind, int *module, uint64_t *offset, uint64_t *size) {
+    if (kind) *kind=BB_MEM_NONE;
+    if (module) *module=-1;
+    void *low=NULL,*high=NULL;
+    platform_thread_stack(&low,&high);
+    if (low && high && address>=(uintptr_t)low && address<(uintptr_t)high) {
+        if (kind) *kind=BB_MEM_STACK;
+        if (offset) *offset=address-(uintptr_t)low;
+        if (size) *size=(uintptr_t)high-(uintptr_t)low;
+        return 1;
+    }
+    for (int i=0;i<dyn_tls_count;++i)
+        if (address>=dyn_tls_blocks[i].base && address<dyn_tls_blocks[i].base+dyn_tls_blocks[i].size) {
+            if (kind) *kind=BB_MEM_DYNAMIC_TLS;
+            if (module) *module=dyn_tls_blocks[i].module;
+            if (offset) *offset=address-dyn_tls_blocks[i].base;
+            if (size) *size=dyn_tls_blocks[i].size;
+            return 1;
+        }
+    uint64_t off=0,sz=0,memsz=0;
+    if (runtime_static_tls_of(address,&off,&sz,&memsz)) {
+        if (kind) *kind=BB_MEM_STATIC_TLS;
+        if (offset) *offset=off;
+        if (size) *size=sz;
+        return 1;
+    }
+    return 0;
+}
 static void *process_param;
 const unsigned char *runtime_libc_module;
 uint64_t runtime_libc_module_size;
@@ -78,6 +125,7 @@ static ABI void *guest_tls_get_addr(const uint64_t *index) {
         *block=calloc(1,tls_modules[index[0]].memsz);
         if (!*block) { fputs("Cannot allocate module TLS\n",stderr); exit(1); }
         memcpy(*block,tls_modules[index[0]].data,tls_modules[index[0]].filesz);
+        note_dynamic_tls((uintptr_t)*block,tls_modules[index[0]].memsz,(int)index[0]);
     }
     return *block+index[1];
 }
@@ -229,6 +277,10 @@ static void watch_copy(const char *what, const void *dst, size_t size, const voi
     /* The image is the guest's own memory too, but it is not one of the regions the runtime
      * manages (it is mapped at its fixed address), so it is excluded by hand. */
     if (runtime_image_bytes && d>=runtime_image_base && d<runtime_image_base+runtime_image_bytes) return;
+    /* The guest's thread stacks are the host's stacks (the guest's address space is the
+     * host's), so a copy into one of them is the guest's own doing. */
+    { int kind=0; uint64_t off=0,sz=0;
+      if (runtime_guest_memory_of(d,&kind,NULL,&off,&sz) && kind==BB_MEM_STACK) return; }
     if (!runtime_memory_is_mapped(d, size))
         bb_cpu_copy_note(what,dst,size,caller);
 }
