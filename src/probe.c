@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <cpuid.h>
 #include "runtime.h"
 #include "asm.h"
@@ -17,6 +19,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <wchar.h>
 #include <pthread.h>
 #include "runtime_tls.h"
 #else
@@ -115,6 +118,27 @@ static void *allocate(size_t size) {
     if (p == MAP_FAILED) fail("mmap failed");
 #endif
     return p;
+}
+/* The relink bakes vtable / function / static-data pointers as absolute
+ * 0x10000000+offset values (the PS4 eboot load base), and the game itself
+ * computes module-internal pointers as 0x10000000+offset. Both are only valid
+ * when the image is mapped at exactly that address, so pin it there instead of
+ * letting the OS choose a random (often >40-bit) address -- otherwise every
+ * 0x10000000-based pointer is wrong and CApplicationBase null-jumps (rip 0). */
+static void *allocate_image(size_t size) {
+    size = round_page(size);
+#ifdef _WIN32
+    void *p = VirtualAlloc((void *)0x10000000, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p) return p;
+#else
+    void *p = mmap((void *)0x10000000, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == (void *)0x10000000) return p;
+    if (p != MAP_FAILED) munmap(p, size);
+#endif
+    fprintf(stderr, "bb-probe: WARNING: could not reserve guest image at 0x10000000; "
+                    "0x10000000-based pointers will be invalid\n");
+    return allocate(size);
 }
 static void protect(void *p, size_t size, unsigned flags) {
 #ifdef _WIN32
@@ -377,8 +401,7 @@ static void dump_guest_stack(uint64_t rsp) {
  * points at the frame of its caller, and the return address of each frame is just above
  * it. This is the way to find the code that made a call the guest could not return from
  * (a call through a null pointer leaves no return address of its own on the stack). */
-static void dump_guest_frames(uint64_t rbp) {
-    if (!rbp) return;
+static void dump_guest_frames(uint64_t rbp) {    if (!rbp) return;
     char line[256];
     platform_write_stdout("  guest frames (rbp chain):\n", 24);
     for (int depth = 0; depth < 40; ++depth) {
@@ -399,6 +422,103 @@ static void dump_guest_frames(uint64_t rbp) {
         platform_write_stdout(line, strlen(line));
         if (!saved || saved == rbp) return;
         rbp = saved;
+    }
+}
+
+/* A wider scan of the guest stack than dump_guest_stack: the fatal call's return address may
+ * sit *below* rsp (a `ret`-to-0 pops it, a `jmp [null]`/`call [null]` leaves its caller's
+ * return address at [rsp-8]), and the 32 words above rsp miss it. Walk the whole stack mapping
+ * (bounded to a window around rsp so we do not scan a multi-GiB direct region) and print every
+ * qword that resolves to a guest module, tagging the one at rsp. */
+static void dump_guest_stack_wide(uint64_t rsp) {
+    if (!rsp) return;
+    char line[256];
+    snprintf(line, sizeof(line), "  guest stack wide scan (rsp %#llx):\n", (unsigned long long)rsp);
+    platform_write_stdout(line, strlen(line));
+    uint64_t mstart = 0, mend = 0;
+    char mapping[512];
+    if (platform_mapping_of((void *)(uintptr_t)rsp, mapping, sizeof(mapping)) && mapping[0])
+        sscanf(mapping, "%llx-%llx", &mstart, &mend);
+    if (!mstart) { mstart = rsp - 0x4000; mend = rsp + 0x200; }
+    /* Bound the scan to a window around rsp; a thread stack is at most a few MiB but the
+     * mapping may be a large region, so clamp to 0x20000 below / 0x8000 above. */
+    uint64_t lo = mstart;
+    if (rsp > lo + 0x20000) lo = rsp - 0x20000;
+    uint64_t hi = mend;
+    if (hi > rsp + 0x8000) hi = rsp + 0x8000;
+    const size_t n = (size_t)(hi - lo) / 8;
+    uint64_t *buf = (uint64_t *)malloc((n + 1) * sizeof(uint64_t));
+    if (!buf) { platform_write_stdout("    (no memory)\n", 15); return; }
+    if (platform_read_memory((void *)(uintptr_t)lo, buf, n * sizeof(uint64_t)) != 0) {
+        free(buf);
+        platform_write_stdout("    (unreadable)\n", 15);
+        return;
+    }
+    unsigned shown = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t addr = lo + (uint64_t)i * 8;
+        uint64_t v = buf[i];
+        uint64_t off = 0; const char *mod = NULL;
+        if (runtime_guest_address(v, &off, &mod) && mod) {
+            char tag[80];
+            snprintf(tag, sizeof(tag), "<%s+%#llx>", mod, (unsigned long long)off);
+            snprintf(line, sizeof(line), "    %#llx: %#llx %s%s\n",
+                     (unsigned long long)addr, (unsigned long long)v, tag,
+                     (addr == rsp) ? "  <== rsp" : "");
+            platform_write_stdout(line, strlen(line));
+            if (++shown >= 512) break;
+        }
+    }
+    free(buf);
+    if (!shown) platform_write_stdout("    (no guest addresses in window)\n", 33);
+}
+
+/* A null-jump that lands at rip=0 from a `jmp [rax+off]` / `call [rax+off]` vtable thunk: the
+ * target read was zero. The first argument (rdi) is `this`; read it to tell a null vtable
+ * pointer (object not constructed) from a null vtable slot (vtable present but empty). */
+static void dump_null_jump_target(uint64_t rdi) {
+    if (!rdi) return;
+    char line[256];
+    /* The 32 bytes *before* this (the wrapper's tail, if rdi is inside a std::function /
+     * job object) often tells the dispatch flavour: a raw CApplicationBase* has nothing
+     * interesting before it, a wrapper has the real object / executor table there. */
+    uint64_t pre[4];
+    if (platform_read_memory((void *)(uintptr_t)(rdi - 0x20), pre, sizeof(pre)) == 0) {
+        snprintf(line, sizeof(line),
+                 "  before 'this' (-0x20..-0x01): %#llx %#llx %#llx %#llx\n",
+                 (unsigned long long)pre[0], (unsigned long long)pre[1],
+                 (unsigned long long)pre[2], (unsigned long long)pre[3]);
+        platform_write_stdout(line, strlen(line));
+    }
+    uint64_t obj[4];
+    if (platform_read_memory((void *)(uintptr_t)rdi, obj, sizeof(obj)) != 0) {
+        snprintf(line, sizeof(line), "  (cannot read object at %#llx)\n", (unsigned long long)rdi);
+        platform_write_stdout(line, strlen(line));
+        return;
+    }
+    uint64_t off = 0; const char *mod = NULL;
+    char tag[80] = "";
+    if (runtime_guest_address(obj[0], &off, &mod) && mod)
+        snprintf(tag, sizeof(tag), "  <%s+%#llx>", mod, (unsigned long long)off);
+    snprintf(line, sizeof(line),
+             "  null-jump 'this' @ %#llx: vtable=%#llx%s  [+8]=%#llx  [+0x10]=%#llx  [+0x18]=%#llx\n",
+             (unsigned long long)rdi, (unsigned long long)obj[0], tag,
+             (unsigned long long)obj[1], (unsigned long long)obj[2], (unsigned long long)obj[3]);
+    platform_write_stdout(line, strlen(line));
+    const uint64_t vtable = obj[0];
+    if (vtable) {
+        uint64_t slot = 0;
+        if (platform_read_memory((void *)(uintptr_t)(vtable + 0x10), &slot, 8) == 0)
+            snprintf(line, sizeof(line), "  vtable+0x10 (the jumped slot) = %#llx%s\n",
+                     (unsigned long long)slot, slot ? "" : "  <== ZERO (this is the null jump)");
+        else
+            snprintf(line, sizeof(line), "  vtable+0x10 unreadable\n");
+        platform_write_stdout(line, strlen(line));
+    } else {
+        snprintf(line, sizeof(line),
+                 "  vtable pointer is ZERO -> object at %#llx was never constructed (vtable not set)\n",
+                 (unsigned long long)rdi);
+        platform_write_stdout(line, strlen(line));
     }
 }
 
@@ -472,13 +592,32 @@ static void report_fault(void *context, void *fault_address, int sig) {
              (unsigned long long)platform_context_register(&uc, 12), (unsigned long long)platform_context_register(&uc, 13),
              (unsigned long long)platform_context_register(&uc, 14), (unsigned long long)platform_context_register(&uc, 15));
     platform_write_stdout(line, strlen(line));
+    /* A jump to address zero: the first argument (rdi) is `this` for a vtable thunk, so read
+     * the object to say whether its vtable pointer is null or its vtable slot is. */
+    if (rip == 0)
+        dump_null_jump_target((uintptr_t)platform_context_register(&uc, 7));
     /* The guest call chain: how a leaf helper like the 0x66b280 node destructor got here,
      * and which indirect caller left the stale node pointer the destructor trips on. */
     {
         const uintptr_t grsp = (uintptr_t)platform_context_stack(&uc);
         const uintptr_t grbp = (uintptr_t)platform_context_frame(&uc);
+        /* The crashing thread's guest start PC: a null-pointer jump lands inside this
+         * thread's code, and the entry names the subsystem (CApplicationBase, &c.). */
+        {
+            const uintptr_t entry = runtime_thread_current_entry();
+            if (entry) {
+                uint64_t off = 0; const char *mod = NULL;
+                char tag[80] = "";
+                if (runtime_guest_address(entry, &off, &mod) && mod)
+                    snprintf(tag, sizeof(tag), "  <%s+%#llx>", mod, (unsigned long long)off);
+                snprintf(line, sizeof(line), "  thread guest entry PC = %#llx%s\n",
+                         (unsigned long long)entry, tag);
+                platform_write_stdout(line, strlen(line));
+            }
+        }
         dump_guest_stack((uint64_t)grsp);
         dump_guest_frames((uint64_t)grbp);
+        dump_guest_stack_wide((uint64_t)grsp);
     }
     /* Outside the image and any shared object (generated code, a freed mapping): the mapping
      * the address is in, and the thread. */
@@ -569,15 +708,1320 @@ static void report_fault(void *context, void *fault_address, int sig) {
     }
     _exit(128 + sig);
 }
+/* BB_CPU_WATCH / BB_POOL_WATCH (diagnostics): the copies the guest's own C library makes are
+ * HLE'd by the runtime, so a `memset` of a page of the game's heap never shows in the game's
+ * code: it is the runtime that does it, on the game's behalf. The runtime names the copy and
+ * hands the place that asked for it here; the place is a guest address of the game's code
+ * (the addresses of the guest are the host's own), so it is said the same way a fault is. */
+void bb_cpu_copy_note(const char *what, const void *destination, uint64_t size, const void *caller) {
+    const uintptr_t rip=(uintptr_t)caller;
+    char line[256];
+    int n=snprintf(line,sizeof(line),"CPU watch: %s of %llu bytes to %#llx from %#llx",
+                   what?what:"copy",(unsigned long long)size,(unsigned long long)(uintptr_t)destination,
+                   (unsigned long long)rip);
+    if (n<=0) return;
+    if (n>=(int)sizeof(line)) n=(int)sizeof(line)-1;
+    if (image && rip>=(uintptr_t)image && rip<(uintptr_t)image+0x20000000) {
+        const int m=snprintf(line+n,sizeof(line)-(size_t)n," (guest+%#llx)",
+                             (unsigned long long)(rip-(uintptr_t)image));
+        if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+    }
 #ifdef _WIN32
+    { HMODULE where=NULL;
+      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&where)) {
+          char path[MAX_PATH];
+          const DWORD length=GetModuleFileNameA(where,path,sizeof(path));
+          if (length && length<sizeof(path)) {
+              const int m=snprintf(line+n,sizeof(line)-(size_t)n," (in %s+%#llx)",path,
+                                   (unsigned long long)(rip-(uintptr_t)where));
+              if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+          }
+      } }
+    { const int m=snprintf(line+n,sizeof(line)-(size_t)n," thread %lu\n",
+                           (unsigned long)GetCurrentThreadId());
+      if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1; }
+#endif
+    if (n>0) platform_write_stdout(line,(size_t)n);
+}
+#ifdef _WIN32
+/* BB_POOL_WATCH=1 (diagnostics): the registry's node pool is watched for writes, so the place
+ * that erases it is named. The pool is the game's own operator-new block (its base is held by the
+ * image at 0x161d080); the free list of the registry is threaded through the nodes in it, and a
+ * node whose memory is zeroed breaks the list: the register function then hands out ids without
+ * ever putting a node in the table, every lookup of one of them finds nothing, and the game calls
+ * a symbol that resolved to NULL (rip 0).
+ *
+ * The earlier watch - a guard page on the pool's first page - never fired, and the pool was all
+ * zeros by the time it was armed: the pool's page is read constantly (every lookup reads a node),
+ * and Windows takes a guard away when it fires whatever the access was, so the reads consumed the
+ * guard before any write arrived. Nothing is watched through page protection now:
+ *   - the four words of the pool's first node (the pool's base is the node's first word) are
+ *     watched by the processor's own breakpoints (Dr0..Dr3: write, eight bytes each), carried by
+ *     every thread of the process: a write through any name of those bytes is caught, and the
+ *     place that wrote it (guest offset, module, thread) is said;
+ *   - the runtime names the copies its HLE'd C library makes into the pool's page (a `memset` by
+ *     the game's own libc does not appear in the game's code at all: the runtime does it for the
+ *     game), handing over the place of the game that asked for it;
+ *   - the node's words are read every five milliseconds and every change is said, with the number
+ *     of writes seen, so the moment the chain is erased is dated;
+ *   - the runtime's mapping operations touching the pool's bytes are named (the WATCH lines of
+ *     runtime_memory.c), and the other names those bytes are mapped at are listed: the breakpoints
+ *     do not care about pages, so a write through another name is caught all the same.
+ * A pool that goes to zero with no write, no copy and no mapping operation seen was not written at
+ * all: the pages behind it were replaced or discarded by the host. */
+static volatile uintptr_t pool_watch_base; /* the pool: its base is the first node */
+static volatile uintptr_t pool_watch_page;
+static volatile LONG pool_watch_lock;
+static _Atomic long pool_watch_writes;
+static _Atomic int pool_watch_lines;
+static _Atomic int pool_watch_threads;
+#define POOL_WATCH_PLACES 24
+typedef struct { uintptr_t rip, at; long count; } PoolWatchPlace;
+static PoolWatchPlace pool_watch_places[POOL_WATCH_PLACES];
+static int pool_watch_place_count;
+/* The pool's base through the host's own view of the same bytes (the runtime's second name of the
+ * physical memory), and the protection of both names, asked about in every round: a write into a
+ * page that something else has silently made writable again (the GPU library protects the pages it
+ * writes, and both libraries protect their own code) does not fault at all, so the read-only trap
+ * never sees it and the watch goes on believing the trap is armed. See pool_watch_prot_poll. */
+static uintptr_t pool_watch_host_base;
+/* The physical address of the pool's page (the section offset the guest's name of it begins at): a
+ * third name of the same bytes carries the pool's page at that offset inside itself when it begins
+ * at the section's beginning, and at its own beginning when it begins at the page. */
+static uintptr_t pool_watch_phys;
+typedef struct { uintptr_t address; unsigned mask; int seen; } PoolWatchProt;
+static PoolWatchProt pool_watch_prot_guest, pool_watch_prot_host;
+static uint64_t pool_watch_started_ms;
+
+/* The pool's page is also watched with the processor's own page protection, and this is what
+ * catches a writer the breakpoints cannot: a write from a thread that was never adopted, or a
+ * write through the host's second view of the same bytes. The page is made read-only, so a write
+ * is an access violation (a read is not - this is why the guard page failed: the guard is taken
+ * away by the first access, read or write, and the pool is read constantly). The violation names
+ * the writer; the runtime's own recovery then gives the page back, and the watch arms it again. */
+static volatile LONG pool_trap_lock;
+static _Atomic int pool_trap_on;
+static _Atomic long pool_trap_arms;
+static _Atomic long pool_trap_hits;
+#define POOL_TRAP_SITES 24
+typedef struct { uintptr_t rip, at; long count; } PoolTrapSite;
+static PoolTrapSite pool_trap_sites[POOL_TRAP_SITES];
+static int pool_trap_site_count;
+
+/* The page is made read-only; the guest's own protection of it allows the write, so the runtime's
+ * recovery puts the protection back after the writer has been named. */
+static int pool_trap_arm(void) {
+    if (!pool_watch_page) return 0;
+    DWORD old=0;
+    if (!VirtualProtect((void *)(uintptr_t)pool_watch_page,4096,PAGE_READONLY,&old)) return 0;
+    atomic_store(&pool_trap_on,1);
+    atomic_fetch_add(&pool_trap_arms,1);
+    return 1;
+}
+
+/* The same page protection is put on the host's own view of those bytes (the runtime's second
+ * name for the same physical memory), because a store through that name is a store the guest's
+ * page protection and the breakpoints do not see at all: the guest's name of the bytes is a
+ * different view, so the fault never happens there, and the linear address the breakpoints watch
+ * is never stored to. Everything the GPU side keeps in host memory is written through this view. */
+static volatile uintptr_t pool_trap_backing_page;
+static _Atomic int pool_trap_backing_on;
+static _Atomic long pool_trap_backing_hits;
+static PoolTrapSite pool_trap_backing_sites[POOL_TRAP_SITES];
+static int pool_trap_backing_site_count;
+
+/* When a write faults on a pool page we let exactly one store through: the page is made writable
+ * and the faulting thread's Trap Flag is set, so that after the store the processor takes a
+ * single-step fault (#DB), in which we re-protect the page read-only and re-arm the trap. This
+ * closes the disarm window the old code left - it made the page permanently writable until the
+ * pool-watch thread swept the address space (~100 ms later), during which the zeroing slipped by
+ * with no write named. pool_trap_on / pool_trap_backing_on stay 1 across the one-instruction
+ * window, so the watch thread never races to re-protect underneath us. */
+static volatile uintptr_t pool_trap_reprotect_guest;
+static volatile uintptr_t pool_trap_reprotect_backing;
+/* Safety: if a pool page faults an unreasonable number of times (a tight write loop rather than
+ * the occasional allocator store), the single-step re-protect would cost too much and could stall
+ * the game before the zeroing is ever reached. Past the threshold we fall back to the old
+ * disarm-and-let-the-watch-thread-re-arm behaviour for the rest of the run. */
+static _Atomic long pool_trap_storm;
+#define POOL_TRAP_STORM_LIMIT 4000000L
+
+static void pool_watch_enter(void);
+static void pool_watch_leave(void);
+
+static int pool_trap_arm_backing(void) {
+    if (!pool_trap_backing_page) return 0;
+    DWORD old=0;
+    if (!VirtualProtect((void *)(uintptr_t)pool_trap_backing_page,4096,PAGE_READONLY,&old)) return 0;
+    atomic_store(&pool_trap_backing_on,1);
+    atomic_fetch_add(&pool_trap_arms,1);
+    return 1;
+}
+/* The place that wrote through the host's view: named once, then counted. */
+static void pool_trap_backing_note(uintptr_t rip, uintptr_t at) {
+    const long hits=atomic_fetch_add(&pool_trap_backing_hits,1)+1;
+    pool_watch_enter();
+    int slot=-1;
+    for (int i=0;i<pool_trap_backing_site_count;++i)
+        if (pool_trap_backing_sites[i].rip==rip) { ++pool_trap_backing_sites[i].count; slot=i; break; }
+    if (slot<0 && pool_trap_backing_site_count<POOL_TRAP_SITES) {
+        slot=pool_trap_backing_site_count++;
+        pool_trap_backing_sites[slot].rip=rip; pool_trap_backing_sites[slot].at=at;
+        pool_trap_backing_sites[slot].count=1;
+    }
+    if (slot>=0 && pool_trap_backing_sites[slot].count==1) {
+        char line[320];
+        int n=snprintf(line,sizeof(line),
+                       "Pool trap: a write into the host's view of the pool+%#llx from rip %#llx",
+                       (unsigned long long)(at-(uintptr_t)pool_trap_backing_page),
+                       (unsigned long long)rip);
+        if (n<=0) n=0;
+        if (n>=(int)sizeof(line)) n=(int)sizeof(line)-1;
+        { HMODULE where=NULL;
+          if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&where)) {
+              char path[MAX_PATH];
+              const DWORD length=GetModuleFileNameA(where,path,sizeof(path));
+              if (length && length<sizeof(path)) {
+                  const int m=snprintf(line+n,sizeof(line)-(size_t)n," (in %s+%#llx)",path,
+                                       (unsigned long long)(rip-(uintptr_t)where));
+                  if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+              }
+          } }
+        { const int m=snprintf(line+n,sizeof(line)-(size_t)n," thread %lu hit %ld\n",
+                               (unsigned long)GetCurrentThreadId(),hits);
+          if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1; }
+        if (n>0) platform_write_stdout(line,(size_t)n);
+    }
+    pool_watch_leave();
+}
+
+static void pool_watch_enter(void) {
+    while (InterlockedCompareExchange(&pool_watch_lock,1,0)) Sleep(0);
+}
+static void pool_watch_leave(void) { InterlockedExchange(&pool_watch_lock,0); }
+static void pool_watch_say(const char *format, ...) {
+    if (atomic_load(&pool_watch_lines)>=2048) return;
+    char text[256];
+    va_list arguments;
+    va_start(arguments,format);
+    int n=vsnprintf(text,sizeof(text),format,arguments);
+    va_end(arguments);
+    if (n<=0) return;
+    if (n>=(int)sizeof(text)) n=(int)sizeof(text)-1;
+    atomic_fetch_add(&pool_watch_lines,1);
+    platform_write_stdout(text,(size_t)n);
+}
+/* BB_POOL_WATCH (diagnostics): four words of the pool's bytes, read through one of the names they
+ * have (the guest's address, or the host's own view of the same physical memory). The same words
+ * coming out of both names is the same memory; a change in one name while the other still says the
+ * old words means the mapping behind that name was replaced, not written. */
+static void pool_watch_words_say(const char *what, uintptr_t address) {
+    if (!address) return;
+    uint64_t words[4]={0,0,0,0};
+    if (platform_read_memory((void *)address,words,sizeof(words)))
+        pool_watch_say("Pool watch: %s %#llx: not readable\n",what,(unsigned long long)address);
+    else
+        pool_watch_say("Pool watch: %s %#llx: %#llx %#llx %#llx %#llx\n",what,
+                       (unsigned long long)address,(unsigned long long)words[0],
+                       (unsigned long long)words[1],(unsigned long long)words[2],
+                       (unsigned long long)words[3]);
+}
+/* BB_POOL_WATCH (diagnostics): the state, the protection and the type of one name of the pool's
+ * page, asked about in every round and said whenever any of them changes. The read-only trap holds
+ * only for as long as nothing else flips the page back: a library that protects a page before it
+ * writes it, or a host call that does, takes the trap away without ever telling this watch, and the
+ * write then arrives on a writable page with the trap still believing it is armed. */
+static void pool_watch_prot_poll(const char *what, PoolWatchProt *watched) {
+    if (!watched->address) return;
+    MEMORY_BASIC_INFORMATION info;
+    if (VirtualQuery((void *)watched->address,&info,sizeof(info))!=sizeof(info)) {
+        if (watched->seen!=2) {
+            watched->seen=2;
+            pool_watch_say("Pool watch: the %s page %#llx cannot be asked about\n",what,
+                           (unsigned long long)watched->address);
+        }
+        return;
+    }
+    const unsigned mask=((unsigned)(info.State&0xfff))|((unsigned)(info.Protect&0xffff)<<12)|
+                        ((unsigned)(info.Type&0xffff)<<28);
+    if (watched->seen==1 && mask==watched->mask) return;
+    const unsigned was=watched->mask;
+    watched->mask=mask; watched->seen=1;
+    pool_watch_say("Pool watch: the %s page %#llx is state %#x protect %#x type %#x alloc %#x "
+                   "(before %#x) at +%llu ms\n",what,(unsigned long long)watched->address,
+                   (unsigned)info.State,(unsigned)info.Protect,(unsigned)info.Type,
+                   (unsigned)info.AllocationProtect,was,
+                   (unsigned long long)(GetTickCount64()-(unsigned long long)pool_watch_started_ms));
+}
+/* BB_POOL_WATCH (diagnostics): every other name the pool's bytes are mapped at, and the exact
+ * shape of the erasure. The runtime maps the pool's section once for the guest (at the address the
+ * game asked for) and keeps one view of its own (the "second name" this watch protects). A mapping
+ * the runtime makes at an address the host picks itself - runtime_memory.c's map_phys falls back to
+ * one when the address the game asked for is already taken, which is what happens when the same
+ * range is mapped twice - is a third view of the very same physical bytes, and a store through it
+ * reaches the pool without touching either name this watch holds: a different view has a page
+ * protection of its own, and the processor's breakpoints watch linear addresses, not physical ones.
+ * A store through such a view is exactly what "the words changed while their page was read-only,
+ * with no write seen" means. The views are found by their content, not by their name (a
+ * pagefile-backed section has none: see pool_watch_sweep_views), and the pool's page inside a view
+ * is recognised by the page's own four words: the same four words do not occur by chance. The page
+ * inside such a view is made read-only as soon as it is found, so the write through it is an access
+ * violation that names the writer, exactly like the other two. */
+#define POOL_EXTRA_VIEWS 8
+typedef struct { uintptr_t base, size, page; } PoolExtraView;
+static PoolExtraView pool_extra_views[POOL_EXTRA_VIEWS];
+static _Atomic int pool_extra_count;
+static _Atomic long pool_extra_hits;
+static PoolTrapSite pool_extra_sites[POOL_TRAP_SITES];
+static int pool_extra_site_count;
+static uint64_t pool_extra_mark[4];       /* the first node's words as they were published */
+static uint64_t pool_watch_snapshot[512]; /* the pool's first page as it was published */
+
+static uint64_t pool_extra_view_size(uintptr_t base) {
+    uint64_t size=0;
+    for (int guard=0;guard<8192;++guard) {
+        MEMORY_BASIC_INFORMATION part;
+        if (VirtualQuery((void *)(base+size),&part,sizeof(part))!=sizeof(part)) break;
+        if (!part.RegionSize || (uintptr_t)part.AllocationBase!=base) break;
+        size+=part.RegionSize;
+    }
+    return size;
+}
+/* The place that wrote through a third view of the pool's bytes: named once, then counted. */
+static void pool_extra_note(uintptr_t rip, uintptr_t at, uintptr_t page) {
+    const long hits=atomic_fetch_add(&pool_extra_hits,1)+1;
+    pool_watch_enter();
+    int slot=-1;
+    for (int i=0;i<pool_extra_site_count;++i)
+        if (pool_extra_sites[i].rip==rip) { ++pool_extra_sites[i].count; slot=i; break; }
+    if (slot<0 && pool_extra_site_count<POOL_TRAP_SITES) {
+        slot=pool_extra_site_count++;
+        pool_extra_sites[slot].rip=rip; pool_extra_sites[slot].at=at;
+        pool_extra_sites[slot].count=1;
+    }
+    if (slot>=0 && pool_extra_sites[slot].count==1) {
+        char line[320];
+        int n=snprintf(line,sizeof(line),"Pool trap: a write into ANOTHER name of the pool (%#llx of "
+                                       "%#llx) from rip %#llx",
+                       (unsigned long long)at,(unsigned long long)page,(unsigned long long)rip);
+        if (n<=0) n=0;
+        if (n>=(int)sizeof(line)) n=(int)sizeof(line)-1;
+        if (image && rip>=(uintptr_t)image && rip<(uintptr_t)image+0x20000000) {
+            const int m=snprintf(line+n,sizeof(line)-(size_t)n," (guest+%#llx)",
+                                 (unsigned long long)(rip-(uintptr_t)image));
+            if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+        }
+        { HMODULE where=NULL;
+          if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&where)) {
+              char path[MAX_PATH];
+              const DWORD length=GetModuleFileNameA(where,path,sizeof(path));
+              if (length && length<sizeof(path)) {
+                  const int m=snprintf(line+n,sizeof(line)-(size_t)n," (in %s+%#llx)",path,
+                                       (unsigned long long)(rip-(uintptr_t)where));
+                  if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+              }
+          } }
+        { const int m=snprintf(line+n,sizeof(line)-(size_t)n," thread %lu hit %ld\n",
+                               (unsigned long)GetCurrentThreadId(),hits);
+          if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1; }
+        if (n>0) platform_write_stdout(line,(size_t)n);
+    }
+    pool_watch_leave();
+}
+/* Does this name of some bytes hold the pool's page? The page is recognised by its own first four
+ * words, which no other mapped range of the process has by chance: the words the page holds now (a
+ * name made after the store), or the words it held when they were published (a name made before
+ * it). Four words of that shape, eight-byte for eight-byte, are the mark. */
+static int pool_extra_page_here(uintptr_t where) {
+    uint64_t live[4], seen[4];
+    if (!pool_watch_page || !where) return 0;
+    if (platform_read_memory((void *)(uintptr_t)pool_watch_page,live,sizeof(live))) return 0;
+    if (platform_read_memory((void *)where,seen,sizeof(seen))) return 0;
+    if (!memcmp(seen,live,sizeof(live))) return (seen[0]|seen[1]|seen[2]|seen[3])!=0;
+    return !memcmp(seen,pool_extra_mark,sizeof(pool_extra_mark));
+}
+/* Every other name of the pool's bytes. The views are found by content, not by name: the port's
+ * sections are made with CreateFileMappingW(INVALID_HANDLE_VALUE,...), a pagefile-backed section
+ * that has no name at all, so GetMappedFileNameW says nothing about them - it answered for the
+ * images of the loaded libraries and for none of the port's own views, which is why the earlier
+ * sweep, asking it for "bb-guest-memory", never found a view and never found a third one.
+ *
+ * A view of the pool's bytes holds the pool's page: at the beginning of the view when the view
+ * begins at the page (a mapping of the pool's own range), or at the offset the page lies at inside
+ * the section when the view begins at the section's beginning. Both are looked for, and the page
+ * inside such a view is made read-only as soon as it is found, so a write through it is an access
+ * violation that names the writer, exactly like the other two names. */
+static void pool_watch_sweep_views(void) {
+    static uintptr_t said[24];
+    static int said_count, names_reported;
+    static int sweeps_entered;
+    unsigned char *at=(unsigned char *)(uintptr_t)0x10000;
+    unsigned looked=0, candidates=0;
+    const int report_names=!names_reported;
+    /* The walk is long and the watch's first round cannot begin until it ends: its entry and its
+     * leaving are said, rate-limited to the first few walks, so that a walk that never leaves (the
+     * earlier runs showed the loop's first round never came) is told apart from a walk that simply
+     * found nothing. */
+    ++sweeps_entered;
+    if (sweeps_entered<=6)
+        pool_watch_say("Pool watch: sweep: entered (walk %d), looking through the address space\n",
+                       sweeps_entered);
+    for (;;) {
+        MEMORY_BASIC_INFORMATION info;
+        if (VirtualQuery(at,&info,sizeof(info))!=sizeof(info)) break;
+        if (!info.RegionSize || !info.BaseAddress) break;
+        unsigned char *next=(unsigned char *)info.BaseAddress+info.RegionSize;
+        if (next<=(unsigned char *)info.BaseAddress) break;
+        if (info.State==MEM_COMMIT && info.Type==MEM_MAPPED && info.AllocationBase &&
+            (uintptr_t)info.BaseAddress==(uintptr_t)info.AllocationBase) {
+            ++looked;
+            const uintptr_t alloc=(uintptr_t)info.AllocationBase;
+            const uint64_t size=pool_extra_view_size(alloc);
+            const int guest_name=(uintptr_t)pool_watch_page>=alloc &&
+                                 (uintptr_t)pool_watch_page<alloc+size;
+            const int host_name=(uintptr_t)pool_trap_backing_page>=alloc &&
+                                (uintptr_t)pool_trap_backing_page<alloc+size;
+            if (report_names) {
+                wchar_t name[256];
+                const DWORD n=GetMappedFileNameW(GetCurrentProcess(),info.AllocationBase,name,
+                                                 (DWORD)(sizeof(name)/sizeof(name[0])));
+                if (n) {
+                    DWORD i;
+                    int ours=0;
+                    for (i=0;i<n;++i) if (name[i]=='b' && i+1<n && name[i+1]=='b') { ours=1; break; }
+                    if (ours && said_count<24) {
+                        int already=0;
+                        for (int j=0;j<said_count;++j) if (said[j]==alloc) { already=1; break; }
+                        if (!already) {
+                            char plain[256];
+                            said[said_count++]=alloc;
+                            for (i=0;i<n && i<sizeof(plain)-1;++i)
+                                plain[i]=(char)((name[i]>32 && name[i]<127) ? name[i] : '?');
+                            plain[i]=0;
+                            pool_watch_say("Pool watch: the mapped range at %#llx is backed by %s\n",
+                                           (unsigned long long)alloc,plain);
+                        }
+                    }
+                }
+            }
+            if (guest_name || host_name) continue;   /* the two names the watch already holds */
+            ++candidates;
+            {
+                uintptr_t where=0;
+                uint64_t offsets[4];
+                unsigned count=1;
+                offsets[0]=0;
+                if (pool_watch_phys) {
+                    offsets[1]=pool_watch_phys;
+                    offsets[2]=pool_watch_phys+(uintptr_t)(pool_watch_base-pool_watch_page);
+                    offsets[3]=(uintptr_t)(pool_watch_base-pool_watch_page);
+                    count=4;
+                }
+                for (unsigned k=0;k<count && !where;++k)
+                    if (offsets[k]+0x40<=size && pool_extra_page_here(alloc+(uintptr_t)offsets[k]))
+                        where=alloc+(uintptr_t)offsets[k];
+                if (where) {
+                    int known=0;
+                    for (int j=0;j<atomic_load(&pool_extra_count);++j)
+                        if (pool_extra_views[j].base==alloc) {
+                            known=1; pool_extra_views[j].page=where; break;
+                        }
+                    if (!known) {
+                        const int count2=atomic_load(&pool_extra_count);
+                        if (count2<POOL_EXTRA_VIEWS) {
+                            pool_extra_views[count2].base=alloc;
+                            pool_extra_views[count2].size=size;
+                            pool_extra_views[count2].page=where;
+                            atomic_store(&pool_extra_count,count2+1);
+                        }
+                        pool_watch_say("Pool watch: ANOTHER name of the pool's bytes is %#llx+%#llx "
+                                       "(the guest's name is %#llx, the host's is %#llx); the pool's "
+                                       "page inside it is %#llx, read-only now: a write through it "
+                                       "will be named\n",
+                                       (unsigned long long)alloc,(unsigned long long)size,
+                                       (unsigned long long)pool_watch_page,
+                                       (unsigned long long)pool_trap_backing_page,
+                                       (unsigned long long)where);
+                    }
+                    { DWORD old=0;
+                      VirtualProtect((void *)where,0x4000,PAGE_READONLY,&old); }
+                }
+            }
+        }
+        if (looked && (looked%4096)==0 && sweeps_entered<=2)
+            pool_watch_say("Pool watch: sweep: %u mapped ranges looked through so far, at %#llx\n",
+                           looked,(unsigned long long)at);
+        at=next;
+    }
+    names_reported=1;
+    if (sweeps_entered<=6)
+        pool_watch_say("Pool watch: sweep: left after %u mapped ranges\n",looked);
+    pool_watch_say("Pool watch: the address space was looked through (%u mapped ranges, %u other "
+                   "names, %d names of the pool's bytes known)\n",
+                   looked,candidates,atomic_load(&pool_extra_count));
+}
+/* The place that wrote into the pool: named once, then counted. The breakpoint fires after the
+ * store, so the place said is the instruction after the one that wrote (the store itself is the
+ * instruction that ends just before it). The name says which of the two names of the bytes was
+ * stored through, and the offset is counted from that name's own first byte. */
+static void pool_watch_say_write(uintptr_t rip, uintptr_t at, uintptr_t origin, const char *name) {
+    pool_watch_enter();
+    atomic_fetch_add(&pool_watch_writes,1);
+    int slot=-1;
+    for (int i=0;i<pool_watch_place_count;++i)
+        if (pool_watch_places[i].rip==rip) { ++pool_watch_places[i].count; slot=i; break; }
+    if (slot<0 && pool_watch_place_count<POOL_WATCH_PLACES) {
+        slot=pool_watch_place_count++;
+        pool_watch_places[slot].rip=rip; pool_watch_places[slot].at=at;
+        pool_watch_places[slot].count=1;
+    }
+    if (slot>=0 && pool_watch_places[slot].count==1 && atomic_fetch_add(&pool_watch_lines,1)<512) {
+        char line[256];
+        int n=snprintf(line,sizeof(line),"Pool watch: write into the pool+%#llx through the %s name "
+                                       "from rip %#llx",
+                       (unsigned long long)(at-origin),name,(unsigned long long)rip);
+        if (n<=0) n=0;
+        if (n>=(int)sizeof(line)) n=(int)sizeof(line)-1;
+        if (image && rip>=(uintptr_t)image && rip<(uintptr_t)image+0x20000000) {
+            const int m=snprintf(line+n,sizeof(line)-(size_t)n," (guest+%#llx)",
+                                 (unsigned long long)(rip-(uintptr_t)image));
+            if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+        }
+        { HMODULE where=NULL;
+          if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&where)) {
+              char path[MAX_PATH];
+              const DWORD length=GetModuleFileNameA(where,path,sizeof(path));
+              if (length && length<sizeof(path)) {
+                  const int m=snprintf(line+n,sizeof(line)-(size_t)n," (in %s+%#llx)",path,
+                                       (unsigned long long)(rip-(uintptr_t)where));
+                  if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+              }
+          } }
+        { const int m=snprintf(line+n,sizeof(line)-(size_t)n," thread %lu\n",
+                               (unsigned long)GetCurrentThreadId());
+          if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1; }
+        if (n>0) platform_write_stdout(line,(size_t)n);
+        /* bbport: also name the guest call chain that led to this store, so a write through the
+         * host's backing view is traced back to the guest function that asked for it. The VEH runs
+         * on the faulting thread, so runtime_guest_call_sites reads its guest context. */
+        uint64_t gs[3]={0,0,0};
+        runtime_guest_call_sites(gs);
+        if (gs[0]||gs[1]||gs[2]) {
+            char g[256];
+            const int gn=snprintf(g,sizeof g,"  host-write guest frames: +%#llx < +%#llx < +%#llx\n",
+                                 (unsigned long long)gs[0],(unsigned long long)gs[1],
+                                 (unsigned long long)gs[2]);
+            if (gn>0) platform_write_stdout(g,(size_t)(gn>=(int)sizeof g?sizeof g-1:gn));
+        }
+    } else if (slot>=0 && pool_watch_places[slot].count==2) {
+        pool_watch_say("Pool watch: the place at rip %#llx writes into the pool again\n",
+                       (unsigned long long)rip);
+    }
+    /* bbport: report the value actually stored on every trapped write (rate-limited to 32 per
+     * place), so a zero (the erasure) is told apart from the registry's own free-list write
+     * (0x800410060). `at` is a mapped guest or host virtual address and reads directly. */
+    if (slot>=0 && pool_watch_places[slot].count>=1 && pool_watch_places[slot].count<=32) {
+        uint64_t val=0;
+        if (at) { const unsigned char *p=(const unsigned char *)at;
+                  for (int i=0;i<8;++i) ((unsigned char *)&val)[i]=p[i]; }
+        char v[64];
+        const int vn=snprintf(v,sizeof v,"  stored value %#llx (hit %ld)\n",
+                              (unsigned long long)val,(long)pool_watch_places[slot].count);
+        if (vn>0) platform_write_stdout(v,(size_t)(vn>=(int)sizeof v?sizeof v-1:vn));
+    }
+    pool_watch_leave();
+}
+/* The page-protection watch's own record of a write: the place, the module, the thread. Each
+ * place is said once and then counted. */
+static void pool_trap_note(uintptr_t rip, uintptr_t at) {
+    const long hits=atomic_fetch_add(&pool_trap_hits,1)+1;
+    pool_watch_enter();
+    int slot=-1;
+    for (int i=0;i<pool_trap_site_count;++i)
+        if (pool_trap_sites[i].rip==rip) { ++pool_trap_sites[i].count; slot=i; break; }
+    if (slot<0 && pool_trap_site_count<POOL_TRAP_SITES) {
+        slot=pool_trap_site_count++;
+        pool_trap_sites[slot].rip=rip; pool_trap_sites[slot].at=at;
+        pool_trap_sites[slot].count=1;
+    }
+    if (slot>=0 && pool_trap_sites[slot].count==1) {
+        char line[320];
+        int n=snprintf(line,sizeof(line),"Pool trap: a write into the pool+%#llx from rip %#llx",
+                       (unsigned long long)(at-(uintptr_t)pool_watch_page),(unsigned long long)rip);
+        if (n<=0) n=0;
+        if (n>=(int)sizeof(line)) n=(int)sizeof(line)-1;
+        if (image && rip>=(uintptr_t)image && rip<(uintptr_t)image+0x20000000) {
+            const int m=snprintf(line+n,sizeof(line)-(size_t)n," (guest+%#llx)",
+                                 (unsigned long long)(rip-(uintptr_t)image));
+            if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+        }
+        { HMODULE where=NULL;
+          if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&where)) {
+              char path[MAX_PATH];
+              const DWORD length=GetModuleFileNameA(where,path,sizeof(path));
+              if (length && length<sizeof(path)) {
+                  const int m=snprintf(line+n,sizeof(line)-(size_t)n," (in %s+%#llx)",path,
+                                       (unsigned long long)(rip-(uintptr_t)where));
+                  if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+              }
+          } }
+        { const int m=snprintf(line+n,sizeof(line)-(size_t)n," thread %lu hit %ld\n",
+                               (unsigned long)GetCurrentThreadId(),hits);
+          if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1; }
+        if (n>0) platform_write_stdout(line,(size_t)n);
+    }
+    pool_watch_leave();
+}
+/* The breakpoints, two names of the pool's first node words each, watched for writes: the guest's
+ * name of the words (the pool's own address) and the host's own view of the same physical memory.
+ * A store through the host's view does not fault the guest's page at all - it is a different view
+ * of the bytes - so it is watched where it does happen. If the host's view is not known yet, the
+ * four guest words are watched as before. */
+static void pool_watch_registers(CONTEXT *context) {
+    const uintptr_t base=(uintptr_t)pool_watch_base;
+    const uintptr_t host=(uintptr_t)pool_watch_host_base;
+    context->Dr0=base;
+    context->Dr1=host?host:base+0x8;
+    context->Dr2=host?base+0x8:base+0x10;
+    context->Dr3=host?host+0x8:base+0x18;
+    /* bbport fix: all four breakpoints are write-only (RW=01b) and eight bytes long (LEN=10b).
+     * The previous setting had the host-view slots (Dr1/Dr3) configured as RW=read and the
+     * guest-view slots (Dr0/Dr2) as LEN=1 byte, so a store through the host's backing view -
+     * exactly how the registry pool is erased (store_once writes via backing_base+phys, a
+     * different virtual address than the guest page the guest-view breakpoint watched) - was
+     * never trapped. Enable is GLOBAL (bits 8..11), not local: the CPU clears local (L0..L3)
+     * breakpoint enables on every thread/context switch, so local breakpoints are off in every
+     * thread except the one whose context was just loaded, which is why the trap never fired.
+     * Global breakpoints survive switches and watch every thread. RWn=01 at bits 16+2n,
+     * LENn=10 at bits 25+2n, reserved bit 10 kept, GE/LE clear. */
+    context->Dr7=(1u<<10)|0xF00u|0xFu|
+                 (1u<<16)|(1u<<18)|(1u<<20)|(1u<<22)|
+                 (1u<<25)|(1u<<27)|(1u<<29)|(1u<<31);
+}
+/* The processor's breakpoints, proved before they are trusted: this thread arms Dr0 on a word of
+ * its own (eight bytes long, write-only) and stores into it, and the handler has to name the
+ * store. A breakpoint set that never fires would make the silence that follows - no write into
+ * the pool seen - mean nothing at all, and it did: the length field was written wrong (see
+ * pool_watch_registers), so every store of eight bytes went past all four breakpoints. The words
+ * of the pool are eight-byte words, so the proof uses an eight-byte word too. The store is done
+ * on the thread that owns the registers, which is how a runaway SetThreadContext is ruled out. */
+static volatile uint64_t pool_dr_probe[4];
+static void pool_watch_dr_prove(void) {
+    CONTEXT context;
+    memset(&context,0,sizeof(context));
+    context.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(GetCurrentThread(),&context)) {
+        pool_watch_say("Pool watch: the breakpoints' own state was not read, they are NOT proved\n");
+        return;
+    }
+    context.Dr0=(uintptr_t)&pool_dr_probe[0];
+    context.Dr7|=0x1u|(1u<<16)|(1u<<19); /* Dr0: enabled, write-only, eight bytes long */
+    context.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+    if (!SetThreadContext(GetCurrentThread(),&context)) {
+        pool_watch_say("Pool watch: the breakpoints' own state was not written, they are NOT proved\n");
+        return;
+    }
+    const long before=atomic_load(&pool_watch_writes);
+    pool_dr_probe[0]=UINT64_C(0x5a5a5a5a5a5a5a5a);
+    const long after=atomic_load(&pool_watch_writes);
+    pool_watch_say("Pool watch: the breakpoints' own probe write was %s (%ld places named by it)\n",
+                   after>before?"seen":"NOT seen",after-before);
+    /* The watch's own breakpoints are put back on this thread (the store above left the probe's). */
+    context.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+    if (GetThreadContext(GetCurrentThread(),&context)) {
+        pool_watch_registers(&context);
+        context.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+        SetThreadContext(GetCurrentThread(),&context);
+    }
+}
+static void pool_watch_dump(const char *path, uintptr_t address);
+static int pool_tight_dumped;
+/* A poll of its own, closer than the watch's loop can be: the loop carries the sweep (which walks
+ * the whole address space and costs a hundred milliseconds) and the adoption of every thread, so
+ * its first round can come a hundred milliseconds after the words were published - long after the
+ * words were already gone, which is what the earlier runs showed (+203 and +218 ms). This thread
+ * stands behind nothing: it asks about the protection of both names and reads the node's words as
+ * fast as the machine allows, and says the instant either name stops being read-only and the
+ * instant the words change, with the protection and the traps of that same instant. */
+static unsigned pool_tight_mask(uintptr_t address) {
+    MEMORY_BASIC_INFORMATION info;
+    if (!address || VirtualQuery((void *)address,&info,sizeof(info))!=sizeof(info)) return 0xffffffffu;
+    return ((unsigned)(info.State&0xfff))|((unsigned)(info.Protect&0xffff)<<12)|
+           ((unsigned)(info.Type&0xffff)<<28);
+}
+static DWORD WINAPI pool_tight_thread(LPVOID parameter) {
+    (void)parameter;
+    while (!pool_watch_page || !pool_watch_started_ms) {
+        if (atomic_load(&pool_watch_lines)>=2048) return 0;
+        Sleep(1);
+    }
+    uint64_t last[4]={0,0,0,0};
+    int have=0, said_masks=0;
+    unsigned mask_g=0, mask_h=0;
+    for (;;) {
+        const uint64_t now_ms=(uint64_t)GetTickCount64();
+        if (now_ms-pool_watch_started_ms>10000) break; /* the start-up is over: the loop is enough */
+        const unsigned mg=pool_tight_mask((uintptr_t)pool_watch_page);
+        const unsigned mh=pool_tight_mask((uintptr_t)pool_trap_backing_page);
+        if (!said_masks || mg!=mask_g || mh!=mask_h) {
+            said_masks=1; mask_g=mg; mask_h=mh;
+            pool_watch_say("Pool watch: tight: the guest's page protect %#x state %#x, the host's "
+                           "protect %#x state %#x (traps %d/%d, writes %ld, traps hit %ld+%ld+%ld) "
+                           "at +%llu ms\n",
+                           (mg>>12)&0xffff, mg&0xfff, (mh>>12)&0xffff, mh&0xfff,
+                           atomic_load(&pool_trap_on),atomic_load(&pool_trap_backing_on),
+                           (long)atomic_load(&pool_watch_writes),
+                           (long)atomic_load(&pool_trap_hits),
+                           (long)atomic_load(&pool_trap_backing_hits),
+                           (long)atomic_load(&pool_extra_hits),
+                           (unsigned long long)(now_ms-(unsigned long long)pool_watch_started_ms));
+        }
+        uint64_t words[4]={0,0,0,0};
+        if (pool_watch_base &&
+            platform_read_memory((void *)(uintptr_t)pool_watch_base,words,sizeof(words))==0) {
+            if (!have || memcmp(words,last,sizeof(words))) {
+                const int first=!have;
+                have=1;
+                pool_watch_say("Pool watch: tight: the words are %#llx %#llx %#llx %#llx at +%llu ms "
+                               "(masks %#x/%#x, traps %d/%d, writes %ld, traps hit %ld+%ld+%ld)\n",
+                               (unsigned long long)words[0],(unsigned long long)words[1],
+                               (unsigned long long)words[2],(unsigned long long)words[3],
+                               (unsigned long long)(now_ms-(unsigned long long)pool_watch_started_ms),
+                               mask_g,mask_h,atomic_load(&pool_trap_on),
+                               atomic_load(&pool_trap_backing_on),(long)atomic_load(&pool_watch_writes),
+                               (long)atomic_load(&pool_trap_hits),
+                               (long)atomic_load(&pool_trap_backing_hits),
+                               (long)atomic_load(&pool_extra_hits));
+                if (!first && !pool_tight_dumped) {
+                    pool_tight_dumped=1;
+                    pool_watch_dump("pool-page-after.bin",(uintptr_t)pool_watch_page);
+                    if (pool_watch_host_base)
+                        pool_watch_dump("pool-page-host-after.bin",(uintptr_t)pool_watch_host_base);
+                }
+                memcpy(last,words,sizeof(last));
+            }
+        }
+        Sleep(0);
+    }
+    return 0;
+}
+/* The pool's page as it is, written out whole: the shape of a store cannot be read against a
+ * snapshot of four words, and the page as it was before and after can be compared offline with the
+ * images and the patches, which is what tells where the bytes that took the page's place came
+ * from. */
+static void pool_watch_dump(const char *path, uintptr_t address) {
+    if (!address) return;
+    unsigned char page[0x4000];
+    if (platform_read_memory((void *)address,page,sizeof(page))) {
+        pool_watch_say("Pool watch: the page at %#llx was not read for %s\n",
+                       (unsigned long long)address,path);
+        return;
+    }
+    FILE *file=fopen(path,"wb");
+    if (!file) {
+        pool_watch_say("Pool watch: %s was not written\n",path);
+        return;
+    }
+    fwrite(page,1,sizeof(page),file);
+    fclose(file);
+    pool_watch_say("Pool watch: the page at %#llx was written to %s\n",
+                   (unsigned long long)address,path);
+}
+static int pool_watch_take_thread(HANDLE thread) {
+    CONTEXT context;
+    memset(&context,0,sizeof(context));
+    context.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(thread,&context)) return 0;
+    const uintptr_t base=(uintptr_t)pool_watch_base;
+    const uintptr_t host=(uintptr_t)pool_watch_host_base;
+    if (context.Dr0==base && context.Dr1==(host?host:base+0x8) &&
+        context.Dr3==(host?host+0x8:base+0x18)) return 1; /* already carried */
+    pool_watch_registers(&context);
+    context.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+    return SetThreadContext(thread,&context)?1:0;
+}
+/* Every thread of the process carries the breakpoints; the ones that start while the watch is on
+ * take them in the sweep that follows. */
+static void pool_watch_adopt(void) {
+    HANDLE all=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    if (all==INVALID_HANDLE_VALUE) return;
+    const DWORD process=GetCurrentProcessId(), mine=GetCurrentThreadId();
+    THREADENTRY32 one;
+    one.dwSize=sizeof(one);
+    int carried=0;
+    if (Thread32First(all,&one)) do {
+        if (one.th32OwnerProcessID!=process || one.th32ThreadID==mine) continue;
+        HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_SET_CONTEXT,FALSE,
+                                 one.th32ThreadID);
+        if (!thread) continue;
+        if (SuspendThread(thread)!=(DWORD)-1) {
+            if (pool_watch_take_thread(thread)) ++carried;
+            ResumeThread(thread);
+        }
+        CloseHandle(thread);
+    } while (Thread32Next(all,&one));
+    CloseHandle(all);
+    atomic_store(&pool_watch_threads,carried);
+}
+/* The pool's own watch thread: it waits for the game to allocate the pool, takes the breakpoints
+ * on its first node, and reads the node's words every five milliseconds. The watchdog (the other
+ * thread) is far too slow for this; nothing here waits on the runtime, so it cannot deadlock. */
+/* bbport: once the game publishes the R1 registry pool's base (image+0x161d080), relocate the pool
+ * into its own section (runtime_memory_protect_r1_pool) so the GPU's in-place import of direct-memory
+ * chunks and any discard of the shared pool section cannot reach it. Always on (not gated by
+ * BB_POOL_WATCH); polls briefly then runs once and exits. */
+static DWORD WINAPI pool_protect_thread(LPVOID parameter) {
+    (void)parameter;
+    uintptr_t base=0;
+    for (unsigned tries=0;tries<600000;++tries) { /* ten minutes is more than the boot takes */
+        base=0;
+        if (image && platform_read_memory((void *)((uintptr_t)image+0x161d080),&base,8)==0 &&
+            base>=0x10000 && base<0x0000ffffffffffffull)
+            break;
+        base=0;
+        Sleep(1);
+    }
+    if (!base) return 0;
+    uint64_t phys=0; uintptr_t end=0;
+    if (runtime_memory_direct_phys((uintptr_t)base,&phys,&end))
+        runtime_memory_protect_r1_pool(phys, 0x320000);
+    return 0;
+}
+static DWORD WINAPI pool_watch_thread(LPVOID parameter) {
+    (void)parameter;
+    uintptr_t base=0;
+    for (unsigned tries=0;tries<600000;++tries) { /* ten minutes is more than the boot takes */
+        base=0;
+        /* The pool's base is held by the registry's own control block, in the image. */
+        if (platform_read_memory((void *)((uintptr_t)image+0x161d080),&base,8)==0 &&
+            base>=0x10000 && base<0x0000ffffffffffffull) break;
+        base=0;
+        Sleep(1);
+    }
+    if (!base) { pool_watch_say("Pool watch: the pool's base never appeared\n"); return 0; }
+    pool_watch_base=base;
+    pool_watch_page=base&~(uintptr_t)4095;
+    pool_watch_say("Pool watch: the registry pool is at %#llx (page %#llx); the four words of its "
+                   "first node are watched for writes\n",
+                   (unsigned long long)base,(unsigned long long)pool_watch_page);
+    /* The node's words the instant the base is published: the free list is threaded a few
+     * instructions after the base is stored, so a zero here means the threading never happened
+     * or was already undone. Read before anything else, so nothing this thread does can hide
+     * the state at publication. */
+    {
+        uint64_t words[4]={0,0,0,0};
+        uint64_t head=0;
+        platform_read_memory((void *)((uintptr_t)image+0x160b688),&head,8);
+        const int read=platform_read_memory((void *)(uintptr_t)pool_watch_base,words,sizeof(words))==0;
+        pool_watch_say("Pool watch: at publication free_head=%#llx node %#llx %#llx %#llx %#llx%s\n",
+                       (unsigned long long)head,(unsigned long long)words[0],
+                       (unsigned long long)words[1],(unsigned long long)words[2],
+                       (unsigned long long)words[3],read?"":" (unreadable)");
+        /* Those four words are the mark that finds the pool inside every other view of its
+         * section; the whole first page is kept as it is now, so that the shape of an erasure can
+         * be read against it (how far it reaches, and where exactly). */
+        memcpy(pool_extra_mark,words,sizeof(pool_extra_mark));
+        if (platform_read_memory((void *)(uintptr_t)pool_watch_page,pool_watch_snapshot,
+                                 sizeof(pool_watch_snapshot))!=0)
+            memset(pool_watch_snapshot,0,sizeof(pool_watch_snapshot));
+    }
+    /* The page is made read-only before the heavier work that follows (the runtime's watch is
+     * taken under its own lock, and adopting the threads takes a while): the trap is armed in
+     * microseconds, the free list is not threaded yet when the base is published, so a trap
+     * armed here is armed in time. */
+    {
+        const int armed=pool_trap_arm();
+        pool_watch_say("Pool watch: the page protection trap is %s (page %#llx)\n",
+                       armed?"armed":"NOT armed",(unsigned long long)pool_watch_page);
+    }
+    /* The host's own view of the very same bytes, made read-only as well (pool_trap_arm_backing
+     * above says why): a store through that name lands on these bytes without ever touching the
+     * guest's page, so this is the only watch that can name it. */
+    {
+        uint64_t phys=0;
+        uintptr_t end=0;
+        void *view=runtime_memory_direct_phys(pool_watch_page,&phys,&end)
+                       ? runtime_memory_backing_pointer(phys) : NULL;
+        if (view) {
+            pool_trap_backing_page=(uintptr_t)view;
+            const int armed=pool_trap_arm_backing();
+            pool_watch_say("Pool watch: the host's own view of the pool is %#llx (phys %#llx), %s\n",
+                           (unsigned long long)(uintptr_t)view,(unsigned long long)phys,
+                           armed?"read-only now":"NOT protected");
+        } else {
+            pool_watch_say("Pool watch: the host's own view of the pool was not found\n");
+        }
+    }
+    /* Both traps are proved with a store of the value that is already there: the page is
+     * read-only, so the store must fault and the handler must name it. A trap that stays silent
+     * here is silent about every write it did not see as well, so this proof is what makes the
+     * silence that follows mean something. The value stored is the value read, so the bytes are
+     * left exactly as they were. */
+    {
+        if (pool_watch_base) {
+            volatile uint32_t *word=(volatile uint32_t *)(uintptr_t)pool_watch_base;
+            const uint32_t was=*word;
+            *word=was;
+            pool_watch_say("Pool watch: the guest page trap's own probe write was %s\n",
+                           atomic_load(&pool_trap_hits)?"seen":"NOT seen");
+        }
+        if (pool_trap_backing_page) {
+            volatile uint32_t *word=(volatile uint32_t *)(uintptr_t)(pool_trap_backing_page+0x40);
+            const uint32_t was=*word;
+            *word=was;
+            pool_watch_say("Pool watch: the host view trap's own probe write was %s\n",
+                           atomic_load(&pool_trap_backing_hits)?"seen":"NOT seen");
+        }
+    }
+    /* The self-tests above took both traps away: the handler gives the page back so that the write
+       it just named can go through, and the watch's own loop only arms them again once it starts -
+       and the loop starts only after every thread has been adopted. The game's startup runs through
+       that window, so the traps are put back here, at once, before anything else. */
+    pool_trap_arm();
+    pool_trap_arm_backing();
+    /* The host's own view of the pool's bytes and the protection of both names, taken here and
+       then asked about in every round: whatever takes the read-only away from either name - the
+       GPU library protecting a page it writes, the runtime protecting a guest page, a mapping
+       operation putting the view back - is said with its time, so a write that arrives on a page
+       the trap no longer holds is not counted as a write the trap did not see. */
+    pool_watch_host_base=pool_trap_backing_page
+                             ?(uintptr_t)pool_trap_backing_page+(uintptr_t)(pool_watch_base-pool_watch_page)
+                             :(uintptr_t)0;
+    pool_watch_started_ms=(uint64_t)GetTickCount64();
+    pool_watch_prot_guest.address=(uintptr_t)pool_watch_page;
+    pool_watch_prot_host.address=(uintptr_t)pool_trap_backing_page;
+    pool_watch_words_say("the pool's first words through the guest's name",(uintptr_t)pool_watch_base);
+    pool_watch_words_say("the pool's first words through the host's name",pool_watch_host_base);
+    pool_watch_prot_poll("guest's",&pool_watch_prot_guest);
+    pool_watch_prot_poll("host's",&pool_watch_prot_host);
+    runtime_memory_watch_range(pool_watch_page,0x4000);
+    {   /* The other names of the same bytes: a write through one of them is not a fault at all
+           (no page protection is used), the breakpoints catch it wherever it comes from. */
+        uintptr_t starts[8], ends[8];
+        const int n=runtime_memory_aliases(pool_watch_page,0x4000,starts,ends,8);
+        if (!n) pool_watch_say("Pool watch: the pool's bytes have no other name\n");
+        for (int i=0;i<n;++i)
+            pool_watch_say("Pool watch: the pool's bytes are also named %#llx-%#llx\n",
+                           (unsigned long long)starts[i],(unsigned long long)ends[i]);
+    }
+    /* The copies the runtime's HLE'd C library makes into the pool's page are named too. */
+    { extern uintptr_t runtime_cpu_watch_lo, runtime_cpu_watch_hi;
+      runtime_cpu_watch_lo=pool_watch_page;
+      runtime_cpu_watch_hi=pool_watch_page+0x4000; }
+    pool_watch_adopt();
+    pool_watch_say("Pool watch: %d threads carry the breakpoints\n",
+                   atomic_load(&pool_watch_threads));
+    uint64_t last[4]={~0ull,0,0,0};
+    long last_writes=0, last_trap_hits=0, last_backing_hits=0, last_extra_hits=0;
+    /* Every other view of the pool's section, before the game runs on: a view the watch does not
+     * hold is a name of the pool's bytes through which a store reaches the pool silently. */
+    pool_watch_sweep_views();
+    uint64_t last_adopt=(uint64_t)GetTickCount64();
+    uint64_t last_sweep=last_adopt;
+    for (unsigned round=0;;++round) {
+        /* The page the runtime put back (or the trap that was just fired) is armed again first of
+         * all, before the adoption: the watch has to stay on for the write that erases the node to
+         * be caught whatever it is. */
+        if (!atomic_load(&pool_trap_on)) pool_trap_arm();
+        if (!atomic_load(&pool_trap_backing_on)) pool_trap_arm_backing();
+        /* The pages of the other views found by the sweep are held read-only too, until the first
+         * write through one of them has been named: after that they are left alone (the trap is
+         * for the naming, not for stopping the game). */
+        if (!atomic_load(&pool_extra_hits))
+            for (int i=0;i<atomic_load(&pool_extra_count);++i)
+                if (pool_extra_views[i].page) {
+                    DWORD old=0;
+                    VirtualProtect((void *)pool_extra_views[i].page,0x4000,PAGE_READONLY,&old);
+                }
+        {   /* The adoption and the sweep cost milliseconds, so they are kept to their own times
+               (the rounds themselves cost microseconds: the words are watched as closely as the
+               machine allows, so that the instant of the erasure is known to the microsecond). */
+            const uint64_t now_ms=(uint64_t)GetTickCount64();
+            if (now_ms-last_adopt>=10) { last_adopt=now_ms; pool_watch_adopt(); }
+            if (now_ms-last_sweep>=(now_ms-pool_watch_started_ms<3000?100:1000)) {
+                last_sweep=now_ms;
+                pool_watch_sweep_views();
+            }
+        }
+        {
+            const long hits=atomic_load(&pool_trap_hits);
+            if (hits!=last_trap_hits) {
+                last_trap_hits=hits;
+                if (hits<=8 || hits%256==0)
+                    pool_watch_say("Pool watch: %ld writes into the pool's page caught by the "
+                                   "trap so far\n",hits);
+            }
+            const long backing=atomic_load(&pool_trap_backing_hits);
+            if (backing!=last_backing_hits) {
+                last_backing_hits=backing;
+                if (backing<=8 || backing%256==0)
+                    pool_watch_say("Pool watch: %ld writes into the host's view of the pool caught "
+                                   "by the trap so far\n",backing);
+            }
+            const long extra=atomic_load(&pool_extra_hits);
+            if (extra!=last_extra_hits) {
+                last_extra_hits=extra;
+                if (extra<=8 || extra%256==0)
+                    pool_watch_say("Pool watch: %ld writes into another name of the pool caught by "
+                                   "the trap so far\n",extra);
+            }
+        }
+        /* The protection of both names is asked about every round, before the words are read: a
+         * change while either name reads read-only is not a write through that name at all. */
+        pool_watch_prot_poll("guest's",&pool_watch_prot_guest);
+        pool_watch_prot_poll("host's",&pool_watch_prot_host);
+        uint64_t words[4]={0,0,0,0};
+        const int read=platform_read_memory((void *)(uintptr_t)pool_watch_base,words,sizeof(words))==0;
+        if (read && (words[0]!=last[0]||words[1]!=last[1]||words[2]!=last[2]||words[3]!=last[3])) {
+            uint32_t used=0, next_id=0;
+            if (image) {
+                platform_read_memory((void *)((uintptr_t)image+0x160b694),&used,4);
+                platform_read_memory((void *)((uintptr_t)image+0x160b600),&next_id,4);
+            }
+            /* bbport: the verdict on WHO erased the pool. If the guest VA 0x800410040 now maps a
+             * DIFFERENT physical page than the one the registry was built on (0x4900040), the
+             * runtime/GPU repointed the mapping (a remap that the stale phys-window of watch_note
+             * would miss). If the phys is unchanged but the bytes are zero/other, it is an in-place
+             * reset (MEM_RESET / punch hole) or a write through an untrapped name. */
+            {   char dg[200], dh[200];
+                runtime_memory_describe((uintptr_t)pool_watch_base,dg,sizeof dg);
+                runtime_memory_describe(pool_watch_host_base?pool_watch_host_base:(uintptr_t)pool_watch_base,
+                                       dh,sizeof dh);
+            pool_watch_say("Pool watch: mapping at erasure: guest(%#llx) %s | host(%#llx) %s "
+                           "[original phys 0x4900040]\n",
+                           (unsigned long long)pool_watch_base,dg,
+                           (unsigned long long)(pool_watch_host_base?pool_watch_host_base:
+                                                (uintptr_t)pool_watch_base),dh);
+            {   char ops[4096];
+                if (runtime_memory_op_dump(ops,sizeof ops)>0)
+                    pool_watch_say("Pool watch: last memory operations (most recent last):\n%s",ops);
+            }
+            }
+            pool_watch_say("Pool watch: the pool's words are now %#llx %#llx %#llx %#llx through the "
+                           "guest's name (writes seen %ld, trap on %d arms %ld hits %ld+%ld, "
+                           "used %#x next_id %#x) at +%llu ms\n",
+                           (unsigned long long)words[0],(unsigned long long)words[1],
+                           (unsigned long long)words[2],(unsigned long long)words[3],
+                           (long)atomic_load(&pool_watch_writes),atomic_load(&pool_trap_on),
+                           (long)atomic_load(&pool_trap_arms),(long)atomic_load(&pool_trap_hits),
+                           (long)atomic_load(&pool_trap_backing_hits),used,next_id,
+                           (unsigned long long)(GetTickCount64()-(unsigned long long)pool_watch_started_ms));
+            /* The protection of both names at the instant the words were read (the poll above runs
+             * a few microseconds before the read): words that changed while their page was
+             * read-only were not written through that page at all - something wrote the physical
+             * bytes through a name this watch does not hold. Words that changed while the page was
+             * writable are a write the trap was not armed for. */
+            pool_watch_say("Pool watch: at that instant the guest's name is protect %#x and the "
+                           "host's name is protect %#x (the traps %d/%d)\n",
+                           pool_watch_prot_guest.mask,pool_watch_prot_host.mask,
+                           atomic_load(&pool_trap_on),atomic_load(&pool_trap_backing_on));
+            /* The shape of the erasure: the pool's first page as it was published against the page
+             * now. Four bytes of zeros is one store; the free-list region is the allocator reusing
+             * the nodes; the whole page is a bulk copy or the memory having been given back. */
+            { uint64_t now[512];
+              unsigned changed=0, first=0, lastoff=0, shown=0;
+              if (platform_read_memory((void *)(uintptr_t)pool_watch_page,now,sizeof(now))==0) {
+                  for (unsigned i=0;i<512;++i)
+                      if (now[i]!=pool_watch_snapshot[i]) {
+                          if (!changed) first=i;
+                          lastoff=i; ++changed;
+                      }
+                  pool_watch_say("Pool watch: %u of the page's 512 words differ from the page as it "
+                                 "was published (first +%#llx, last +%#llx)\n",changed,
+                                 (unsigned long long)(first*8),(unsigned long long)(lastoff*8));
+                  for (unsigned i=0;i<512 && shown<6;++i)
+                      if (now[i]!=pool_watch_snapshot[i]) {
+                          pool_watch_say("Pool watch:   +%#llx was %#llx now %#llx\n",
+                                         (unsigned long long)(i*8),
+                                         (unsigned long long)pool_watch_snapshot[i],
+                                         (unsigned long long)now[i]);
+                          ++shown;
+                      }
+              } }
+            /* The same words through the host's own name: the same bytes have to come out of both
+             * names. Only one of the two names changing means the mapping behind that name was
+             * replaced, not the memory written. */
+            pool_watch_words_say("the same words through the host's name",pool_watch_host_base);
+            /* How far the erasure reaches: the node's own page, and the pool's second page. A
+             * single node's worth of zeros is a targeted store; a whole page (or the whole pool)
+             * of zeros is a bulk operation or the memory having been given back. */
+            { unsigned nonzero_first=0, nonzero_second=0; uint32_t word=0;
+              for (unsigned i=0;i<4096;i+=16)
+                  if (!platform_read_memory((void *)((uintptr_t)pool_watch_base+i),&word,4) && word)
+                      ++nonzero_first;
+              for (unsigned i=0;i<4096;i+=16)
+                  if (!platform_read_memory((void *)((uintptr_t)pool_watch_base+0x1000+i),&word,4) && word)
+                      ++nonzero_second;
+              pool_watch_say("Pool watch: of the pool's first page %u of 256 sampled words are not "
+                             "zero, of the second page %u of 256\n",nonzero_first,nonzero_second); }
+            pool_watch_prot_poll("guest's",&pool_watch_prot_guest);
+            pool_watch_prot_poll("host's",&pool_watch_prot_host);
+            memcpy(last,words,sizeof(last));
+        }
+        const long writes=atomic_load(&pool_watch_writes);
+        if (writes!=last_writes) {
+            last_writes=writes;
+            if (writes<=8 || writes%1024==0)
+                pool_watch_say("Pool watch: %ld writes into the pool's first node so far\n",writes);
+        }
+        /* The round costs microseconds: the shifts of the words are dated as closely as the
+           machine allows, and no protection change can hide between two reads. */
+        Sleep(0);
+    }
+    return 0;
+}
 /* The Windows build has no signals: the vectored exception handler sees the access violations,
  * the illegal instructions and the breakpoints the runtime and the game cause. */
 void bb_fault_wait(const char *what) {
     /* There is no debugger to attach to on Windows: the process stops with the fault's report. */
     (void)what;
 }
+/* BB_CPU_WATCH on Windows: the page the watch protects has no signal handler here (the signal
+ * path is the POSIX build's), so the vectored handler does the job the way the pool's trap
+ * does it: the write is named, one store is let through, and the Trap Flag's single-step
+ * (handled at the top of this handler) re-protects the page. */
+static unsigned char *cpu_watch_page;      /* the shared definitions live further down */
+static _Atomic int cpu_watch_hits;         /* (tentative; defined next to cpu_watch_install) */
+static volatile uintptr_t cpu_watch_reprotect;
+#define CPU_WATCH_SITES 24
+#define CPU_WATCH_STORM_LIMIT 10000L
+static struct { uintptr_t rip, at; long count; } cpu_watch_sites[CPU_WATCH_SITES];
+static int cpu_watch_site_count;
+static _Atomic long cpu_watch_storm;
+static void cpu_watch_note(uintptr_t rip, uintptr_t at) {
+    const long hits=atomic_fetch_add(&cpu_watch_hits,1)+1;
+    int slot=-1;
+    for (int i=0;i<cpu_watch_site_count;++i)
+        if (cpu_watch_sites[i].rip==rip) { ++cpu_watch_sites[i].count; slot=i; break; }
+    if (slot<0 && cpu_watch_site_count<CPU_WATCH_SITES) {
+        slot=cpu_watch_site_count++;
+        cpu_watch_sites[slot].rip=rip; cpu_watch_sites[slot].at=at; cpu_watch_sites[slot].count=1;
+    }
+    if (slot>=0 && cpu_watch_sites[slot].count==1) {
+        char line[320];
+        int n=snprintf(line,sizeof(line),"CPU watch: write to image+%#llx from rip %#llx",
+                       (unsigned long long)(at-(uintptr_t)image),(unsigned long long)rip);
+        if (n<=0) n=0;
+        if (n>=(int)sizeof(line)) n=(int)sizeof(line)-1;
+        if (rip>=(uintptr_t)image && rip<(uintptr_t)image+0x20000000) {
+            const int m=snprintf(line+n,sizeof(line)-(size_t)n," (guest+%#llx)",
+                                 (unsigned long long)(rip-(uintptr_t)image));
+            if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+        }
+        { HMODULE where=NULL;
+          if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&where)) {
+              char path[MAX_PATH];
+              const DWORD length=GetModuleFileNameA(where,path,sizeof(path));
+              if (length && length<sizeof(path)) {
+                  const int m=snprintf(line+n,sizeof(line)-(size_t)n," (in %s+%#llx)",path,
+                                       (unsigned long long)(rip-(uintptr_t)where));
+                  if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1;
+              }
+          } }
+        { const int m=snprintf(line+n,sizeof(line)-(size_t)n," thread %lu hit %ld\n",
+                               (unsigned long)GetCurrentThreadId(),hits);
+          if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1; }
+        if (n>0) platform_write_stdout(line,(size_t)n);
+    }
+}
 static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *exception) {
     const DWORD code = exception->ExceptionRecord->ExceptionCode;
+    /* The pool's breakpoints (BB_POOL_WATCH=1): a write into the first node of the game's registry
+     * pool is named - the place that wrote it, the module it is in and the thread. The processor
+     * fires the breakpoint after the store has happened, so the place said is the instruction after
+     * the store (the store is the instruction that ends just before it); nothing is undone and the
+     * game runs on. */
+    if (code==EXCEPTION_SINGLE_STEP) {
+        /* Re-protect the cpu-watch page we had opened for exactly one store (BB_CPU_WATCH):
+         * the same shape as the pool's re-protection below. */
+        if (cpu_watch_reprotect) {
+            const uintptr_t pg=cpu_watch_reprotect;
+            cpu_watch_reprotect=0;
+            { DWORD old=0;
+              VirtualProtect((void *)pg,4096,PAGE_READONLY,&old); }
+            exception->ContextRecord->Dr6 &= ~0x4000u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        /* Re-protect a pool page we had opened for exactly one store (see the fault handlers
+         * below). The Trap Flag we set there is the reason this single-step arrived: its BS bit
+         * in Dr6 is cleared and the data-breakpoint path below is left untouched. (The processor
+         * clears TF itself on the #DB, so it does not keep single-stepping.) */
+        if (pool_trap_reprotect_guest) {
+            const uintptr_t pg=pool_trap_reprotect_guest;
+            pool_trap_reprotect_guest=0;
+            { DWORD old=0;
+              if (VirtualProtect((void *)pg,4096,PAGE_READONLY,&old))
+                  atomic_store(&pool_trap_on,1); }
+            exception->ContextRecord->Dr6 &= ~0x4000u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (pool_trap_reprotect_backing) {
+            const uintptr_t pg=pool_trap_reprotect_backing;
+            pool_trap_reprotect_backing=0;
+            { DWORD old=0;
+              if (VirtualProtect((void *)pg,4096,PAGE_READONLY,&old))
+                  atomic_store(&pool_trap_backing_on,1); }
+            exception->ContextRecord->Dr6 &= ~0x4000u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (pool_watch_base) {
+            CONTEXT *context=exception->ContextRecord;
+            const ULONG reason=(ULONG)context->Dr6;
+            const uintptr_t host=(uintptr_t)pool_watch_host_base;
+            uintptr_t at=(uintptr_t)pool_watch_base, origin=(uintptr_t)pool_watch_page;
+            const char *name="guest's";
+            if (reason&1) at=(uintptr_t)context->Dr0;
+            else if (reason&2) { at=(uintptr_t)context->Dr1; origin=host; name="host's"; }
+            else if (reason&4) at=(uintptr_t)context->Dr2;
+            else if (reason&8) { at=(uintptr_t)context->Dr3; origin=host; name="host's"; }
+            pool_watch_say_write((uintptr_t)context->Rip,at,origin?origin:(uintptr_t)pool_watch_page,name);
+            context->Dr6=0; /* the reason was taken: it is not a reason again */
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    /* The cpu-watch page (BB_CPU_WATCH=<image offset>): a write into it is named - the place,
+     * the module, the thread - and exactly one store is let through (the page is made writable
+     * and the thread's Trap Flag is set; the single-step at the top of this handler re-protects
+     * it read-only). This runs before the runtime's own recovery below, which would give the
+     * page back without naming anybody. */
+    if ((code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR) && cpu_watch_page) {
+        const EXCEPTION_RECORD *record=exception->ExceptionRecord;
+        const int is_write=(record->NumberParameters>=2 && record->ExceptionInformation[0]==1);
+        const uintptr_t at=(record->NumberParameters>=2)
+                               ? (uintptr_t)record->ExceptionInformation[1] : 0;
+        const uintptr_t page=(uintptr_t)cpu_watch_page;
+        if (is_write && at>=page && at<page+4096) {
+            cpu_watch_note((uintptr_t)exception->ContextRecord->Rip,at);
+            const long seen=atomic_fetch_add(&cpu_watch_storm,1)+1;
+            if (seen>CPU_WATCH_STORM_LIMIT) {
+                /* Too many faults: leave the page writable for the rest of the run. */
+                static _Atomic int storm_said;
+                if (!atomic_exchange(&storm_said,1)) {
+                    static const char storm_msg[]="CPU watch: storm limit reached; the page stays "
+                                                 "writable for the rest of the run\n";
+                    platform_write_stdout(storm_msg,sizeof(storm_msg)-1);
+                }
+                { DWORD old=0;
+                  VirtualProtect((void *)page,4096,PAGE_READWRITE,&old); }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            cpu_watch_reprotect=page;
+            exception->ContextRecord->EFlags |= 0x100u; /* Trap Flag: #DB after one instruction */
+            { DWORD old=0;
+              VirtualProtect((void *)page,4096,PAGE_READWRITE,&old); }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    /* The pool's page-protection trap (BB_POOL_WATCH=1): the page was made read-only, so the
+     * write into it is an access violation, and the violation names the writer - the place, the
+     * module, the thread - whatever thread it came from. Exactly one store is let through (the
+     * page is made writable and the thread's Trap Flag is set); the resulting single-step below
+     * re-protects the page read-only and re-arms the trap, so the write is named and the page is
+     * closed again within a single instruction - the disarm window the old code left is gone. */
+    if ((code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR) &&
+        atomic_load(&pool_trap_on)) {
+        const EXCEPTION_RECORD *record=exception->ExceptionRecord;
+        const int is_write=(record->NumberParameters>=2 && record->ExceptionInformation[0]==1);
+        const uintptr_t at=(record->NumberParameters>=2)
+                               ? (uintptr_t)record->ExceptionInformation[1] : 0;
+        const uintptr_t page=(uintptr_t)pool_watch_page;
+        if (is_write && at>=page && at<page+4096) {
+            pool_trap_note((uintptr_t)exception->ContextRecord->Rip,at);
+            const long seen=atomic_fetch_add(&pool_trap_storm,1)+1;
+            if (seen>POOL_TRAP_STORM_LIMIT) {
+                /* Too many faults: stop re-protecting each store, leave it writable and let the
+                 * watch thread re-arm (the old behaviour). The writer has already been named. */
+                if (seen==POOL_TRAP_STORM_LIMIT+1)
+                    pool_watch_say("Pool trap: guest page faulted %ld times; switching to "
+                                   "disarm-and-poll re-arm for the rest of the run\n",seen);
+                atomic_store(&pool_trap_on,0);
+                { DWORD old=0;
+                  VirtualProtect((void *)page,4096,PAGE_READWRITE,&old); }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            /* Let exactly this one store through, then re-protect on the single-step below. */
+            pool_trap_reprotect_guest=page;
+            exception->ContextRecord->EFlags |= 0x100u; /* Trap Flag: #DB after one instruction */
+            { DWORD old=0;
+              VirtualProtect((void *)page,4096,PAGE_READWRITE,&old); }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    /* The same trap on the host's own view of those bytes: the store that never touches the
+     * guest's page is named here, and the page is given back the way the runtime has it. */
+    if ((code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR) &&
+        atomic_load(&pool_trap_backing_on)) {
+        const EXCEPTION_RECORD *record=exception->ExceptionRecord;
+        const int is_write=(record->NumberParameters>=2 && record->ExceptionInformation[0]==1);
+        const uintptr_t at=(record->NumberParameters>=2)
+                               ? (uintptr_t)record->ExceptionInformation[1] : 0;
+        const uintptr_t page=(uintptr_t)pool_trap_backing_page;
+        if (is_write && page && at>=page && at<page+4096) {
+            pool_trap_backing_note((uintptr_t)exception->ContextRecord->Rip,at);
+            const long seen=atomic_fetch_add(&pool_trap_storm,1)+1;
+            if (seen>POOL_TRAP_STORM_LIMIT) {
+                if (seen==POOL_TRAP_STORM_LIMIT+1)
+                    pool_watch_say("Pool trap: host page faulted %ld times; switching to "
+                                   "disarm-and-poll re-arm for the rest of the run\n",seen);
+                atomic_store(&pool_trap_backing_on,0);
+                { DWORD old=0;
+                  VirtualProtect((void *)page,4096,PAGE_READWRITE,&old); }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            pool_trap_reprotect_backing=page;
+            exception->ContextRecord->EFlags |= 0x100u;
+            { DWORD old=0;
+              VirtualProtect((void *)page,4096,PAGE_READWRITE,&old); }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    /* The same trap on any other view of the pool's bytes the sweep found (a third view: a mapping
+     * of the pool's section at an address the host picked). A store through it is a store onto the
+     * pool that neither of the two names this watch holds would ever see - which is exactly how the
+     * node's words can change with both known pages read-only and no write named. The page is given
+     * back the way the runtime has it, so the game runs on. */
+    if ((code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR) &&
+        !atomic_load(&pool_extra_hits)) {
+        const EXCEPTION_RECORD *record=exception->ExceptionRecord;
+        const int is_write=(record->NumberParameters>=2 && record->ExceptionInformation[0]==1);
+        const uintptr_t at=(record->NumberParameters>=2)
+                               ? (uintptr_t)record->ExceptionInformation[1] : 0;
+        if (is_write)
+            for (int i=0;i<atomic_load(&pool_extra_count);++i) {
+                const uintptr_t page=pool_extra_views[i].page;
+                if (!page || at<page || at>=page+0x4000) continue;
+                pool_extra_note((uintptr_t)exception->ContextRecord->Rip,at,page);
+                { DWORD old=0;
+                  VirtualProtect((void *)page,0x4000,PAGE_READWRITE,&old); }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+    }
+    /* A write into either of the two pages that neither trap took: the page was left read-only by
+     * something else, so it is said before the runtime's own recovery gives it back. */
+    if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR) {
+        const EXCEPTION_RECORD *record=exception->ExceptionRecord;
+        const int is_write=(record->NumberParameters>=2 && record->ExceptionInformation[0]==1);
+        const uintptr_t at=(record->NumberParameters>=2)
+                               ? (uintptr_t)record->ExceptionInformation[1] : 0;
+        const uintptr_t guest=(uintptr_t)pool_watch_page;
+        const uintptr_t backing=(uintptr_t)pool_trap_backing_page;
+        const int in_guest=guest && at>=guest && at<guest+4096;
+        const int in_backing=backing && at>=backing && at<backing+4096;
+        if (is_write && (in_guest || in_backing)) {
+            static _Atomic unsigned notes;
+            const unsigned n=atomic_fetch_add(&notes,1)+1;
+            if (n<=8 || !(n&(n-1)))
+                pool_watch_say("Pool watch: a write into the pool's %s page (%#llx) faulted while "
+                               "the trap was off (%u so far)\n",
+                               in_guest?"guest":"host view",(unsigned long long)at,n);
+        }
+    }
     /* The exception's own view: the address it was about, and the context it carries. */
     PlatformContext uc0 = { exception, exception->ContextRecord };
 
@@ -1049,10 +2493,11 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
      * hands out ids without ever putting a node in the table, and every lookup of one of
      * them finds nothing. The watch shows the chain and the counters as they change. */
     const int watch_r1 = getenv("BB_R1_WATCH") != NULL;
-    unsigned last_used = 0xffffffffu, last_next = 0xffffffffu, last_head = 0xffffffffu;
-    uint64_t last_link = 0, last_link_was = 0;
+    const int watch_pool = getenv("BB_POOL_WATCH") != NULL;
+    unsigned last_used = 0xffffffffu, last_next = 0xffffffffu;
+    uint64_t last_head = ~0ull, last_link = 0, last_link_was = 0;
     for (unsigned round=0;;++round) {
-        if (watch_r1) {
+        if (watch_r1 || watch_pool) {
             uint64_t head = 0, next = 0;
             platform_read_memory((void *)((uintptr_t)image + 0x160b688), &head, 8);
             if (head) platform_read_memory((void *)(uintptr_t)head, &next, 8);
@@ -1062,7 +2507,7 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
             if (used != last_used || next_id != last_next || head != last_head) {
                 last_used = used;
                 last_next = next_id;
-                last_head = (unsigned)head;
+                last_head = head;
                 char note[192];
                 int length = snprintf(note, sizeof(note),
                     "Runtime: R1 free_head=%#llx head.next=%#llx used=%#x next_id=%#x\n",
@@ -1093,9 +2538,42 @@ static DWORD WINAPI watchdog_thread(LPVOID parameter) {
                         (unsigned long long)link, (unsigned long long)last_link_was);
                     if (length > 0) platform_write_stdout(note, (size_t)length);
                     last_link_was = link;
+                    /* bbport: the pool's free-list just broke (or restored). Dump the ring of
+                     * recent mapping operations (with guest call sites) so the zeroing/remapping
+                     * of the pool's physical range (0x4900000..) is named - the pool watch's own
+                     * erasure detector can miss a transient one. Fire on the broken state (link 0)
+                     * so it also catches a chain that was already broken at the first sample. */
+                    static _Atomic int r1_dumped;
+                    if (link == 0 && !atomic_load(&r1_dumped)) {
+                        atomic_store(&r1_dumped,1);
+                        char ops[6000];
+                        if (runtime_memory_op_dump(ops,sizeof ops)>0) {
+                            platform_write_stdout(
+                                "Runtime: R1 chain break - last memory operations:\n", 46);
+                            platform_write_stdout(ops, (size_t)strlen(ops));
+                        }
+                        char dg[200];
+                        runtime_memory_describe(0x800410040u,dg,sizeof dg);
+                        platform_write_stdout("Runtime: at R1 break, pool VA 0x800410040 -> ", 42);
+                        platform_write_stdout(dg,(size_t)strlen(dg));
+                        platform_write_stdout("\n",1);
+                        /* bbport: report which breakpoint/trap caught a write into the pool, as a
+                         * fallback in case the single-step print was rate-limited. A non-zero host
+                         * count means the erasure was a store through the runtime's backing view. */
+                        char fb[256];
+                        int fbn=snprintf(fb,sizeof fb,
+                            "Runtime: R1 break trap tallies: guest=%ld host=%ld extra=%ld "
+                            "(writes observed=%ld)\n",
+                            (long)atomic_load(&pool_trap_hits),
+                            (long)atomic_load(&pool_trap_backing_hits),
+                            (long)atomic_load(&pool_extra_hits),
+                            (long)atomic_load(&pool_watch_writes));
+                        if (fbn>0) platform_write_stdout(fb,(size_t)(fbn>=(int)sizeof fb?sizeof fb-1:fbn));
+                    }
+                    if (link == 0x800410060) atomic_store(&r1_dumped,0); /* re-arm if restored */
                 }
             }
-            platform_sleep_ns(20*1000*1000);
+            Sleep(20);
             continue;
         }
         Sleep(interval*200);
@@ -1411,7 +2889,7 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
-    image = allocate(round_page(size));
+    image = allocate_image(size);
     runtime_trace_set_image(image);
     { /* link_modules.py's unwind.txt beside the boot image: the modules' unwind tables */
         char unwind[4096];
@@ -1586,9 +3064,22 @@ int main(int argc, char **argv) {
             watchdog_set_image((uintptr_t)info.BaseAddress,(uintptr_t)info.BaseAddress+info.RegionSize);
         else watchdog_set_image((uintptr_t)image,(uintptr_t)image+64*1024*1024);
     }
-    if (timeout_seconds || getenv("BB_R1_WATCH")) {
+    if (timeout_seconds || getenv("BB_R1_WATCH") || getenv("BB_POOL_WATCH")) {
         HANDLE watchdog=CreateThread(NULL,0,watchdog_thread,NULL,0,NULL);
         if (watchdog) CloseHandle(watchdog);
+    }
+    /* bbport: always relocate the R1 registry pool into its own section the instant the game
+     * publishes it, so the GPU's in-place import and any discard of the shared pool section
+     * cannot corrupt it. Not gated by BB_POOL_WATCH (the fix must apply without diagnostics). */
+    {
+        HANDLE pool_protect=CreateThread(NULL,0,pool_protect_thread,NULL,0,NULL);
+        if (pool_protect) CloseHandle(pool_protect);
+    }
+    /* The pool's own watch: the watchdog's rounds are far too slow to catch the moment the
+     * registry's free list is erased, and the pool's page is read too often for a guard page. */
+    if (getenv("BB_POOL_WATCH")) {
+        HANDLE pool_watch=CreateThread(NULL,0,pool_watch_thread,NULL,0,NULL);
+        if (pool_watch) CloseHandle(pool_watch);
     }
 #endif
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};

@@ -48,6 +48,68 @@ static FILE *memory_log(void) {
     if (!log) log=fopen("memory.txt","w");
     return log;
 }
+/* bbport: a window of the guest's memory is watched (diagnostics). The probe hands the registry's
+ * node pool over once the game has made it (runtime_memory_watch_range): the pool is the game's
+ * own operator-new block inside a direct-memory region the game itself owns, so the runtime's own
+ * hand in its emptying has to be told apart from the game's allocator doing it. Every mapping
+ * operation that lands on the window is said - a mapping placed over it, an unmapping, a release
+ * of the physical memory behind it, a protection change, a write through the backing view. */
+static uintptr_t watch_va_lo, watch_va_hi;
+static uint64_t watch_phys_lo, watch_phys_hi;
+static int watch_on;
+/* bbport: a ring of every mapping operation (place / unmap / release / protect / write-backing),
+ * with the guest call sites, so the pool watch can ask what touched the pool's range even after
+ * the fact. watch_note's static phys-window is taken from the pool's ORIGINAL phys and misses a
+ * remap to a different phys, so an unconditional log is needed to catch that case. */
+#define MEMOP_RING 512
+static struct { const char *what; int is_phys; uint64_t start, size; uint64_t sites[3]; } memop_ring[MEMOP_RING];
+static _Atomic uint64_t memop_seq;
+static void memop_record(const char *what, int is_phys, uint64_t start, uint64_t size, uint64_t *sites) {
+    const uint64_t s=atomic_fetch_add(&memop_seq,1)%MEMOP_RING;
+    memop_ring[s].what=what; memop_ring[s].is_phys=is_phys;
+    memop_ring[s].start=start; memop_ring[s].size=size;
+    memop_ring[s].sites[0]=sites?sites[0]:0; memop_ring[s].sites[1]=sites?sites[1]:0;
+    memop_ring[s].sites[2]=sites?sites[2]:0;
+}
+int runtime_memory_op_dump(char *buf, size_t n) {
+    uint64_t head=atomic_load(&memop_seq);
+    int w=0;
+    for (uint64_t k=0;k<MEMOP_RING && (size_t)w<n-1;++k) {
+        const uint64_t idx=(head-1-k)%MEMOP_RING;
+        const char *what=memop_ring[idx].what;
+        if (!what) continue;
+        w+=snprintf(buf+w,n-w,"  %s %s %#llx+%#llx from +%#llx < +%#llx < +%#llx\n",
+                    what, memop_ring[idx].is_phys?"phys":"va",
+                    (unsigned long long)memop_ring[idx].start,(unsigned long long)memop_ring[idx].size,
+                    (unsigned long long)memop_ring[idx].sites[0],
+                    (unsigned long long)memop_ring[idx].sites[1],
+                    (unsigned long long)memop_ring[idx].sites[2]);
+    }
+    return w;
+}
+static void watch_note(const char *what, int is_phys, uint64_t start, uint64_t size) {
+    if (!watch_on) return;
+    uint64_t sites[3]={0,0,0};
+    runtime_guest_call_sites(sites);
+    memop_record(what,is_phys,start,size,sites);   /* unconditional: a remap to a different phys would miss the window */
+    const uint64_t end=start+size;
+    if (is_phys ? !(end>watch_phys_lo && start<watch_phys_hi)
+                : !(end>watch_va_lo && start<watch_va_hi)) return;
+    fprintf(stderr,"Runtime: WATCH %s %s %#llx+%#llx of %#llx..%#llx from +%#llx < +%#llx < +%#llx\n",
+            what,is_phys?"phys":"va",(unsigned long long)start,(unsigned long long)size,
+            (unsigned long long)(is_phys?watch_phys_lo:watch_va_lo),
+            (unsigned long long)(is_phys?watch_phys_hi:watch_va_hi),
+            (unsigned long long)sites[0],(unsigned long long)sites[1],(unsigned long long)sites[2]);
+    fflush(stderr);
+}
+/* bbport: the probe is told where a mapping was placed (diagnostics): the pool's page must be
+ * watched from the instant it exists, not from the instant the game publishes its base, or the
+ * write that recycles it is over before the watch is on. The hook runs with the runtime's write
+ * lock held, so it must not ask the runtime anything. */
+static void (*hook_place)(uintptr_t address, uint64_t size, uint64_t phys);
+void runtime_memory_set_place_hook(void (*hook)(uintptr_t address, uint64_t size, uint64_t phys)) {
+    hook_place=hook;
+}
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
@@ -74,6 +136,10 @@ static uint64_t pool_size_bytes(void) {
  * of a megabyte (it holds them all and maps the ones it needs), so the table has to hold
  * as many blocks as the pool can be divided into. */
 #define LIMIT 65536
+/* The R1 pool's guest (==host) virtual address and the region around it, for the
+ * "POOL HIT" diagnostic that flags any read/write into it. */
+#define R1_POOL_VA_LO UINT64_C(0x800410000)
+#define R1_POOL_VA_HI UINT64_C(0x800810000)
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
 #define ACCESS ((int32_t)UINT32_C(0x8002000d))
@@ -148,7 +214,29 @@ static int *chunk_fds; /* per CHUNK of direct memory: -1 not decided, -2 memfd, 
 /* Drivers whose dma-buf maps at offset 0 only (NVIDIA): a chunk per direct allocation instead of
  * the CHUNK grid. The game maps each of its allocations once, whole, so its mappings and the
  * backing view start at offset 0 of their chunk. */
-static unsigned char *backing_base; /* second view of the pool: host writes bypass guest/GPU page protection */
+#ifndef _WIN32
+static unsigned char *backing_base; /* non-Windows: whole-pool host alias (second view) */
+#endif
+#ifdef _WIN32
+/* Windows: the pool is host-aliased per 256 MiB chunk (backing_views[c]) because a single
+ * multi-GiB MapViewOfFile intermittently fails to find a contiguous hole once the many
+ * loaded DLLs fragment the address space (which made pool_fd creation fail -> libc heap abort). */
+static unsigned char **backing_views; static size_t backing_nchunks;
+#endif
+/* Forward declaration: phys_backing_ptr is defined further below but used early (add_region, pool). */
+static unsigned char *phys_backing_ptr(uint64_t phys);
+static uint64_t chunk_size(uint64_t c);
+/* bbport: the R1 registry node pool is moved into its own dedicated section (r1_pool_fd) so that
+ * neither the GPU's in-place import of direct-memory chunks (HostImport aliases the shared pool's
+ * physical pages in place) nor any discard/zero of that shared section can reach the live pool.
+ * Detected once the game publishes the pool's base (image+0x161d080). See
+ * runtime_memory_protect_r1_pool. */
+static int r1_pool_fd=-1;
+static unsigned char *r1_pool_base;
+static uint64_t r1_pool_phys, r1_pool_size;
+static uint64_t r1_pool_off; /* offset of the pool's first byte within r1_pool_fd (0x40: the pool
+                                starts 0x40 past the aligned base of the direct region) */
+static int r1_pool_active;
 static int whole_chunks;
 static int lazy_chunks; /* the GPU's memory for a chunk is made when the GPU asks for it */
 typedef struct { uint64_t phys, size; int fd; } Region;
@@ -167,7 +255,7 @@ static const Region *region_at(uint64_t phys, uint64_t *next) {
 static void add_region(uint64_t phys, uint64_t size) {
     if (region_count==MAX_REGIONS) return;
     int fd=chunk_alloc(phys,size);
-    if (fd>=0 && !platform_section_map(fd,backing_base+phys,size,0,BB_PROT_READ|BB_PROT_WRITE)) {
+    if (fd>=0 && !platform_section_map(fd,phys_backing_ptr(phys),size,0,BB_PROT_READ|BB_PROT_WRITE)) {
         platform_section_release(fd);
         fd=-1;
     }
@@ -198,13 +286,28 @@ static int host_prot(int prot) {
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (pool_fd>=0) return 0;
-    if (platform_section_create(&pool_fd,(size_t)(POOL_SIZE+FLEX_SPAN),"bb-guest-memory")) return -1;
+    /* pool_fd backs direct memory only ([0,POOL_SIZE)); flexible memory is its own section
+     * (flex_fd). Sizing it POOL_SIZE+FLEX_SPAN wastes a GiB of pagefile-backed commit charge. */
+    if (platform_section_create(&pool_fd,(size_t)POOL_SIZE,"bb-guest-memory")) return -1;
+#ifdef _WIN32
+    /* Host-alias the pool per 256 MiB chunk: no multi-GiB contiguous view is needed, so pool_fd
+     * creation no longer depends on finding a large free hole in the (DLL-fragmented) address space. */
+    backing_nchunks=(POOL_SIZE+CHUNK-1)/CHUNK;
+    backing_views=calloc(backing_nchunks,sizeof(*backing_views));
+    if (!backing_views) return -1;
+    for (size_t c=0;c<backing_nchunks;++c) {
+        const uint64_t cs=chunk_size(c);
+        if (!cs) continue;
+        unsigned char *v=platform_section_map(pool_fd,NULL,(size_t)cs,c*CHUNK,BB_PROT_READ|BB_PROT_WRITE);
+        if (!v) fprintf(stderr,"Runtime: backing chunk %zu (phys %#" PRIx64 ") map failed\n",c,c*CHUNK);
+        backing_views[c]=v;
+    }
+#else
     void *view=platform_section_backing(pool_fd,(size_t)(POOL_SIZE+FLEX_SPAN));
     if (!view) return -1;
-    /* The flexible memory has a section of its own: it is the game's heap, and the
-     * section of the pool is the direct memory (which the GPU shares). */
-    if (platform_section_create(&flex_fd,(size_t)FLEX_SPAN,"bb-guest-flexible")) return -1;
     backing_base=view;
+#endif
+    if (platform_section_create(&flex_fd,(size_t)FLEX_SPAN,"bb-guest-flexible")) return -1;
     chunk_fds=malloc((POOL_SIZE/CHUNK+1)*sizeof(int));
     if (!chunk_fds) return -1;
     for (uint64_t c=0;c<=POOL_SIZE/CHUNK;++c) chunk_fds[c]=-1;
@@ -243,7 +346,7 @@ static void ensure_chunks(uint64_t phys, uint64_t size) {
             continue;
         }
         int fd=chunk_alloc ? chunk_alloc(c*CHUNK,chunk_size(c)) : -1;
-        if (fd>=0 && !platform_section_map(fd,backing_base+c*CHUNK,chunk_size(c),0,BB_PROT_READ|BB_PROT_WRITE)) {
+        if (fd>=0 && !platform_section_map(fd,phys_backing_ptr(c*CHUNK),chunk_size(c),0,BB_PROT_READ|BB_PROT_WRITE)) {
             platform_section_release(fd);
             fd=-1;
         }
@@ -252,6 +355,16 @@ static void ensure_chunks(uint64_t phys, uint64_t size) {
 }
 /* mmap of direct or flexible memory at phys, split where it crosses chunks. */
 static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys) {
+    /* bbport: the R1 registry pool lives in its own section (runtime_memory_protect_r1_pool
+     * moved it there); map it from that section so the GPU's import of the shared chunk and any
+     * discard of that chunk cannot reach the live pool. The pool is small and contiguous, so a
+     * single view covers it. */
+    if (r1_pool_active && phys>=r1_pool_phys && phys+size<=r1_pool_phys+r1_pool_size) {
+        const uint64_t off=(phys-r1_pool_phys)+r1_pool_off;
+        void *m=platform_section_map(r1_pool_fd,(void *)address,size,off,prot);
+        if (m) return m;
+        return platform_section_map(r1_pool_fd,NULL,size,off,prot);
+    }
     /* The flexible memory is in the section of its own; the direct memory in the pool's.
      * The offset in the section is the place in the pool, not in the section. */
     const int section = phys>=POOL_SIZE ? flex_fd : pool_fd;
@@ -329,13 +442,13 @@ static void zero_phys(uint64_t phys, uint64_t size) {
             uint64_t next;
             const Region *r=region_at(at,&next);
             const uint64_t room=r ? r->phys+r->size-at : next-at, n=size-done<room ? size-done : room;
-            if (r && GPU_CHUNK(r->fd)) memset(backing_base+at,0,n);
+            if (r && GPU_CHUNK(r->fd)) memset(phys_backing_ptr(at),0,n);
             else platform_section_punch_hole(pool_fd,at,(size_t)n);
             done+=n;
             continue;
         }
         const uint64_t c=at/CHUNK, room=c*CHUNK+chunk_size(c)-at, n=size-done<room ? size-done : room;
-        if (GPU_CHUNK(chunk_fds[c])) memset(backing_base+at,0,n);
+        if (GPU_CHUNK(chunk_fds[c])) memset(phys_backing_ptr(at),0,n);
         else platform_section_punch_hole(pool_fd,at,(size_t)n);
         done+=n;
     }
@@ -515,6 +628,9 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     }
     drop_range(address,address+size);
     trap_forget(address,address+size); /* a new mapping starts without traps */
+    watch_note("place",0,address,size);
+    if (phys) watch_note("place-phys",1,phys,size);
+    if (kind==KIND_DIRECT && hook_place) hook_place(address,size,phys);
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
@@ -561,6 +677,10 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
                                   uint64_t alignment, int type, int64_t *out) {
     if (!alignment) alignment = PAGE;
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10) {
+        fprintf(stderr,"Runtime:   direct_allocate INVALID: out=%p low=%lld high=%lld size=%llu alignment=%llu (PAGE=%llu, valid_align=%d) type=%d\n",
+                (void *)out,(long long)low,(long long)high,(unsigned long long)size,
+                (unsigned long long)alignment,(unsigned long long)PAGE,(int)(alignment>=PAGE&&alignment<=POOL_SIZE&&!(alignment&(alignment-1))),
+                type);
         direct_note(size,alignment,1);
         return INVALID;
     }
@@ -576,8 +696,12 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
         return NO_SPACE;
     }
     write_lock();
-    if (pool()) { write_unlock(); direct_note(size,alignment,1); return NO_MEMORY; }
-    if (block_count>=LIMIT) { write_unlock(); direct_note(size,alignment,1); return NO_SPACE; }
+    if (pool()) { fprintf(stderr,"Runtime:   direct_allocate NO_MEMORY: pool_fd not ready (pool() failed) for size=%llu low=%lld high=%lld\n",
+                         (unsigned long long)size,(long long)low,(long long)high);
+                  write_unlock(); direct_note(size,alignment,1); return NO_MEMORY; }
+    if (block_count>=LIMIT) { fprintf(stderr,"Runtime:   direct_allocate NO_SPACE: block_count=%d>=LIMIT for size=%llu\n",
+                                     block_count,(unsigned long long)size);
+                              write_unlock(); direct_note(size,alignment,1); return NO_SPACE; }
     uint64_t start = align_up((uint64_t)low, alignment);
     /* The lowest free gap of the needed size at or after the given address: the blocks
      * are in order, so one pass over them says where the gaps are (the game asks for
@@ -735,6 +859,7 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
         }
     for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i) {
         uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
+        watch_note("unmap",0,a,b-a);
         platform_unmap((void *)a,b-a);
     }
     drop_range(start,end);
@@ -768,6 +893,7 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
             fflush(log);
         }
     }
+    watch_note("release",1,start,size);
     write_lock();
     if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
     /* Mappings of released physical pages disappear with them. */
@@ -910,6 +1036,7 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     uintptr_t end=start+align_up(size,PAGE);
     start&=~(uintptr_t)(PAGE-1);
     if ((prot & ~0x37) || !covered(start,end,0)) return INVALID;
+    watch_note("protect",0,start,end-start);
     if (platform_protect((void *)start,end-start,host_prot(prot))) return INVALID;
     trap_reapply(start,end); /* pages with write traps stay read-only */
     int error; size_t i=carve(start,end,&error);
@@ -1085,8 +1212,123 @@ static void *toggle_watcher(void *path) {
 }
 /* bbport: the GPU library provides direct memory chunks (see CHUNK). */
 void runtime_memory_set_guest_chunk_whole(int whole) { whole_chunks=whole; }
+/* bbport: the host view of direct memory phys, routed to the R1 pool's dedicated section when phys
+ * falls inside it (the pool was moved there by runtime_memory_protect_r1_pool). */
+static unsigned char *phys_backing_ptr(uint64_t phys) {
+    if (r1_pool_active && phys>=r1_pool_phys && phys<r1_pool_phys+r1_pool_size)
+        return r1_pool_base+r1_pool_off+(phys-r1_pool_phys);
+#ifdef _WIN32
+    if (phys>=POOL_SIZE) return NULL;
+    const size_t c=(size_t)(phys/CHUNK);
+    if (c>=backing_nchunks || !backing_views[c]) return NULL;
+    return backing_views[c]+(phys-c*CHUNK);
+#else
+    return backing_base+phys;
+#endif
+}
 /* bbport: the host address of direct memory phys in the backing view (host memory import). */
-void *runtime_memory_backing_pointer(uint64_t phys) { return backing_base ? backing_base+phys : NULL; }
+void *runtime_memory_backing_pointer(uint64_t phys) {
+    return phys_backing_ptr(phys);
+}
+/* bbport: move the R1 registry node pool out of the shared pool section into its own dedicated
+ * section, and re-point the guest mapping there. After this the pool's bytes live only in
+ * r1_pool_fd. The GPU's in-place import (HostImport) of the shared chunk aliases the shared
+ * section's physical pages, which now no longer hold the pool, and any discard/zero of that shared
+ * section (a MEM_RESET or a replaced mapping) cannot reach the live pool. Idempotent.
+ *
+ * The pool is a 3 MiB allocation that begins 0x40 bytes into the direct region's
+ * allocation-granularity-aligned block (guest 0x800410040, region base 0x800410000). A section
+ * view's base AND offset must each be a multiple of the allocation granularity (65536), so the
+ * pool's own guest range cannot be a standalone view. We therefore move the whole aligned block
+ * that contains the pool (prefix + pool + granularity tail) out of the shared section into
+ * r1_pool_fd, mapped at the aligned region base, and re-map the rest of the (1 GiB) direct region
+ * back from pool_fd. All offsets below are derived from the covering VMA, never hard-coded. */
+int runtime_memory_protect_r1_pool(uint64_t phys, uint64_t size) {
+    if (r1_pool_active) return 0;
+    if (!size || phys>=POOL_SIZE || phys+size>POOL_SIZE) return -1;
+    size=align_up(size,PAGE);
+    const size_t gran=(size_t)platform_granularity();
+    /* Find the direct-memory VMA that covers the pool (it is the whole 1 GiB region). */
+    Vma *v=NULL;
+    for (size_t i=0;i<vma_count;i++) {
+        if (vmas[i].kind==KIND_DIRECT &&
+            vmas[i].phys<=phys && phys+size<=vmas[i].phys+(vmas[i].end-vmas[i].start)) {
+            v=&vmas[i]; break;
+        }
+    }
+    if (!v) {
+        fprintf(stderr,"Runtime: R1 pool protect: no direct VMA covers phys %#llx (nothing to relocate)\n",
+                (unsigned long long)phys);
+        fflush(stderr);
+        return -1;
+    }
+    const uintptr_t region_start=v->start;
+    const uint64_t region_phys=v->phys;
+    const uintptr_t region_end=v->end;
+    const uintptr_t pool_guest_va=region_start+(phys-region_phys);
+    const uintptr_t aligned_base=region_start & ~((uintptr_t)gran-1);
+    const uint64_t pool_off=pool_guest_va-aligned_base;            /* 0x40 */
+    const uint64_t r1_size=align_up(pool_off+size,(uint64_t)gran); /* prefix+pool+gran-tail */
+    if (aligned_base+pool_off!=pool_guest_va || pool_off>=r1_size) {
+        fprintf(stderr,"Runtime: R1 pool protect: alignment inconsistency (base %#llx off %#llx size %#llx)\n",
+                (unsigned long long)aligned_base,(unsigned long long)pool_off,(unsigned long long)r1_size);
+        fflush(stderr);
+        return -1;
+    }
+    /* Snapshot the whole aligned block (prefix + pool + granularity tail) out of the shared section
+     * before it is unmapped. The shared section keeps its bytes, so this is the good state. The tail
+     * past the pool is copied too so any allocation that landed in the slack reads its original bytes. */
+    if (platform_section_create(&r1_pool_fd,(size_t)r1_size,"bb-r1-pool")) return -1;
+    void *view=platform_section_backing(r1_pool_fd,(size_t)r1_size);
+    if (!view) { platform_section_release(r1_pool_fd); r1_pool_fd=-1; return -1; }
+    r1_pool_base=view;
+    memcpy(r1_pool_base, phys_backing_ptr(region_phys), (size_t)r1_size);
+    /* Move the mapping under the write lock so no fault lands in the gap while we swap the views. */
+    write_lock();
+    /* 1) Release the entire existing direct-region view (its allocation base is region_start;
+     *    platform_unmap_full finds it via VirtualQuery even if region_start were unaligned). */
+    int un=platform_unmap_full((void *)region_start);
+    /* 2) Map the dedicated section across the pool's aligned block. */
+    void *m=platform_section_map(r1_pool_fd,(void *)aligned_base,(size_t)r1_size,0,v->prot);
+    int r1_ok=m?1:0;
+    /* 3) Re-map the rest of the direct region from the shared section, preserving phys continuity. */
+    int rest_ok=1;
+    const uintptr_t remap_start=aligned_base+r1_size;
+    if (region_end > remap_start) {
+        const uint64_t remap_off=region_phys+(remap_start-region_start);
+        void *r=platform_section_map(pool_fd,(void *)remap_start,(size_t)(region_end-remap_start),remap_off,v->prot);
+        rest_ok=r?1:0;
+        if (!r) fprintf(stderr,"Runtime:   R1 pool protect: remainder remap FAILED (end %#llx off %#llx err %d)\n",
+                        (unsigned long long)region_end,(unsigned long long)remap_off,platform_last_error());
+    }
+    if (!r1_ok) fprintf(stderr,"Runtime:   R1 pool protect: r1 section map FAILED err %d\n",platform_last_error());
+    /* 4) Decisive check: write a sentinel into r1_pool_fd and read it back through the guest VA.
+     *    If the guest VA now reads the sentinel, the live mapping is on r1_pool_fd (isolated); if it
+     *    reads the original pool head, the remap did not take and the pool is still shared. */
+    uint64_t *base=(uint64_t*)r1_pool_base;
+    const size_t pool_idx=(size_t)(pool_off/sizeof(uint64_t));
+    uint64_t saved=base[pool_idx];
+    base[pool_idx]=0xDEADBEEFCAFEBABEULL;
+    uint64_t via_va=*(volatile uint64_t*)pool_guest_va;
+    base[pool_idx]=saved;
+    write_unlock();
+    r1_pool_phys=phys; r1_pool_size=size; r1_pool_off=pool_off;
+    if (r1_ok && rest_ok && via_va==0xDEADBEEFCAFEBABEULL) {
+        r1_pool_active=1;
+        fprintf(stderr,"Runtime: R1 pool relocated to its own section (guest %#llx phys %#llx size %#llx); "
+                        "live view isolated (sentinel verified)\n",
+                (unsigned long long)pool_guest_va,(unsigned long long)phys,(unsigned long long)size);
+    } else {
+        fprintf(stderr,"Runtime: R1 pool relocation INCOMPLETE: unmap=%d r1_ok=%d rest_ok=%d via_va=%#llx (pool still shared!)\n",
+                un,r1_ok,rest_ok,(unsigned long long)via_va);
+    }
+    fflush(stderr);
+    return 0;
+}
+/* bbport diagnostics: the index of the section the direct memory (the pool) lives in. The pool
+ * watch asks for it so that the platform layer can say every mapping of that section out loud: a
+ * mapping of it at an address the host picks is a third view of the pool's own bytes. */
+int runtime_memory_pool_section(void) { return pool_fd; }
 void runtime_memory_set_guest_chunk_allocator(int (*alloc)(uint64_t phys, uint64_t size)) {
     write_lock();
     chunk_alloc=alloc;
@@ -1103,7 +1345,7 @@ int runtime_memory_guest_chunk_gpu(uint64_t phys, uint64_t size) {
     int fd=chunk_fds[c];
     if (fd==CHUNK_PENDING) {
         fd=chunk_alloc(c*CHUNK,chunk_size(c));
-        if (fd>=0 && !platform_section_map(fd,backing_base+c*CHUNK,chunk_size(c),0,BB_PROT_READ|BB_PROT_WRITE)) {
+        if (fd>=0 && !platform_section_map(fd,phys_backing_ptr(c*CHUNK),chunk_size(c),0,BB_PROT_READ|BB_PROT_WRITE)) {
             platform_section_release(fd);
             fd=-1;
         }
@@ -1289,6 +1531,42 @@ int runtime_memory_direct_phys(uintptr_t address, uint64_t *phys, uintptr_t *end
     read_unlock();
     return ok;
 }
+/* bbport: watch the window at a guest address (diagnostics): the probe hands the registry's node
+ * pool over once the game has made it. The physical range behind it is derived here, so a release
+ * of that physical memory is seen as well. */
+void runtime_memory_watch_range(uintptr_t address, uint64_t size) {
+    uint64_t phys=0; uintptr_t end=0;
+    watch_va_lo=address; watch_va_hi=address+size;
+    watch_phys_lo=watch_phys_hi=0;
+    if (size && runtime_memory_direct_phys(address,&phys,&end) && end>=address+size) {
+        watch_phys_lo=phys; watch_phys_hi=phys+size;
+    }
+    watch_on=1;
+    fprintf(stderr,"Runtime: watching the window %#llx+%#llx (phys %#llx)\n",
+            (unsigned long long)address,(unsigned long long)size,(unsigned long long)watch_phys_lo);
+    fflush(stderr);
+}
+/* bbport: the guest ranges that show the same direct memory as [address, address+size) - its
+ * aliases (diagnostics). The game maps one physical allocation at more than one address when it
+ * wants two views of it, and a write through either view is a write into the same memory, so the
+ * pool watch has to guard every one of them. Returns how many were written, at most max. */
+int runtime_memory_aliases(uintptr_t address, uint64_t size, uintptr_t *starts, uintptr_t *ends,
+                           int max) {
+    int n=0;
+    read_lock();
+    const size_t i=vma_index(address);
+    if (i<vma_count && vmas[i].start<=address && vmas[i].kind==KIND_DIRECT && size) {
+        const uint64_t phys=vmas[i].phys+(address-vmas[i].start);
+        for (size_t j=0;j<vma_count && n<max;++j) {
+            const uint64_t length=vmas[j].end-vmas[j].start;
+            if (vmas[j].kind!=KIND_DIRECT || vmas[j].phys+length<=phys || phys+size<=vmas[j].phys)
+                continue;
+            starts[n]=vmas[j].start; ends[n]=vmas[j].end; ++n;
+        }
+    }
+    read_unlock();
+    return n;
+}
 /* bbport: protection and direct memory type of the mapping at address (type -1: not direct
  * memory); 0 when nothing is mapped there. */
 int runtime_memory_vma_info(uintptr_t address, int *prot, int *type, uintptr_t *end) {
@@ -1320,13 +1598,23 @@ static void store_once(unsigned char *dst, const unsigned char *src, uint64_t n)
     }
 }
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
+    /* bbport diagnostic: flag host-side writes (GPU readbacks, etc.) that land inside
+     * the R1 registry node pool (guest 0x800410000..0x800410000+0x400000). */
+    if (size && address < R1_POOL_VA_HI && address+size > R1_POOL_VA_LO) {
+        char line[200];
+        const int m=snprintf(line,sizeof(line),
+            "POOL HIT: write_backing %" PRIu64 " bytes into R1 pool region addr=%p\n",
+            (unsigned long long)size,(void *)(uintptr_t)address);
+        if (m>0) platform_write_stdout(line,(size_t)m);
+    }
     read_lock();
     int ok=1;
     for (uintptr_t at=address, end=address+size; at<end && ok;) {
         size_t i=vma_index(at);
         if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
         uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
-        store_once(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
+        watch_note("write-backing",0,at,n);
+        store_once(phys_backing_ptr(vmas[i].phys+(at-vmas[i].start)),(const unsigned char *)data+(at-address),n);
         at+=n;
     }
     read_unlock();
@@ -1344,7 +1632,7 @@ void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size) {
         uint64_t n;
         if (i<vma_count && vmas[i].start<=at && vmas[i].kind!=KIND_RESERVED) {
             n=(vmas[i].end<end ? vmas[i].end : end)-at;
-            memcpy(out+(at-address),backing_base+vmas[i].phys+(at-vmas[i].start),n);
+            memcpy(out+(at-address),phys_backing_ptr(vmas[i].phys+(at-vmas[i].start)),n);
         } else {
             const uintptr_t next=i==vma_count ? end : vmas[i].start>at ? vmas[i].start : vmas[i].end;
             n=(next<end ? next : end)-at;

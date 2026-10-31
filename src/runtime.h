@@ -65,6 +65,10 @@ uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_describe(uintptr_t address, char *buffer, size_t size);
+/* bbport (diagnostics): dumps the ring of recent mapping operations (place/unmap/release/
+ * protect/write-backing) with guest call sites, so the pool watch can see what remapped the
+ * pool's physical range even after the fact. Returns characters written. */
+int runtime_memory_op_dump(char *buffer, size_t size);
 /* Puts the guest's own protection back on a page the GPU tracking left write-protected,
  * so the write that faulted goes on. The thread's context is not touched. */
 int runtime_memory_restore_access(void *context, uintptr_t address, int repeated);
@@ -73,7 +77,30 @@ void runtime_memory_set_guest_chunk_lazy(int lazy);
 /* The CPU is about to write the range outside guest code (a file read): tells the GPU side. */
 void runtime_memory_note_write(uintptr_t address, uint64_t size);
 void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size);
+/* The copies the HLE'd C library makes (memset/memcpy/memmove) into the watched window are named
+ * by the probe (diagnostics): the game's code that asked for the copy is printed. */
+void bb_cpu_copy_note(const char *what, const void *destination, uint64_t size, const void *caller);
 void runtime_memory_prepare_cpu_write(uintptr_t address, uint64_t size);
+/* One window of the guest's memory is watched (diagnostics): every mapping operation that lands
+ * on it is said. */
+void runtime_memory_watch_range(uintptr_t address, uint64_t size);
+/* The runtime says where a mapping was placed (diagnostics): the probe watches the pool's page
+ * from the instant it exists. The hook runs with the runtime's write lock held. */
+void runtime_memory_set_place_hook(void (*hook)(uintptr_t address, uint64_t size, uint64_t phys));
+/* The guest ranges that show the same direct memory as [address, address+size) (diagnostics). */
+int runtime_memory_aliases(uintptr_t address, uint64_t size, uintptr_t *starts, uintptr_t *ends,
+                           int max);
+/* Where direct memory at a guest address lives (diagnostics): its offset into the host's view and
+ * the end of the mapping. 0 for anything that is not direct memory. */
+int runtime_memory_direct_phys(uintptr_t address, uint64_t *phys, uintptr_t *end);
+/* The host's own view of the same bytes: a second name for the direct memory at phys. Writes
+ * through it are stores the guest's page protection and the breakpoints do not see. */
+void *runtime_memory_backing_pointer(uint64_t phys);
+/* bbport: move the R1 registry node pool (guest direct memory at phys..phys+size) into its own
+ * dedicated section so that neither the GPU's in-place import of direct-memory chunks (which
+ * aliases the shared pool's physical pages) nor any discard/zero of that shared section can reach
+ * the live pool. Called once the game publishes the pool's base address. Idempotent. */
+int runtime_memory_protect_r1_pool(uint64_t phys, uint64_t size);
 /* bbport (frame stats): a guest thread was blocked `ns` in the runtime (0 cond, 1 mutex, 2 sema, 3 sleep). */
 void runtime_wait_note(int kind, uint64_t ns);
 /* What a thread waits for (BB_WAIT_TRACE=1 says it): the name is remembered per thread
@@ -164,6 +191,9 @@ uintptr_t runtime_net_resolve(const char *name);
 /* Guest threads for host code (the online module's NP threads); 0 or a positive errno value. */
 int32_t runtime_thread_spawn(void **thread, void *(ABI *entry)(void *), void *argument, uint64_t stack, const char *name);
 int32_t runtime_thread_join_spawned(void *thread, void **result);
+/* The guest start PC of the calling thread (the CApplicationBase entry, &c.): said at a
+ * fault so a null-pointer jump can be placed inside the thread's code. 0 if unknown. */
+uintptr_t runtime_thread_current_entry(void);
 void runtime_file_report(void);
 void runtime_file_configure(const char *app0, const char *user);
 int runtime_file_mount(const char *guest, const char *host);

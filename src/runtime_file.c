@@ -494,6 +494,26 @@ static void guest_site(char *out, size_t size) {
     snprintf(out,size," from +%#" PRIx64 " < +%#" PRIx64 " < +%#" PRIx64,
              sites[0],sites[1],sites[2]);
 }
+/* bbport diagnostic: flag any file read whose destination lands inside the R1
+ * registry node pool (guest 0x800410000..0x800410000+0x400000). A pread/memcpy into
+ * it would zero/corrupt the registry - the long-standing NULL-call crash. The pool is
+ * written by the loader thread, which may not carry the watch's Dr breakpoints, so the
+ * normal pool watch misses it; this catches it at the read boundary instead. */
+#define R1_POOL_VA_LO UINT64_C(0x800410000)
+#define R1_POOL_VA_HI UINT64_C(0x800810000)
+static void note_read_to_pool(const char *kind, const void *buffer, uint64_t n) {
+    if (!n) return;
+    const uintptr_t b=(uintptr_t)buffer, e=b+n;
+    if (b < R1_POOL_VA_HI && e > R1_POOL_VA_LO) {
+        char site[160]="";
+        guest_site(site,sizeof(site));
+        char line[300];
+        const int m=snprintf(line,sizeof(line),
+            "POOL HIT: %s %llu bytes into R1 pool region dst=%p%s\n",
+            kind,(unsigned long long)n,(void *)b,site);
+        if (m>0) platform_write_stdout(line,(size_t)m);
+    }
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (file_trace()) {
@@ -508,6 +528,7 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     ssize_t n=read_retrying(h,buffer,size,0,0);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
+    if (n>0) note_read_to_pool("read",buffer,(uint64_t)n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
@@ -541,6 +562,7 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
         if (length>0) platform_write_stdout(line,(size_t)length);
     }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
+    if (n>0) note_read_to_pool("pread",buffer,(uint64_t)n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }/* Pages the GPU side keeps without access (data newer in VRAM, runtime_memory_trap reasons from

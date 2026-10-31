@@ -296,15 +296,15 @@ void Menu() {
     const char* upscalers[] = {
         BbSettings::MenuText("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1",
         BbSettings::MenuText("TAA (native anti-aliasing)", "TAA (нативное сглаживание)"),
-        "DLSS (NVIDIA RTX)"};
+        "DLSS (NVIDIA RTX)", "XeSS (Intel Xe Super Sampling)"};
     static_assert(sizeof(upscalers) / sizeof(upscalers[0]) == BbSettings::UpscalerCount);
-    static const char* later[] = {"XeSS"};
     int upscaler = s.upscaler;
     if (ImGui::BeginCombo(BbSettings::MenuText("Upscaler", "Апскейлер"), upscalers[upscaler])) {
         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
             const bool supported = i == BbSettings::UpscalerFsr4     ? s.fsr4_supported.load()
                                    : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
                                    : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load()
+                                   : i == BbSettings::UpscalerXess   ? s.xess_supported.load()
                                                                      : true;
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
@@ -317,13 +317,6 @@ void Menu() {
                                                          "— не поддерживается видеокартой"));
             }
         }
-        for (const char* name : later) {
-            ImGui::BeginDisabled();
-            ImGui::Selectable(name, false);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", BbSettings::MenuText("— in development", "— в работе"));
-        }
         ImGui::EndCombo();
     }
     if (s.upscaler == BbSettings::UpscalerDlss) {
@@ -333,6 +326,15 @@ void Menu() {
             "NVIDIA DLSS Super Resolution (видеокарты RTX; Native AA — это DLAA). Нужны мост DLSS "
             "и библиотека NVIDIA рядом с игрой; без них используется FSR 3.1."));
     }
+    if (s.upscaler == BbSettings::UpscalerXess) {
+        Hint(BbSettings::MenuText(
+            "Intel XeSS (Xe Super Sampling; any Vulkan GPU, selects its Intel-XMX or DP4a path "
+            "internally). Needs the XeSS bridge and Intel's library next to the game; otherwise "
+            "FSR 3.1 is used.",
+            "Intel XeSS (Xe Super Sampling; любая видеокарта Vulkan, внутри выбирает путь "
+            "Intel-XMX или DP4a). Нужны мост XeSS и библиотека Intel рядом с игрой; без них "
+            "используется FSR 3.1."));
+    }
     const auto problem_text = [](const char* text) {
         ImGui::PushTextWrapPos();
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "%s", text);
@@ -341,6 +343,11 @@ void Menu() {
     if (const char* problem = s.dlss_problem.load(); problem && s.upscaler == BbSettings::UpscalerDlss) {
         char line[192];
         std::snprintf(line, sizeof(line), "DLSS: %s", problem);
+        problem_text(line);
+    }
+    if (const char* problem = s.xess_problem.load(); problem && s.upscaler == BbSettings::UpscalerXess) {
+        char line[192];
+        std::snprintf(line, sizeof(line), "XeSS: %s", problem);
         problem_text(line);
     }
     if (const char* problem = s.fsr4_problem.load()) {

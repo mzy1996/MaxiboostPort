@@ -59,6 +59,13 @@ void *platform_map_fixed(void *address, size_t size, int prot);
 void *platform_reserve_fixed(void *address, size_t size);
 /* Unmaps a range. */
 void platform_unmap(void *address, size_t size);
+/* Releases the whole mapping that begins at address (VirtualFree(..., MEM_RELEASE) requires the
+ * base address and a zero size; platform_unmap passes a non-zero size, which MEM_RELEASE rejects,
+ * so a dedicated full-unmap is provided for callers that must release a known base). Returns 0 on
+ * success, -1 on failure (the address was not a mapping base). */
+int platform_unmap_full(void *address);
+/* The host's last error code (GetLastError on Windows, errno on POSIX), for diagnostics. */
+int platform_last_error(void);
 /* A section of memory the guest's memory is made of: on Linux a memfd, on Windows a memory
  * section. The runtime keeps the sections in a table and holds their indices, so the type
  * does not leak into it. */

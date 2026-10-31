@@ -90,6 +90,29 @@ void platform_unmap(void *address, size_t size) {
     if (address) VirtualFree(address,size,MEM_RELEASE);
 }
 
+int platform_unmap_full(void *address) {
+    /* The guest's memory is a single MEM_RESERVE reservation into which section views are mapped
+     * with MapViewOfFileEx. Such a view must be unmapped with UnmapViewOfFile on its allocation
+     * base (VirtualFree(...,MEM_RELEASE) is invalid for a mapped view: it returns ERROR_INVALID_
+     * PARAMETER). The runtime records the guest's requested address as the VMA start, but the
+     * view's real allocation base is page-aligned below it, so find it with VirtualQuery first. */
+    if (!address) return -1;
+    MEMORY_BASIC_INFORMATION info;
+    if (!VirtualQuery(address,&info,sizeof(info))) {
+        fprintf(stderr,"platform_unmap_full(%p) query FAILED err=%lu\n",address,GetLastError());
+        return -1;
+    }
+    if (info.State!=MEM_COMMIT) return 0; /* already gone */
+    if (!UnmapViewOfFile(info.AllocationBase)) {
+        fprintf(stderr,"platform_unmap_full(%p base %p size %#llx) UnmapViewOfFile FAILED err=%lu\n",
+                address,info.AllocationBase,(unsigned long long)info.RegionSize,GetLastError());
+        return -1;
+    }
+    return 0;
+}
+
+int platform_last_error(void) { return (int)GetLastError(); }
+
 /* The sections the guest's memory is made of (a memory section on Windows). */
 #define BB_MAX_SECTIONS 512
 static HANDLE sections[BB_MAX_SECTIONS];
@@ -101,7 +124,7 @@ int platform_section_create(int *index, size_t size, const char *name) {
     if (section_count>=BB_MAX_SECTIONS) return -1;
     HANDLE handle=CreateFileMappingW(INVALID_HANDLE_VALUE,NULL,PAGE_READWRITE,
                                       (DWORD)(size>>32),(DWORD)(size&0xffffffffu),NULL);
-    if (!handle) return -1;
+    if (!handle) { fprintf(stderr,"Runtime: platform_section_create FAILED size=%zu err=%lu\n",size,GetLastError()); fflush(stderr); return -1; }
     sections[section_count]=handle;
     section_sizes[section_count]=size;
     *index=(int)section_count;
@@ -124,7 +147,23 @@ void *platform_section_map(int index, void *address, size_t size, uint64_t offse
 void *platform_section_backing(int index, size_t size) {
     if (index<0 || (size_t)index>=section_count) return NULL;
     (void)size;
-    return MapViewOfFile(sections[index],FILE_MAP_ALL_ACCESS,0,0,0);
+    const size_t full=section_sizes[index];
+    /* Reserve a contiguous window first so the view has a guaranteed hole to land in.
+     * MapViewOfFile with no address intermittently fails to place a multi-GiB view when the
+     * many loaded DLLs fragment the lower address space; the reservation (which costs no
+     * physical memory) lets us map at an exact, properly aligned address via MapViewOfFileEx. */
+    void *res=VirtualAlloc(NULL,full,MEM_RESERVE,PAGE_READWRITE);
+    if (res) {
+        void *view=MapViewOfFileEx(sections[index],FILE_MAP_ALL_ACCESS,0,0,full,res);
+        if (view) return view;
+        const DWORD e=GetLastError();
+        VirtualFree(res,0,MEM_RELEASE);
+        fprintf(stderr,"Runtime: platform_section_backing MapViewOfFileEx FAILED size=%zu err=%lu (reserved %p)\n",
+                full,e,res); fflush(stderr);
+    }
+    void *view=MapViewOfFile(sections[index],FILE_MAP_ALL_ACCESS,0,0,0);
+    if (!view) { fprintf(stderr,"Runtime: platform_section_backing FAILED size=%zu err=%lu\n",full,GetLastError()); fflush(stderr); }
+    return view;
 }
 
 void platform_section_release(int index) {
@@ -136,6 +175,12 @@ void platform_section_release(int index) {
 int platform_section_punch_hole(int index, uint64_t offset, size_t size) {
     /* The pages are given back to the host and read as zero again (MEM_RESET). */
     if (index<0 || (size_t)index>=section_count) return -1;
+    /* bbport (diagnostics): every punch hole is said with its section index and offset, so the
+     * zeroing of the registry pool's physical range (guest 0x800410040, phys ~0x4900040, pool is
+     * section index 0) is named even though no runtime memory operation lands on it. */
+    fprintf(stderr,"Runtime: PUNCH section %d offset %#llx size %#zx\n",
+            index,(unsigned long long)offset,size);
+    fflush(stderr);
     void *view=MapViewOfFileEx(sections[index],FILE_MAP_ALL_ACCESS,
                                (DWORD)(offset>>32),(DWORD)(offset&0xffffffffu),size,NULL);
     if (!view) return -1;

@@ -23,6 +23,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_xess.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -291,6 +292,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     // bbport: DLSS (optional bridge library) needs its own instance extensions.
     if (Dlss* dlss = Dlss::Get()) {
         dlss->AppendInstanceExtensions(extensions);
+    }
+    // bbport: XeSS (optional bridge library) needs its own instance extensions (usually none;
+    // it is compute-based and runs on any vendor).
+    if (Xess* xess = Xess::Get()) {
+        xess->AppendInstanceExtensions(extensions);
     }
 
     const vk::ApplicationInfo application_info = {
