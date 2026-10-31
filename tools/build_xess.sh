@@ -52,6 +52,12 @@ fi
 
 if [[ "${OS:-}" == Windows_NT || "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
     msys=${MSYS2_ROOT:-/c/devkitPro/msys2}
+    # A native Windows CMake and ninja are required: the MSYS2 ones rewrite the Windows paths of the
+    # command line and break the compiler. clang64's are native; mingw64's gcc/g++ are the compiler.
+    for clang_bin in "$msys/clang64/bin" "$msys/mingw64/bin"; do
+        [[ -x $clang_bin/cmake.exe ]] && export PATH="$clang_bin:$PATH"
+        [[ -x $clang_bin/ninja.exe ]] && export PATH="$clang_bin:$PATH"
+    done
     vulkan_include=$(cygpath -m "$msys/mingw64/include" 2>/dev/null || echo "$msys/mingw64/include")
     cmake -S gpu/xess_bridge -B out/xess-bridge -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DXESS_SDK_ROOT="$sdk" -DVULKAN_INCLUDE="$vulkan_include" > /dev/null
