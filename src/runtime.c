@@ -205,6 +205,8 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
    game's data ends up beside the host's own. */
 uintptr_t runtime_cpu_watch_lo, runtime_cpu_watch_hi;
 uintptr_t runtime_guest_watch_lo, runtime_guest_watch_hi;
+uintptr_t runtime_image_base;
+uint64_t runtime_image_bytes;
 static size_t copy_watch_min = 0;
 static int copy_watch_ready = 0;
 static void watch_copy(const char *what, const void *dst, size_t size, const void *caller) {
@@ -223,7 +225,11 @@ static void watch_copy(const char *what, const void *dst, size_t size, const voi
             copy_watch_min = at ? (size_t)at : 4096;
         }
     }
-    if (copy_watch_min && size >= copy_watch_min && !runtime_memory_is_mapped(d, size))
+    if (!copy_watch_min || size < copy_watch_min) return;
+    /* The image is the guest's own memory too, but it is not one of the regions the runtime
+     * manages (it is mapped at its fixed address), so it is excluded by hand. */
+    if (runtime_image_bytes && d>=runtime_image_base && d<runtime_image_base+runtime_image_bytes) return;
+    if (!runtime_memory_is_mapped(d, size))
         bb_cpu_copy_note(what,dst,size,caller);
 }
 static ABI void *guest_memset(void *dst, int value, size_t size) {

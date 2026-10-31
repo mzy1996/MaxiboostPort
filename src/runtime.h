@@ -117,6 +117,10 @@ void runtime_wait_report(double frames);
 /* What the guest asked the direct memory for, by size (the game's pools, the library's heap). */
 void runtime_memory_buckets_report(void);
 void runtime_guest_call_sites(uint64_t out[3]);
+/* bbport: where the guest's image is mapped (it is the guest's own memory, but not one of the
+ * regions the runtime manages, so the diagnostics have to know about it separately). */
+extern uintptr_t runtime_image_base;
+extern uint64_t runtime_image_bytes;
 /* bbport: times the game's heap asked for more memory (posix_mmap): a sign it leaks. */
 uint64_t runtime_heap_growths(void);
 static inline uint64_t runtime_wait_clock(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec; }

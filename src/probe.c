@@ -908,6 +908,12 @@ void bb_cpu_copy_note(const char *what, const void *destination, uint64_t size, 
                    (unsigned long long)rip);
     if (n<=0) return;
     if (n>=(int)sizeof(line)) n=(int)sizeof(line)-1;
+    /* What the destination is in the host's memory: the runtime's own block, the guest's own
+     * region, a buffer of the graphics library, or memory nobody manages. */
+    { char host[160]={0};
+      describe_host_address((uintptr_t)destination,host,sizeof(host));
+      const int m=snprintf(line+n,sizeof(line)-(size_t)n," | %s",host);
+      if (m>0 && m<(int)sizeof(line)-n) n+=m; else n=(int)sizeof(line)-1; }
     if (image && rip>=(uintptr_t)image && rip<(uintptr_t)image+0x20000000) {
         const int m=snprintf(line+n,sizeof(line)-(size_t)n," (guest+%#llx)",
                              (unsigned long long)(rip-(uintptr_t)image));
@@ -3148,6 +3154,8 @@ int main(int argc, char **argv) {
     }
     image = allocate_image(size);
     image_bytes = size;
+    runtime_image_base = (uintptr_t)image;
+    runtime_image_bytes = size;
     runtime_trace_set_image(image);
     { /* link_modules.py's unwind.txt beside the boot image: the modules' unwind tables */
         char unwind[4096];
