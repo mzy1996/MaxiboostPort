@@ -8,7 +8,7 @@
 // path, so unlike DLSS this bridge does not restrict to one vendor.
 //
 // The bridge mirrors bbport_dlss_bridge.h; adjust the field names to the Intel XeSS SDK headers in
-// use (xess_vk.h / xess.h, XeSS SDK 1.3+).
+// use (xess_vk.h / xess.h, XeSS SDK 2.x).
 
 #pragma once
 

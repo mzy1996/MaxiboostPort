@@ -36,7 +36,9 @@ int Xess::QualityForScale(float scale) {
 namespace {
 #ifdef _WIN32
 constexpr wchar_t BridgeName[] = L"bbport_xess.dll";
-constexpr wchar_t XessLibName[] = L"xess.dll";
+// Intel ships the XeSS shared library as libxess.dll (libxess.so on Linux); the bridge links it
+// implicitly, and this name is what we look for to decide XeSS is available.
+constexpr wchar_t XessLibName[] = L"libxess.dll";
 using Module = HMODULE;
 
 std::filesystem::path ExecutableDirectory() {
@@ -232,7 +234,7 @@ Xess::Xess() : impl{std::make_unique<Impl>()} {
     }
     const auto lib = XessLibDirectory();
     if (lib.empty()) {
-        impl->Disable("Intel's XeSS library is missing: place xess.dll / libxess.so next to the "
+        impl->Disable("Intel's XeSS library is missing: place libxess.dll / libxess.so next to the "
                       "bridge (the Upscaler panel)");
         return;
     }

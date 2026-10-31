@@ -22,7 +22,9 @@ set(VULKAN_INCLUDE "" CACHE PATH "Vulkan-Headers include directory (Linux: the s
 set(XESS_LIBRARY "" CACHE FILEPATH "Intel XeSS import library (xess.lib / libxess.a); auto-detected")
 
 if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "The XeSS bridge is x86-64 only")
+    # clang64-cmake's ABI probe can mis-report this for MinGW-w64 g++; the compiler is a 64-bit
+    # target and the warning is benign. (The guard stays a warning, not a fatal error, for that case.)
+    message(WARNING "The XeSS bridge expects x86-64 (CMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P})")
 endif()
 
 # The SDK ships its headers either flat (include/xess_vk.h) or under include/xess/xess_vk.h.
@@ -38,7 +40,15 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 add_library(bbport_xess SHARED bbport_xess_bridge.cpp bbport_xess_bridge.h)
 target_include_directories(bbport_xess PRIVATE "${XESS_INCLUDE_DIR}" ${VULKAN_INCLUDE})
+# Statically link the C++/gcc runtimes so the bridge needs no extra MinGW DLLs at run time (the
+# port's loader does not know about this DLL through its import table, so collect_dlls.py would
+# not gather libstdc++-6.dll for it). The bridge keeps its one external dependency, Intel's
+# libxess.dll, which the port already stages next to it.
+target_link_options(bbport_xess PRIVATE -static-libstdc++ -static-libgcc)
 if (WIN32)
+    # MinGW-w64 adds a "lib" prefix to shared libraries (libbbport_xess.dll); the port loads
+    # "bbport_xess.dll" (see vk_xess.cpp). Drop the prefix so the name matches on every compiler.
+    set_target_properties(bbport_xess PROPERTIES PREFIX "")
     if (NOT XESS_LIBRARY)
         set(XESS_LIBRARY "${XESS_SDK_ROOT}/lib/Win64/vc16/xess.lib")
     endif()

@@ -28,6 +28,16 @@ cp "$root/out/win/bb-probe.exe" "$package/bin/"
 gpu_dll=$(find "$root/out/gpu-win" -name 'bbgpu.dll' | head -1)
 [ -n "$gpu_dll" ] && cp "$gpu_dll" "$package/bin/"
 
+# Optional upscaler bridges that the GPU library loads at run time (not through the import table,
+# so collect_dlls.py does not see them). Each is copied only when it was built and staged in
+# out/win beside bb-probe. XeSS: bbport_xess.dll + Intel's libxess.dll (+ libxell.dll for frame
+# generation). DLSS: bbport_dlss.dll + NVIDIA's nvidia-ngx libraries.
+for extra in bbport_xess.dll libxess.dll libxell.dll bbport_dlss.dll \
+             nvngx_dlss.dll nvidia-ngx-dlss.dll nvngx_dlssg.dll; do
+    [ -f "$root/out/win/$extra" ] && cp "$root/out/win/$extra" "$package/bin/"
+done
+[ -f "$root/out/win/INTEL-XESS-LICENSE.txt" ] && cp "$root/out/win/INTEL-XESS-LICENSE.txt" "$package/docs/"
+
 # The debug symbols are dropped: the library is 300 MB with them and 13 MB without, and the
 # player has no use for them. The stripped file is written beside the original and moved
 # over it: strip works in place through a temporary file (stXXXXXX) on Windows, and when
