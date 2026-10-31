@@ -325,14 +325,17 @@ if (WIN32)
     # against the import library made from the runtime's module definition file.
     set(RUNTIME_EXPORTS "${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime_exports.txt")
     set(RUNTIME_DEF "${CMAKE_CURRENT_BINARY_DIR}/bbgpu_runtime.def")
-    file(STRINGS "${RUNTIME_EXPORTS}" RUNTIME_EXPORT_LINES REGEX "^runtime_")
-    set(RUNTIME_DEF_CONTENT "EXPORTS\n")
-    foreach(symbol ${RUNTIME_EXPORT_LINES})
-        string(APPEND RUNTIME_DEF_CONTENT "    ${symbol}\n")
-    endforeach()
-    file(WRITE "${RUNTIME_DEF}" "${RUNTIME_DEF_CONTENT}")
     find_program(DLLTOOL NAMES dlltool REQUIRED)
     set(RUNTIME_IMPORT_LIB "${CMAKE_CURRENT_BINARY_DIR}/libbbruntime.a")
+    # The export list of the runtime is turned into the definition file of the import
+    # library at build time: a new export of the runtime has to reach the GPU library
+    # without a reconfigure of the build.
+    add_custom_command(OUTPUT "${RUNTIME_DEF}"
+        COMMAND "${CMAKE_COMMAND}" "-DRUNTIME_EXPORTS=${RUNTIME_EXPORTS}" "-DRUNTIME_DEF=${RUNTIME_DEF}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/make_runtime_def.cmake"
+        DEPENDS "${RUNTIME_EXPORTS}" "${CMAKE_CURRENT_SOURCE_DIR}/make_runtime_def.cmake"
+        COMMENT "The definition file of the runtime's exports"
+        VERBATIM)
     add_custom_command(OUTPUT "${RUNTIME_IMPORT_LIB}"
         COMMAND "${DLLTOOL}" -d "${RUNTIME_DEF}" -D "bb-probe.exe" -l "${RUNTIME_IMPORT_LIB}"
         DEPENDS "${RUNTIME_DEF}"

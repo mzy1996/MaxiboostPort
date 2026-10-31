@@ -37,6 +37,16 @@ EqueueInternal* GetEqueue(OrbisKernelEqueue eq) {
     return kqueues[eq];
 }
 
+/* bbport BB_QUEUE_TRACE=1: the queues the game makes, what it waits for and what it gets.
+ * The wait is the part that decides the frame's speed, so it is said out loud. */
+bool QueueTrace() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_QUEUE_TRACE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 static void HrTimerCallback(OrbisKernelEqueue eq, const OrbisKernelEvent& kevent) {
     if (kqueues.contains(eq)) {
         kqueues[eq]->TriggerEvent(kevent.ident, OrbisKernelEvent::Filter::HrTimer, kevent.udata);
@@ -449,6 +459,10 @@ int PS4_SYSV_ABI sceKernelCreateEqueue(OrbisKernelEqueue* eq, const char* name) 
 
     // Create the equeue
     kqueues[kqueue_handle] = new EqueueInternal(kqueue_handle, name);
+    if (QueueTrace()) {
+        std::printf("Queue: created '%s' as %#x\n", name, (unsigned)kqueue_handle);
+        std::fflush(stdout);
+    }
     *eq = kqueue_handle;
 
     return ORBIS_OK;
@@ -514,6 +528,22 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
 
     const auto wait_start = std::chrono::steady_clock::now();
     *out = equeue->WaitForEvents(ev, num, timo);
+    if (QueueTrace()) {
+        static std::atomic<u64> waits{0};
+        const u64 n = waits.fetch_add(1, std::memory_order_relaxed);
+        if (n < 60 || n % 200 == 0) {
+            const auto ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - wait_start).count();
+            std::printf("Queue: wait #%llu on '%s': %d events, %lld us", (unsigned long long)n,
+                        equeue->GetName().data(), *out, (long long)ms);
+            for (int i = 0; i < *out && i < 4; ++i) {
+                std::printf("; event ident=%#llx filter=%#x", (unsigned long long)ev[i].ident,
+                            (unsigned)ev[i].filter);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+    }
     {
         const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wait_start)

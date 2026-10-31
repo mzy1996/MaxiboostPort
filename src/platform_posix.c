@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -157,6 +158,16 @@ int platform_read_memory(void *address, void *buffer, size_t size) {
 
 uint64_t platform_thread_id(void) {
     return (uint64_t)syscall(SYS_gettid);
+}
+
+uint64_t platform_thread_stack_limit(void) {
+    /* The C library of this host does not probe the stack (the kernel's guard page
+     * takes its place), so there is nothing to move out of the way. */
+    return 0;
+}
+
+void platform_set_thread_stack_limit(uint64_t limit) {
+    (void)limit;
 }
 
 uint64_t platform_monotonic_ns(void) {
@@ -507,6 +518,52 @@ void platform_cpu_times(uint64_t *process_ns, uint64_t *thread_ns) {
             *thread_ns = (uint64_t)(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1000000000ull +
                          (uint64_t)(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) * 1000ull;
     } else if (thread_ns) *thread_ns = 0;
+}
+
+/* bbport: the search for a value that leaked from the host into the guest's memory. The guest's
+ * memory is the host's memory, so every readable region of this process is a place where the
+ * value could be. The regions are read through /proc/self/mem (a region that is not readable
+ * fails the read instead of taking the process down, which matters: this runs in the fault
+ * handler). The budget keeps the crash report quick. */
+int platform_scan_memory(uint64_t value, uintptr_t *hits, int max_hits, uint64_t *scanned) {
+    if (scanned) *scanned = 0;
+    if (!hits || max_hits <= 0) return 0;
+    unsigned char pattern[8];
+    memcpy(pattern, &value, sizeof(pattern));
+    int found = 0;
+    uint64_t budget = UINT64_C(1) << 30; /* 1 GiB is looked at */
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    int mem = open("/proc/self/mem", O_RDONLY);
+    char line[512];
+    while (mem >= 0 && fgets(line, sizeof(line), maps)) {
+        unsigned long start = 0, end = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
+        if (perms[0] != 'r' || end <= start) continue;
+        const uint64_t size = (uint64_t)(end - start);
+        if (size > budget || size > (64ull << 20)) continue;
+        budget -= size;
+        unsigned char *buffer = (unsigned char *)malloc((size_t)size);
+        if (!buffer) continue;
+        const ssize_t got = pread(mem, buffer, (size_t)size, (off_t)start);
+        if (got > 0) {
+            if (scanned) *scanned += (uint64_t)got;
+            for (ssize_t i = 0; i + (ssize_t)sizeof(pattern) <= got; ++i) {
+                if (buffer[i] != pattern[0]) continue;
+                if (memcmp(buffer + i, pattern, sizeof(pattern)) != 0) continue;
+                if (found < max_hits) hits[found] = (uintptr_t)start + (uintptr_t)i;
+                ++found;
+                i += (ssize_t)sizeof(pattern) - 1;
+                if (found >= max_hits) break;
+            }
+        }
+        free(buffer);
+        if (found >= max_hits) break;
+    }
+    if (mem >= 0) close(mem);
+    fclose(maps);
+    return found;
 }
 
 #endif /* !_WIN32 */

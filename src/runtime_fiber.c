@@ -56,6 +56,13 @@ typedef struct {
 } Fiber;
 _Static_assert(sizeof(Fiber) <= 256, "SceFiber is 256 bytes");
 
+/* BB_TRACE_FIBER=1 traces the fibers (the switch between them and the stack each one
+ * runs on). */
+static int fiber_trace(void) {
+    static int trace=-1;
+    if (trace<0) { const char *t=getenv("BB_TRACE_FIBER"); trace=t && t[0]=='1'; }
+    return trace;
+}
 /* The fiber state of the thread now running: the fiber (NULL outside Run), where the thread's
  * own context waits, the value passed with the last switch into this context. */
 typedef struct {
@@ -75,9 +82,14 @@ static __attribute__((noinline)) ThreadFibers *here(void) {
 }
 
 /* fiber_swap(save, next): pushes the callee-saved registers, MXCSR and the x87 control word, stores
- * the stack pointer in *save, then pops the same from the stack at next and returns there. */
-void fiber_swap(void **save, void *next);
+ * the stack pointer in *save, then pops the same from the stack at next and returns there.
+ * The registers are the ones the System V convention keeps (the guest's own code follows it),
+ * so the declaration says so: the hand-written code takes its arguments in %rdi and %rsi, and
+ * the host's compiler has to put them there (its own convention puts them in %rcx and %rdx). */
+void fiber_swap(void **save, void *next) ABI;
 void fiber_start(void);
+void fiber_main(void);
+void fiber_boot(void);
 __asm__(
     BB_ASM_TEXT
     BB_ASM_GLOBAL("fiber_swap")
@@ -110,13 +122,25 @@ __asm__(
     BB_ASM_TYPE("fiber_start")
     "fiber_start:\n"
     "    andq $-16,%rsp\n"
-    "    call fiber_main\n"
+    "    call fiber_boot\n"
     "    ud2\n"
     BB_ASM_SIZE("fiber_start"));
 
+/* The first thing that runs on the fiber's own stack: it says so, so the place where a
+ * fiber stops is known. */
+__attribute__((used, noreturn)) void fiber_boot(void) {
+    if (fiber_trace()) fprintf(stderr,"Fiber: boot (rsp %p)\n",(void *)__builtin_frame_address(0));
+    fiber_main();
+}
+
 __attribute__((used, noreturn)) void fiber_main(void) {
+    if (fiber_trace()) fprintf(stderr,"Fiber: entered (rsp %p)\n",(void *)__builtin_frame_address(0));
     ThreadFibers *t=here();
     Fiber *fiber=t->current;
+    if (fiber_trace())
+        fprintf(stderr,"Fiber: entered (fiber %p, entry %p, arg %llu)\n",(void *)fiber,
+                fiber?(void *)(uintptr_t)fiber->entry:NULL,
+                (unsigned long long)(fiber?fiber->arg_on_initialize:0));
     if (t->left) { atomic_store(&t->left->state,STATE_IDLE); t->left=NULL; }
     fiber->entry(fiber->arg_on_initialize,t->transfer);
     fprintf(stderr,"STOP: fiber %.31s returned from its entry (the PS4 does not allow it)\n",fiber->name);
@@ -134,6 +158,9 @@ static void *first_frame(Fiber *fiber) {
         }
         top=fiber->own_stack+OWN_STACK;
     }
+    if (fiber_trace())
+        fprintf(stderr,"Fiber: first frame (context %p, size %llu, top %p)\n",(void *)fiber->context,
+                (unsigned long long)fiber->context_size,(void *)top);
     uint64_t *sp=(uint64_t *)((uintptr_t)top&~(uintptr_t)15);
     *--sp=0;                          /* alignment */
     *--sp=(uint64_t)(uintptr_t)fiber_start;
@@ -148,7 +175,15 @@ static void *first_frame(Fiber *fiber) {
 static void *resume_point(Fiber *fiber) {
     void *sp=fiber->saved_sp;
     fiber->saved_sp=NULL;
-    return sp ? sp : first_frame(fiber);
+    if (!sp) sp=first_frame(fiber);
+    /* The stack the fiber continues on is read before the switch: a stack that cannot
+     * be read is found here, with this thread's own stack still in place, so the
+     * report of it can be written (after the switch there would be no stack to
+     * write it from). */
+    { volatile uint64_t probe=*(volatile uint64_t *)sp; (void)probe; }
+    /* And written: the fiber's first instructions run there. */
+    { volatile uint64_t *w=(volatile uint64_t *)sp; *w=*w; }
+    return sp;
 }
 
 static int valid(const Fiber *fiber) {
@@ -191,6 +226,19 @@ static ABI int32_t fiber_finalize(Fiber *fiber) {
     return 0;
 }
 
+/* The stack a fiber runs on is the guest's own memory, not the thread's: the C library's
+ * stack probe (which the host's own functions use for their big frames) walks down from
+ * the thread's stack limit, which is somewhere else entirely, and touches pages that are
+ * not the stack's. While the thread is on a stack of the guest's, the limit is put out of
+ * the way (nothing is probed then), and it is put back when the thread is on its own. */
+static uint64_t thread_stack_limit;
+static void enter_guest_stack(void) {
+    thread_stack_limit=platform_thread_stack_limit();
+    platform_set_thread_stack_limit(0);
+}
+static void leave_guest_stack(void) {
+    platform_set_thread_stack_limit(thread_stack_limit);
+}
 /* Run: from a thread, into a fiber, until a fiber returns to the thread. */
 static ABI int32_t fiber_run(Fiber *fiber,uint64_t arg_on_run,uint64_t *arg_on_return) {
     if (!fiber) return FIBER_ERROR_NULL;
@@ -202,7 +250,11 @@ static ABI int32_t fiber_run(Fiber *fiber,uint64_t arg_on_run,uint64_t *arg_on_r
     if (!atomic_compare_exchange_strong(&fiber->state,&idle,STATE_RUN)) return FIBER_ERROR_STATE;
     atomic_fetch_add_explicit(&fiber_runs,1,memory_order_relaxed);
     t->current=fiber; t->transfer=arg_on_run; t->left=NULL;
+    if (fiber_trace()) fprintf(stderr,"Fiber: run (fiber %p, arg %llu)\n",(void *)fiber,(unsigned long long)arg_on_run);
+    enter_guest_stack();
     fiber_swap(&t->thread_sp,resume_point(fiber));
+    leave_guest_stack();
+    if (fiber_trace()) fprintf(stderr,"Fiber: back in the thread\n");
     t=here();                         /* back on this thread: ReturnToThread */
     if (t->left) { atomic_store(&t->left->state,STATE_IDLE); t->left=NULL; }
     t->current=NULL;

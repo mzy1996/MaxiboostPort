@@ -1,21 +1,67 @@
-/* Linux rwlocks behind PS4 pointer-to-handle ABI. The registry protects
+/* Read-write locks behind PS4 pointer-to-handle ABI. The registry protects
    lifetime, static initialization and ownership; waiting happens outside it. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+/* The lock itself: the host's read-write lock on Windows (SRWLOCK), the C library's
+ * elsewhere. The release is told whether the thread holds it for reading or for writing
+ * (the registry above knows). */
+#ifdef _WIN32
+typedef SRWLOCK bb_rwlock_t;
+static int bb_rwlock_init(bb_rwlock_t *lock) { InitializeSRWLock(lock); return 0; }
+static int bb_rwlock_rdlock(bb_rwlock_t *lock) { AcquireSRWLockShared(lock); return 0; }
+static int bb_rwlock_wrlock(bb_rwlock_t *lock) { AcquireSRWLockExclusive(lock); return 0; }
+static int bb_rwlock_tryrdlock(bb_rwlock_t *lock) { return TryAcquireSRWLockShared(lock) ? 0 : EBUSY; }
+static int bb_rwlock_trywrlock(bb_rwlock_t *lock) { return TryAcquireSRWLockExclusive(lock) ? 0 : EBUSY; }
+static int bb_rwlock_release(bb_rwlock_t *lock, int writer) {
+    if (writer) ReleaseSRWLockExclusive(lock); else ReleaseSRWLockShared(lock);
+    return 0;
+}
+static int bb_rwlock_destroy(bb_rwlock_t *lock) { (void)lock; return 0; }
+/* The timed ones are a wait of a millisecond at a time (the host's lock has no deadline
+ * of its own). */
+static int bb_rwlock_timed(bb_rwlock_t *lock, int writer, uint64_t deadline_ns) {
+    for (;;) {
+        const int e=writer ? bb_rwlock_trywrlock(lock) : bb_rwlock_tryrdlock(lock);
+        if (!e) return 0;
+        if (e!=EBUSY) return e;
+        if (platform_realtime_ns()>=deadline_ns) return ETIMEDOUT;
+        platform_sleep_ns(1000000ull);
+    }
+}
+#else
+typedef pthread_rwlock_t bb_rwlock_t;
+static int bb_rwlock_init(bb_rwlock_t *lock) { return pthread_rwlock_init(lock,NULL); }
+static int bb_rwlock_rdlock(bb_rwlock_t *lock) { return pthread_rwlock_rdlock(lock); }
+static int bb_rwlock_wrlock(bb_rwlock_t *lock) { return pthread_rwlock_wrlock(lock); }
+static int bb_rwlock_tryrdlock(bb_rwlock_t *lock) { return pthread_rwlock_tryrdlock(lock); }
+static int bb_rwlock_trywrlock(bb_rwlock_t *lock) { return pthread_rwlock_trywrlock(lock); }
+static int bb_rwlock_release(bb_rwlock_t *lock, int writer) { (void)writer; return pthread_rwlock_unlock(lock); }
+static int bb_rwlock_destroy(bb_rwlock_t *lock) { return pthread_rwlock_destroy(lock); }
+static int bb_rwlock_timed(bb_rwlock_t *lock, int writer, uint64_t deadline_ns) {
+    struct timespec deadline;
+    const uint64_t seconds=deadline_ns/1000000000ull;
+    deadline.tv_sec=(time_t)seconds;
+    deadline.tv_nsec=(long)(deadline_ns-seconds*1000000000ull);
+    return writer ? pthread_rwlock_timedwrlock(lock,&deadline) : pthread_rwlock_timedrdlock(lock,&deadline);
+}
+#endif
 typedef struct Holder {
     pthread_t thread;
     unsigned readers, writer, pending;
     struct Holder *next;
 } Holder;
 typedef struct Rwlock {
-    pthread_rwlock_t native;
+    bb_rwlock_t native;
     Holder *holders;
     unsigned inflight;
     struct Rwlock *next;
@@ -47,7 +93,7 @@ static Rwlock *find_locked(Rwlock *handle) {
 static int create_locked(Rwlock **out) {
     Rwlock *r=calloc(1,sizeof(*r));
     if (!r) return ENOMEM;
-    int e=pthread_rwlock_init(&r->native,NULL);
+    int e=bb_rwlock_init(&r->native);
     if (e) { free(r); return e; }
     r->next=registry; registry=r; *out=r; ++created; return 0;
 }
@@ -92,15 +138,15 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
     ++r->inflight; ++h->pending;
     pthread_mutex_unlock(&registry_lock);
     /* Timed operations first try the lock, matching POSIX timeout validation. */
-    if (attempt || timed) e=writer ? pthread_rwlock_trywrlock(&r->native) : pthread_rwlock_tryrdlock(&r->native);
-    else e=writer ? pthread_rwlock_wrlock(&r->native) : pthread_rwlock_rdlock(&r->native);
-    if (timed && e==EBUSY) {
+    if (attempt) e=writer ? bb_rwlock_trywrlock(&r->native) : bb_rwlock_tryrdlock(&r->native);
+    else if (timed) {
         if (!time || time->nanoseconds<0 || time->nanoseconds>=1000000000) e=EINVAL;
         else {
-            struct timespec deadline={.tv_sec=(time_t)time->seconds,.tv_nsec=(long)time->nanoseconds};
-            e=writer ? pthread_rwlock_timedwrlock(&r->native,&deadline) : pthread_rwlock_timedrdlock(&r->native,&deadline);
+            const uint64_t deadline=(uint64_t)time->seconds*1000000000ull+(uint64_t)time->nanoseconds;
+            e=bb_rwlock_timed(&r->native,writer,deadline);
         }
     }
+    else e=writer ? bb_rwlock_wrlock(&r->native) : bb_rwlock_rdlock(&r->native);
     pthread_mutex_lock(&registry_lock);
     --r->inflight; --h->pending;
     if (!e) {
@@ -124,7 +170,7 @@ static ABI int32_t rw_unlock(Rwlock **handle) {
     Holder *h=r->holders;
     while (h && !pthread_equal(h->thread,pthread_self())) h=h->next;
     if (!h || (!h->readers && !h->writer)) { pthread_mutex_unlock(&registry_lock); return error(EPERM); }
-    int e=pthread_rwlock_unlock(&r->native);
+    int e=bb_rwlock_release(&r->native,h->writer);
     if (!e) { if (h->writer) h->writer=0; else --h->readers; ++unlocks; }
     prune_locked(r,h);
     pthread_mutex_unlock(&registry_lock); return error(e);
@@ -136,7 +182,7 @@ static ABI int32_t rw_destroy(Rwlock **handle) {
     Rwlock *r=find_locked(*handle);
     if (!r) { pthread_mutex_unlock(&registry_lock); return error(EINVAL); }
     if (r->inflight || r->holders) { pthread_mutex_unlock(&registry_lock); return error(EBUSY); }
-    int e=pthread_rwlock_destroy(&r->native);
+    int e=bb_rwlock_destroy(&r->native);
     if (!e) {
         Rwlock **link=&registry;
         while (*link!=r) link=&(*link)->next;
@@ -198,7 +244,3 @@ void runtime_rwlock_report(void) {
     printf("Runtime: rwlocks created=%zu, reads=%zu, writes=%zu, unlocks=%zu\n",created,reads,writes,unlocks);
     pthread_mutex_unlock(&registry_lock);
 }
-#else
-uintptr_t runtime_rwlock_resolve(const char *name) { (void)name; return 0; }
-void runtime_rwlock_report(void) { puts("Runtime: Windows rwlock backend not implemented"); }
-#endif

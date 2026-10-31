@@ -41,7 +41,7 @@ done
 # The libraries the runtime links against. Vulkan, SDL3 and freetype come from the
 # toolchain's package manager; the import libraries are named the way MinGW names them
 # (libvulkan-1.dll.a for the Vulkan loader). The GPU library (libbbgpu.dll) is the port's own.
-libs=(-lvulkan-1 -lSDL3 -lfreetype -lbcrypt -lpsapi)
+libs=(-lvulkan-1 -lSDL3 -lfreetype -lbcrypt -lpsapi -lws2_32)
 
 # The GPU library: the runtime's graphics go through it (bbgpu.h).
 gpu_dir=${GPU_DIR:-$root/out/gpu-win}
@@ -76,6 +76,9 @@ echo "Compiling for Windows: ${#sources[@]} sources -> $out/bb-probe.exe"
 # recovery). On Linux the dynamic linker does this (the runtime is linked with -rdynamic);
 # Windows needs a module definition file, and the same file gives the library the import
 # library (the GPU build makes it in gpu/CMakeLists.txt).
+# The GPU library imports these from the runtime by the module's name ("bb-probe.exe"), so
+# the runtime has to keep that name: under any other name the loader cannot resolve the
+# library's imports and it calls through an unresolved import.
 exports="$root/src/runtime_exports.txt"
 runtime_def="$out_win/bb-probe.def"
 if [ -f "$exports" ]; then
@@ -89,6 +92,7 @@ fi
 
 "$cc" -std=c11 -O2 -g -Wall -Wextra \
     -I "$root_win/src" -I "$root_win" -I "$gpu_include_win" -I "$msys_win/mingw64/include" \
+    -I "$msys_win/mingw64/include/freetype2" \
     -DWIN32_LEAN_AND_MEAN -DNOMINMAX -D_CRT_SECURE_NO_WARNINGS \
     -o "$out_win/bb-probe.exe" "${sources[@]}" "$out_win/libatrac9.a" \
     "$gpu_lib_win" \

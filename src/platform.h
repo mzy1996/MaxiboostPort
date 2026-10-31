@@ -59,6 +59,13 @@ void *platform_map_fixed(void *address, size_t size, int prot);
 void *platform_reserve_fixed(void *address, size_t size);
 /* Unmaps a range. */
 void platform_unmap(void *address, size_t size);
+/* Releases the whole mapping that begins at address (VirtualFree(..., MEM_RELEASE) requires the
+ * base address and a zero size; platform_unmap passes a non-zero size, which MEM_RELEASE rejects,
+ * so a dedicated full-unmap is provided for callers that must release a known base). Returns 0 on
+ * success, -1 on failure (the address was not a mapping base). */
+int platform_unmap_full(void *address);
+/* The host's last error code (GetLastError on Windows, errno on POSIX), for diagnostics. */
+int platform_last_error(void);
 /* A section of memory the guest's memory is made of: on Linux a memfd, on Windows a memory
  * section. The runtime keeps the sections in a table and holds their indices, so the type
  * does not leak into it. */
@@ -81,6 +88,10 @@ int platform_protect(void *address, size_t size, int prot);
 int platform_query_protect(void *address, size_t size);
 /* Reserves address space for the guest below the 4 GiB line (the guest's low memory). */
 void *platform_reserve_low(size_t size, int prot);
+/* The host's own private memory for the guest (the flexible memory: the game's heap, which
+ * it does not share with the GPU). It is reserved, not filled: the pages are given to the
+ * game as it writes them. NULL when the host cannot give it. */
+void *platform_private_memory(size_t size, int prot);
 /* The guest's PROT_* values, the same numbers the guest uses. */
 #define BB_PROT_NONE 0
 #define BB_PROT_READ 1
@@ -91,9 +102,18 @@ void *platform_alloc_executable(size_t size);
 
 /* Reading the host's own memory (a stack trace, a profiler): the guest's own address space. */
 int platform_read_memory(void *address, void *buffer, size_t size);
+/* The same, but the address is checked first (a wrong one gives an error instead of
+ * taking the program down). */
+int platform_read_memory_checked(void *address, void *buffer, size_t size);
 
 /* The thread's own id, as the guest's sceKernelGetTid would report it. */
 uint64_t platform_thread_id(void);
+/* The thread's own stack limit (where its stack ends). The C library's stack probe
+ * (which the host's own functions use for their big frames) walks down from it, so a
+ * thread that runs on a stack of the guest's - which is somewhere else entirely - has
+ * to put it out of the way (nothing is probed then). Zero means "no probing". */
+uint64_t platform_thread_stack_limit(void);
+void platform_set_thread_stack_limit(uint64_t limit);
 /* The host's clock in nanoseconds, monotonic. */
 uint64_t platform_monotonic_ns(void);
 /* The host's wall clock in nanoseconds since the epoch (the guest's timed waits use it). */
@@ -230,6 +250,14 @@ int platform_is_link(const char *path);
 int platform_random(void *buffer, size_t size);
 /* The host's CPU time used by this process and this thread, in nanoseconds. */
 void platform_cpu_times(uint64_t *process_ns, uint64_t *thread_ns);
+
+/* bbport: find the places in this process's memory that hold this 8-byte value (little endian).
+ * The guest's memory is the host's memory (the guest's address space is the host's), so a value
+ * that leaked from the host into the guest is found here. The number of hits is returned; their
+ * addresses are in hits[] (up to max_hits of them). The bytes looked at are in scanned.
+ * The search is bounded (a fixed budget of memory, the huge regions are skipped), so it is a
+ * diagnostic, not an exhaustive search. */
+int platform_scan_memory(uint64_t value, uintptr_t *hits, int max_hits, uint64_t *scanned);
 
 /* The path separator the host uses ('/' or '\\'). */
 #define platform_sep(path) ((path)[0] == '/' ? '/' : '\\')

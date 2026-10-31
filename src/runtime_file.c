@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #ifndef _WIN32
 #include <strings.h>
 #endif
@@ -51,7 +52,13 @@ typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Li
 /* commit: a save file opened for writing is written to a temporary copy (temp), which replaces
  * the file (commit) in one rename when closed: a crash or a kill mid-save leaves the old file. */
 typedef struct { int used, host, dirty; Listing *dir; size_t position; char path[512]; char *commit, *temp; } File;
-typedef struct { char guest[64]; char host[512]; } Mount;
+typedef struct { char guest[64]; char host[512]; } Mount;/* Whether the file operations are said (BB_FILE_TRACE=1). */
+static int file_trace(void) {
+    static int trace=-1;
+    if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && t[0]=='1'; }
+    return trace;
+}
+
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
@@ -137,9 +144,7 @@ static int translate(const char *guest,char *out,size_t size) {
     pthread_mutex_unlock(&lock);
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
     /* BB_FILE_TRACE=1: every guest path the game opens, stats or checks (mods, missing files). */
-    static int trace=-1;
-    if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && t[0]=='1'; }
-    if (trace) printf("File trace: %s -> %s\n",guest,result ? "(no mount)" : out);
+    if (file_trace()) printf("File trace: %s -> %s\n",guest,result ? "(no mount)" : out);
     return result;
 }
 /* The PS4's file system ignores case, and the game asks for lower-case names
@@ -184,6 +189,12 @@ static int host_flags(int flags) {
     if (flags&0x400) r|=O_TRUNC;
     if (flags&0x800) r|=O_EXCL;
     if (flags&0x20000) r|=O_DIRECTORY;
+#ifdef _WIN32
+    /* The C library opens a file in text mode unless it is told otherwise, and then
+     * it takes 0x1A for the end of the file and turns the line ends into one byte:
+     * the game's archives are binary, so this would cut them short. */
+    r|=O_BINARY;
+#endif
     return r|O_CLOEXEC;
 }
 static void free_listing(Listing *l) { if (l) { free(l->names); free(l->offsets); free(l->types); free(l); } }
@@ -474,29 +485,87 @@ static ssize_t read_retrying(int h,void *buffer,uint64_t size,int64_t offset,int
     }
     return n;
 }
+/* The guest code that asked for it (the image offsets of the call chain): the file
+ * operations tell where in the game the read happened, which is what says whether the
+ * game read what it wanted. */
+static void guest_site(char *out, size_t size) {
+    uint64_t sites[3];
+    runtime_guest_call_sites(sites);
+    snprintf(out,size," from +%#" PRIx64 " < +%#" PRIx64 " < +%#" PRIx64,
+             sites[0],sites[1],sites[2]);
+}
+/* bbport diagnostic: flag any file read whose destination lands inside the R1
+ * registry node pool (guest 0x800410000..0x800410000+0x400000). A pread/memcpy into
+ * it would zero/corrupt the registry - the long-standing NULL-call crash. The pool is
+ * written by the loader thread, which may not carry the watch's Dr breakpoints, so the
+ * normal pool watch misses it; this catches it at the read boundary instead. */
+#define R1_POOL_VA_LO UINT64_C(0x800410000)
+#define R1_POOL_VA_HI UINT64_C(0x800810000)
+static void note_read_to_pool(const char *kind, const void *buffer, uint64_t n) {
+    if (!n) return;
+    const uintptr_t b=(uintptr_t)buffer, e=b+n;
+    if (b < R1_POOL_VA_HI && e > R1_POOL_VA_LO) {
+        char site[160]="";
+        guest_site(site,sizeof(site));
+        char line[300];
+        const int m=snprintf(line,sizeof(line),
+            "POOL HIT: %s %llu bytes into R1 pool region dst=%p%s\n",
+            kind,(unsigned long long)n,(void *)b,site);
+        if (m>0) platform_write_stdout(line,(size_t)m);
+    }
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
+    if (file_trace()) {
+        char site[160]="";
+        guest_site(site,sizeof(site));
+        printf("File trace: read(fd %d, %llu bytes) at %p%s\n",fd,(unsigned long long)size,buffer,site);
+        fflush(stdout);
+    }
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
     ssize_t n=read_retrying(h,buffer,size,0,0);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
+    if (n>0) note_read_to_pool("read",buffer,(uint64_t)n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
+    if (file_trace()) {
+        char site[160]="";
+        guest_site(site,sizeof(site));
+        printf("File trace: pread(fd %d, %llu bytes at %lld) at %p%s\n",fd,
+               (unsigned long long)size,(long long)offset,buffer,site);
+        fflush(stdout);
+    }
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
     ssize_t n=read_retrying(h,buffer,size,offset,1);
-    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    if (n<0) {
+        if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno);
+        char line[192];
+        const int length=snprintf(line,sizeof(line),"File trace: pread failed (errno %d, %llu bytes asked at %lld)\n",
+                                  errno,(unsigned long long)size,(long long)offset);
+        if (length>0) platform_write_stdout(line,(size_t)length);
+        return -errno;
+    }
+    {   /* What the game got: the number decides whether it reads on (the archive's
+         * table is bigger than the first block). It is said without the C library's
+         * buffer, so it is there even if the game dies right after. */
+        char line[192];
+        const int length=snprintf(line,sizeof(line),"File trace: pread -> %lld bytes of %llu asked\n",
+                                  (long long)n,(unsigned long long)size);
+        if (length>0) platform_write_stdout(line,(size_t)length);
+    }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
+    if (n>0) note_read_to_pool("pread",buffer,(uint64_t)n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
-}
-/* Pages the GPU side keeps without access (data newer in VRAM, runtime_memory_trap reasons from
+}/* Pages the GPU side keeps without access (data newer in VRAM, runtime_memory_trap reasons from
  * 16 up) would make the kernel's copy fail with EFAULT: a user-mode read of each page first goes
  * through the handler, which copies the data back. */
 static void touch_for_read(const void *buffer,uint64_t size) {
@@ -508,6 +577,12 @@ static void touch_for_read(const void *buffer,uint64_t size) {
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
+    if (file_trace()) {
+        File *t=get(fd);
+        printf("File trace: write(fd %d, %llu bytes) at %p -> %s\n",fd,(unsigned long long)size,
+               buffer,t&&t->path[0]?t->path:"(none)");
+        fflush(stdout);
+    }
     touch_for_read(buffer,size);
     ssize_t n=write(h,buffer,size);
     if (n<0) return -errno;
@@ -517,6 +592,12 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
+    if (file_trace()) {
+        File *t=get(fd);
+        printf("File trace: pwrite(fd %d, %llu bytes at %lld) at %p -> %s\n",fd,
+               (unsigned long long)size,(long long)offset,buffer,t&&t->path[0]?t->path:"(none)");
+        fflush(stdout);
+    }
     touch_for_read(buffer,size);
     ssize_t n=(ssize_t)platform_pwrite(h,buffer,size,offset);
     return n<0 ? -errno : n;
@@ -541,7 +622,13 @@ static int64_t do_fstat(int fd,GuestStat *out) {
     if (!out) return -EFAULT;
     struct stat s;
     if (fstat(h,&s)) return -errno;
-    convert_stat(&s,out); return 0;
+    convert_stat(&s,out);
+    if (file_trace()) {
+        char line[192];
+        const int length=snprintf(line,sizeof(line),"File trace: fstat(fd %d) -> size %lld\n",fd,(long long)out->size);
+        if (length>0) platform_write_stdout(line,(size_t)length);
+    }
+    return 0;
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
     char path[1024]; struct stat s;

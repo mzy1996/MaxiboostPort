@@ -16,11 +16,10 @@ import json
 import os
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import Qt, QProcess, QTimer, Signal
+    from PySide6.QtCore import Qt, QProcess, QThread, QTimer, Signal
     from PySide6.QtGui import QAction, QKeySequence
     from PySide6.QtWidgets import (
         QApplication,
@@ -86,8 +85,11 @@ CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 # The generated files (the cheat table, the patch table) go with the program.
 DATA_DIR = Path(os.environ.get("BB_DATA_DIR", PORT_DIR))
-CHEATS_CONFIG = DATA_DIR / "cheats.json"
-PATCHES_CONFIG = DATA_DIR / "patches.json"
+# The runtime's own configuration (bbport.ini): the user's directory, not the program's
+# own (that one may be read only, and it is replaced when the package is built again).
+RUNTIME_CONFIG = CONFIG_DIR / "bbport.ini"
+CHEATS_CONFIG = CONFIG_DIR / "cheats.json"
+PATCHES_CONFIG = CONFIG_DIR / "patches.json"
 
 # The language of the launcher: the first entry is the system's own, the others are named
 # in the language they are (a person who does not read the rest looks for their own).
@@ -113,6 +115,24 @@ UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("En
 # the parameter 1): 0 Japanese, 1 English, 9 Chinese (simplified), 10 Chinese
 # (traditional), 11 Korean. The game decides which of them it has: the North American
 # release is in English, the Hong Kong one in the traditional Chinese and the Korean.
+# The size of the game's memory pool, in megabytes. The pool is an address range the game
+# reserves, not memory it has to fill: a machine with little memory can take a smaller
+# one (the game's own is 5056 MiB).
+GAME_MEMORY = [
+    ("512 МБ (экономичный)", 512),
+    ("1024 МБ", 1024),
+    ("2048 МБ", 2048),
+    ("4096 МБ", 4096),
+    ("5056 МБ (как на PS4)", 5056),
+]
+# The output resolutions. All of them are 16:9, so the picture keeps its shape (the
+# window takes the 16:9 part of the display, the rest is black).
+OUTPUT_RESOLUTIONS = [
+    ("1280×720", "1280x720"),
+    ("1920×1080", "1920x1080"),
+    ("2560×1440", "2560x1440"),
+    ("3840×2160", "3840x2160"),
+]
 GAME_LANGUAGE_NAMES = {0: "日本語", 1: "English", 9: "简体中文", 10: "繁體中文", 11: "한국어"}
 GAME_LANGUAGES = [("Как в системе", ""), ("English", "1"), ("繁體中文", "10"), ("한국어", "11")]
 FPS_MODES = [("Как в системе", ""), ("30", "30"), ("60", "60"), ("120", "120")]
@@ -126,6 +146,8 @@ DEFAULTS = {
     "cheats_file": "",
     "language": "",
     "fullscreen": False,
+    "output_res": "1920x1080",
+    "game_memory": 5056,
     "hdr": False,
     "present_mode": "Mailbox",
     "gamepad": "",
@@ -201,6 +223,13 @@ def fps_modes(have=None):
     return [mode for mode in FPS_MODES if all(name in have for name in FPS_PRESETS.get(mode[1], ()))]
 
 
+def runtime_config_path():
+    """Where the runtime's own configuration (bbport.ini) is: the user's directory."""
+    path = Path(os.environ.get("BB_CONFIG", RUNTIME_CONFIG)).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def game_environment(s):
     """The environment for the runtime: the same variables the Linux launcher sets."""
     env = dict(os.environ)
@@ -209,6 +238,7 @@ def game_environment(s):
         env["BB_USER_DIR"] = s["user_dir"]
     if s.get("dlc_dir"):
         env["BB_DLC_DIR"] = str(Path(s["dlc_dir"]).expanduser())
+    env["BB_CONFIG"] = str(runtime_config_path())
     env["BB_MODS_ENABLED"] = "0"
     env["BB_PATCHES_DIR"] = str(patches_dir(s))
     env["BB_PATCHES_CONFIG"] = str(PATCHES_CONFIG)
@@ -219,6 +249,13 @@ def game_environment(s):
     env["BB_LANGUAGE"] = s["language"] or str(game_language(s))
     env["BB_MENU_LANGUAGE"] = language()
     env["BB_FULLSCREEN"] = "1" if s["fullscreen"] else "0"
+    if s.get("game_memory"):
+        # The pool the game reserves: a machine with little memory takes a smaller one.
+        env["BB_DMEM_MB"] = str(s["game_memory"])
+    if s.get("output_res"):
+        # The picture is drawn in this size; the window takes the 16:9 part of the display
+        # (the rest is black), so it is never stretched.
+        env["BB_OUTPUT_RES"] = str(s["output_res"])
     env["BB_PRESENT_MODE"] = s["present_mode"]
     if s.get("gamepad"):
         env["BB_GAMEPAD"] = s["gamepad"]
@@ -285,20 +322,29 @@ def folder_button(callback):
     return button
 
 
-class PrepareWorker(threading.Thread):
+class PrepareWorker(QThread):
     """Prepares the game in the background, so that the window stays alive.
 
     The eboot is decrypted and the modules are linked: that takes a while, and the window
-    would freeze if it were done in the thread of the button."""
-    def __init__(self, window):
-        super().__init__(daemon=True)
+    would freeze if it were done in the thread of the button. It is a QThread and not a
+    plain one, because the result is passed to the window through a signal."""
+
+    # The signals are declared here: PySide6 binds them to the instance only when they
+    # are the class's own attributes (a signal made in __init__ is a plain object).
+    result = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, window, game_dir):
+        super().__init__()
         self.window = window
-        self.result = Signal(list)
-        self.failed = Signal(str)
+        # The folder the player chose and the file the settings are in: both are read here
+        # (the thread's own), not in the window's thread.
+        self.game_dir = str(game_dir)
+        self.config_file = window.config_path()
 
     def run(self):
         try:
-            prepared = port_prepare.prepare_game(DATA_DIR, self.window.config_path())
+            prepared = port_prepare.prepare_game(DATA_DIR, self.config_file, game=self.game_dir)
         except port_prepare.PrepareError as error:
             self.failed.emit(str(error))
             return
@@ -315,7 +361,8 @@ class Window(QMainWindow):
         if not self.settings.get("game_dir"):
             self.settings["game_dir"] = str(default_game_dir())
         self.process = None
-        self.setWindowTitle("MAXIBOOST ON (mbport)")
+        self.worker = None
+        self.setWindowTitle("MAXIBOOST ON (mbport) (B站：一位路过飞宇移植优化)")
         self.resize(980, 720)
 
         # The language is set before the pages are built: every text is translated as it
@@ -479,6 +526,22 @@ class Window(QMainWindow):
         self.select(self.fps, self.settings.get("fps_mode", "60"))
         self.fps.currentIndexChanged.connect(self.on_fps)
         form.addWidget(Row(tr("Частота кадров"), self.fps), row, 0)
+        row += 1
+
+        self.game_memory = QComboBox()
+        for label, value in GAME_MEMORY:
+            self.game_memory.addItem(tr(label), value)
+        self.select(self.game_memory, self.settings.get("game_memory", 5056))
+        self.game_memory.currentIndexChanged.connect(self.on_game_memory)
+        form.addWidget(Row(tr("Память игры"), self.game_memory), row, 0)
+        row += 1
+
+        self.output_res = QComboBox()
+        for label, value in OUTPUT_RESOLUTIONS:
+            self.output_res.addItem(label, value)
+        self.select(self.output_res, self.settings.get("output_res", "1920x1080"))
+        self.output_res.currentIndexChanged.connect(self.on_output_res)
+        form.addWidget(Row(tr("Разрешение вывода"), self.output_res), row, 0)
         row += 1
 
         self.fps_limit = QSpinBox()
@@ -762,7 +825,7 @@ class Window(QMainWindow):
         built again. The window is not replaced: the tabs are emptied and filled anew, so
         that the game that runs keeps going."""
         set_language(self.settings.get("ui_language", ""))
-        self.setWindowTitle("MAXIBOOST ON (mbport)")
+        self.setWindowTitle("MAXIBOOST ON (mbport) (B站：一位路过飞宇移植优化)")
         # The pages are emptied first: the old ones would keep their texts.
         while self.tabs.count():
             widget = self.tabs.widget(0)
@@ -930,6 +993,14 @@ class Window(QMainWindow):
         self.settings["fps_mode"] = self.fps.currentData()
         self.store()
 
+    def on_game_memory(self):
+        self.settings["game_memory"] = self.game_memory.currentData()
+        self.store()
+
+    def on_output_res(self):
+        self.settings["output_res"] = self.output_res.currentData()
+        self.store()
+
     def on_fps_limit(self, value):
         self.settings["fps_limit"] = value
         self.store()
@@ -989,20 +1060,28 @@ class Window(QMainWindow):
         run in a thread and the window stays alive."""
         self.set_busy(True)
         self.log.append(tr("Готовим игру..."))
-        worker = PrepareWorker(self)
+        worker = PrepareWorker(self, self.settings.get("game_dir", ""))
+        # The window keeps the thread: a thread that is destroyed while it runs stops the
+        # whole process.
+        self.worker = worker
         worker.result.connect(self.on_prepared)
         worker.failed.connect(self.on_prepare_failed)
+        worker.finished.connect(self.on_worker_finished)
         worker.start()
         return None
 
     def config_path(self):
         """The file the settings are read from (the runtime's own configuration)."""
-        return DATA_DIR / "bbport.ini"
+        return runtime_config_path()
 
     def set_busy(self, busy):
         """The window's buttons while the game is being prepared."""
         self.play.setEnabled(not busy)
         self.stop.setEnabled(not busy)
+
+    def on_worker_finished(self):
+        """The preparation is over: the thread is let go."""
+        self.worker = None
 
     def on_prepared(self, arguments):
         """The game is prepared: the runtime can start."""
@@ -1067,6 +1146,12 @@ class Window(QMainWindow):
         self.process = None
         self.play.setEnabled(True)
         self.stop.setEnabled(False)
+        # The code tells what happened: a library that is missing, a program that cannot
+        # run, or the game's own end.
+        if code == 0xC0000135:
+            self.log.append(tr("Не найдена библиотека (DLL). Проверьте, что папка bin целая."))
+        elif code == 0xC000007B:
+            self.log.append(tr("Неверный формат программы (64-разрядный режим)."))
 
     def on_stop(self):
         if self.process is not None:

@@ -56,6 +56,11 @@ s32 PS4_SYSV_ABI sceVideoOutAddFlipEvent(Kernel::OrbisKernelEqueue eq, s32 handl
         return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
     }
 
+    if (Kernel::QueueTrace()) {
+        std::printf("VideoOut: queue %#x now waits for the flip of port %d\n", (unsigned)eq, handle);
+        std::fflush(stdout);
+    }
+
     Kernel::EqueueEvent event{};
     event.event.ident = static_cast<u64>(OrbisVideoOutInternalEventId::Flip);
     event.event.filter = Kernel::OrbisKernelEvent::Filter::VideoOut;
@@ -96,6 +101,11 @@ s32 PS4_SYSV_ABI sceVideoOutAddVblankEvent(Kernel::OrbisKernelEqueue eq, s32 han
     auto equeue = Kernel::GetEqueue(eq);
     if (equeue == nullptr) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
+    }
+
+    if (Kernel::QueueTrace()) {
+        std::printf("VideoOut: queue %#x now waits for the vblank of port %d\n", (unsigned)eq, handle);
+        std::fflush(stdout);
     }
 
     Kernel::EqueueEvent event{};
@@ -182,6 +192,16 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
 
     LOG_DEBUG(Lib_VideoOut, "bufferIndex = {}, flipMode = {}, flipArg = {}", bufferIndex, flipMode,
               flipArg);
+
+    if (Kernel::QueueTrace()) {
+        static std::atomic<u64> flips{0};
+        const u64 n = flips.fetch_add(1, std::memory_order_relaxed);
+        if (n < 60 || n % 200 == 0) {
+            std::printf("VideoOut: flip #%llu: port %d buffer %d mode %d arg %lld\n",
+                        (unsigned long long)n, handle, bufferIndex, flipMode, (long long)flipArg);
+            std::fflush(stdout);
+        }
+    }
 
     if (!driver->SubmitFlip(port, bufferIndex, flipArg)) {
         LOG_ERROR(Lib_VideoOut, "Flip queue is full");
@@ -353,6 +373,13 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     auto* port = driver->GetPort(handle);
     if (!port) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+
+    if (Kernel::QueueTrace()) {
+        std::printf("VideoOut: the end-of-packet flip of port %d buffer %u (mode %u arg %lld) waits "
+                    "for the GPU's flip interrupt\n",
+                    handle, buf_id, mode, (long long)flip_arg);
+        std::fflush(stdout);
     }
 
     Platform::IrqC::Instance()->RegisterOnce(

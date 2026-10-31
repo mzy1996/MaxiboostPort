@@ -193,8 +193,69 @@ static ABI __attribute__((noreturn)) void hard_exit(int status) {
     fflush(stdout);
     _exit(status);
 }
+/* The addresses of the game's own frames on this thread's stack. */
+static int guest_call_addresses(uint64_t out[], int max);
 static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t argument) {
     fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
+    /* The caller is where the game raised it: the frame pointer is often left out on
+     * this platform, so the return address is read instead. */
+    { const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
+      fprintf(stderr,"  raised at %p\n",(void *)caller);
+      runtime_guest_where(stderr,(uint64_t)caller);
+      runtime_report_maps(stderr);
+      { fprintf(stderr,"Runtime: the game's frames:\n"); runtime_guest_backtrace(stderr); }
+      /* The game runs on this processor, so its registers are the ones of the host here:
+       * the return value of the call it made before (rax) and the rest say what it did. */
+      uint64_t registers[16];
+      __asm__ volatile(
+          "movq %%rax,  0(%0)\n\t" "movq %%rbx,  8(%0)\n\t" "movq %%rcx, 16(%0)\n\t"
+          "movq %%rdx, 24(%0)\n\t" "movq %%rsi, 32(%0)\n\t" "movq %%rdi, 40(%0)\n\t"
+          "movq %%rbp, 48(%0)\n\t" "movq %%rsp, 56(%0)\n\t" "movq %%r8,  64(%0)\n\t"
+          "movq %%r9,  72(%0)\n\t" "movq %%r10, 80(%0)\n\t" "movq %%r11, 88(%0)\n\t"
+          "movq %%r12, 96(%0)\n\t" "movq %%r13,104(%0)\n\t" "movq %%r14,112(%0)\n\t"
+          "movq %%r15,120(%0)\n\t" : : "r"(registers) : "memory");
+      static const char *const names[16]={"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+          "r8","r9","r10","r11","r12","r13","r14","r15"};
+      for (int i=0;i<16;++i) fprintf(stderr,"  %s=%#llx\n",names[i],(unsigned long long)registers[i]);
+      /* The game's own frames: a return address is the one after a call, and the call is
+       * either a direct one (E8) or an indirect one (FF /2). Only those are frames; the
+       * rest of the stack holds data that looks like an address. */
+      { const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
+        /* The frame pointer chain of the guest (it keeps the frame pointer). */
+        { uintptr_t frame=registers[6]; /* rbp */
+          for (int depth=0; depth<24 && frame; ++depth) {
+              uint64_t saved=0, ret=0;
+              if (platform_read_memory((void *)frame,&saved,8) || platform_read_memory((void *)(frame+8),&ret,8)) break;
+              uint64_t offset=0; const char *module=NULL;
+              runtime_guest_address(ret,&offset,&module);
+              fprintf(stderr,"  #%d %p %s+%#llx\n",depth,(void *)ret,module?module:"(host)",(unsigned long long)offset);
+              if (saved<=frame) break;
+              frame=saved;
+          } }
+        int shown=0;
+        for (int i=0;i<400 && shown<12;++i) {
+            const uintptr_t at=sp[i];
+            if (!runtime_guest_address(at,NULL,NULL)) continue;
+            uint8_t before[8];
+            if (platform_read_memory((void *)(at-8),before,sizeof(before))) continue;
+            const int direct=before[3]==0xE8;
+            const int indirect=before[3]==0xFF && (before[4]&7)==2;
+            if (!direct && !indirect) continue;
+            uint64_t offset=0; const char *module=NULL;
+            runtime_guest_address(at,&offset,&module);
+            fprintf(stderr,"  a frame of the game: %s+%#llx (after a %s call)\n",
+                    module?module:"its code",(unsigned long long)offset,direct?"direct":"indirect");
+            ++shown;
+        } }
+      /* The game's own frames on the stack: where it was when it stopped. */
+      uint64_t addresses[8];
+      const int found=guest_call_addresses(addresses,8);
+      for (int i=0;i<found;++i) {
+          uint64_t offset=0; const char *module=NULL;
+          runtime_guest_address(addresses[i],&offset,&module);
+          fprintf(stderr,"  the game was at %s+%#llx\n",module?module:"its code",
+                  (unsigned long long)offset);
+      } }
     runtime_guest_backtrace(stderr);
     runtime_report();
     exit(23);
@@ -368,8 +429,7 @@ static WaitSite wait_sites[512];
 static _Thread_local int wait_tid;
 void runtime_guest_call_sites(uint64_t out[3]);
 /* The first three return addresses into the game's code on this thread's stack (guest offsets). */
-static void guest_call_sites(uint64_t out[3]) {
-    const uintptr_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
+static int guest_call_addresses(uint64_t out[], int max) {
     static _Thread_local uintptr_t stack_hi;
     if (!stack_hi) {
         void *base=NULL,*top=NULL;
@@ -378,8 +438,47 @@ static void guest_call_sites(uint64_t out[3]) {
     }
     const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
     int found=0;
+    /* The game's own code is in the modules that were linked into the image; where the
+     * image sits is not the same on every platform. */
+    for (int i=0;i<400 && found<max && (uintptr_t)(sp+i+1)<=stack_hi;++i) {
+        if (runtime_guest_address(sp[i],NULL,NULL)) out[found++]=sp[i];
+    }
+    return found;
+}
+static void guest_call_sites(uint64_t out[3]) {
+    uint64_t addresses[8];
+    const int found=guest_call_addresses(addresses,8);
     out[0]=out[1]=out[2]=0;
-    for (int i=0;i<400 && found<3 && (uintptr_t)(sp+i+1)<=stack_hi;++i) if (sp[i]>=text_lo && sp[i]<text_hi) out[found++]=sp[i]-text_lo;
+    for (int i=0;i<3 && i<found;++i) {
+        uint64_t offset=0;
+        runtime_guest_address(addresses[i],&offset,NULL);
+        out[i]=offset;
+    }
+}
+/* What a thread waits for: it is said when it is asked to (BB_WAIT_TRACE=1). The mark
+ * is kept where the watchdog can read it: the thread's own number is the key (the
+ * thread local one is of no use to another thread). */
+static _Thread_local const char *wait_mark;
+static struct { uint64_t tid; const char *what; } wait_marks[256];
+static pthread_mutex_t wait_marks_lock=PTHREAD_MUTEX_INITIALIZER;
+void runtime_wait_mark(const char *what) {
+    wait_mark=what;
+    const uint64_t tid=platform_thread_id();
+    pthread_mutex_lock(&wait_marks_lock);
+    for (size_t i=0;i<256;++i)
+        if (wait_marks[i].tid==tid || !wait_marks[i].tid) {
+            wait_marks[i].tid=tid; wait_marks[i].what=what; break;
+        }
+    pthread_mutex_unlock(&wait_marks_lock);
+}
+const char *runtime_wait_marked(void) { return wait_mark; }
+const char *runtime_wait_marked_of(uint64_t tid) {
+    const char *what=0;
+    pthread_mutex_lock(&wait_marks_lock);
+    for (size_t i=0;i<256;++i)
+        if (wait_marks[i].tid==tid) { what=wait_marks[i].what; break; }
+    pthread_mutex_unlock(&wait_marks_lock);
+    return what;
 }
 void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
@@ -408,6 +507,7 @@ void runtime_wait_note(int kind, uint64_t ns) {
 void runtime_wait_report(double frames) {
     sample_start();
     sample_report();
+    runtime_memory_buckets_report();
     static const char *kinds[]={"cond","mutex","sema","sleep"};
     struct { WaitSite *w; uint64_t ns, count; } rows[512]; int n=0;
     for (int i=0;i<512;++i) {

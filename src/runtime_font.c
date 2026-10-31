@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -361,7 +360,3 @@ uintptr_t runtime_font_resolve(const char *name) { return RUNTIME_LOOKUP(exports
 void runtime_font_report(void) {
     printf("Runtime: fonts opened=%zu, glyphs drawn=%zu, glyphs missing from the font=%zu\n",opened,glyphs,missing);
 }
-#else
-uintptr_t runtime_font_resolve(const char *name) { (void)name; return 0; }
-void runtime_font_report(void) {}
-#endif

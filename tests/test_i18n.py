@@ -10,6 +10,62 @@ sys.path.insert(0, str(ROOT / 'launcher'))
 import bbport_i18n
 
 
+class WorkerTests(unittest.TestCase):
+    """The preparation runs in a thread and tells the window through a signal."""
+
+    def test_the_worker_signals_can_be_connected(self):
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            self.skipTest('PySide6 is not installed')
+        app = QApplication.instance() or QApplication([])
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import win_launcher
+        window = win_launcher.Window()
+        worker = win_launcher.PrepareWorker(window, window.settings.get("game_dir", ""))
+        # A signal that is not the class's own is a plain object and has no connect: the
+        # window crashed on that.
+        seen = []
+        worker.result.connect(lambda arguments: seen.append(('ok', arguments)))
+        worker.failed.connect(lambda message: seen.append(('failed', message)))
+        self.assertTrue(hasattr(worker.result, 'connect'))
+        # The thread ends with a message (the game folder is not there in the test).
+        worker.start()
+        worker.wait(60000)
+        app.processEvents()
+        self.assertTrue(seen)
+
+
+class PackageTests(unittest.TestCase):
+    """The package must carry every script the launcher needs, and the configuration must
+    be written where the player can write."""
+
+    def test_the_package_copies_every_script_of_the_launcher(self):
+        script = (ROOT / 'tools' / 'package_windows.sh').read_text(encoding='utf-8')
+        # A script that is not copied stops the window ("No module named ...").
+        self.assertIn('cp "$root/launcher/"*.py "$package/launcher/"', script)
+
+    def test_the_runtime_configuration_is_in_the_user_directory(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        # The program's own folder may be read only, and it is replaced when the package
+        # is built again: the configuration goes to the user's directory.
+        self.assertEqual(win_launcher.RUNTIME_CONFIG.parent, win_launcher.CONFIG_DIR)
+        self.assertEqual(win_launcher.CHEATS_CONFIG.parent, win_launcher.CONFIG_DIR)
+        self.assertEqual(win_launcher.PATCHES_CONFIG.parent, win_launcher.CONFIG_DIR)
+
+    def test_the_runtime_is_told_where_its_configuration_is(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        env = win_launcher.game_environment(dict(win_launcher.load_settings(),
+                                                  game_dir=str(ROOT), user_dir='',
+                                                  dlc_dir='', cheats_file=''))
+        self.assertIn('BB_CONFIG', env)
+        self.assertTrue(env['BB_CONFIG'].endswith('bbport.ini'))
+
+
 class MenuTests(unittest.TestCase):
     """The menu bar holds the language, so that it can be changed from any page."""
 
@@ -111,6 +167,62 @@ class TranslationTests(unittest.TestCase):
             for key, text in getattr(bbport_i18n, language).items():
                 with self.subTest(language=language, key=key[:40]):
                     self.assertEqual(len(fields(text)), len(fields(key)))
+
+
+class WorkerTests(unittest.TestCase):
+    """The preparation runs in a thread and tells the window through a signal."""
+
+    def test_the_worker_signals_can_be_connected(self):
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            self.skipTest('PySide6 is not installed')
+        app = QApplication.instance() or QApplication([])
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import win_launcher
+        window = win_launcher.Window()
+        worker = win_launcher.PrepareWorker(window, window.settings.get("game_dir", ""))
+        # A signal that is not the class's own is a plain object and has no connect: the
+        # window crashed on that.
+        seen = []
+        worker.result.connect(lambda arguments: seen.append(('ok', arguments)))
+        worker.failed.connect(lambda message: seen.append(('failed', message)))
+        self.assertTrue(hasattr(worker.result, 'connect'))
+        # The thread ends with a message (the game folder is not there in the test).
+        worker.start()
+        worker.wait(60000)
+        app.processEvents()
+        self.assertTrue(seen)
+
+
+class PackageTests(unittest.TestCase):
+    """The package must carry every script the launcher needs, and the configuration must
+    be written where the player can write."""
+
+    def test_the_package_copies_every_script_of_the_launcher(self):
+        script = (ROOT / 'tools' / 'package_windows.sh').read_text(encoding='utf-8')
+        # A script that is not copied stops the window ("No module named ...").
+        self.assertIn('cp "$root/launcher/"*.py "$package/launcher/"', script)
+
+    def test_the_runtime_configuration_is_in_the_user_directory(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        # The program's own folder may be read only, and it is replaced when the package
+        # is built again: the configuration goes to the user's directory.
+        self.assertEqual(win_launcher.RUNTIME_CONFIG.parent, win_launcher.CONFIG_DIR)
+        self.assertEqual(win_launcher.CHEATS_CONFIG.parent, win_launcher.CONFIG_DIR)
+        self.assertEqual(win_launcher.PATCHES_CONFIG.parent, win_launcher.CONFIG_DIR)
+
+    def test_the_runtime_is_told_where_its_configuration_is(self):
+        sys.path.insert(0, str(ROOT / 'launcher'))
+        import win_launcher
+        env = win_launcher.game_environment(dict(win_launcher.load_settings(),
+                                                  game_dir=str(ROOT), user_dir='',
+                                                  dlc_dir='', cheats_file=''))
+        self.assertIn('BB_CONFIG', env)
+        self.assertTrue(env['BB_CONFIG'].endswith('bbport.ini'))
 
 
 class MenuTests(unittest.TestCase):

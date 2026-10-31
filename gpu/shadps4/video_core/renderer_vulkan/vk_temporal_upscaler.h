@@ -21,6 +21,7 @@
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_xess.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/texture_cache/image.h"
 
@@ -193,6 +194,12 @@ private:
     bool RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource& color,
                     const Dlss::Resource& depth, u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
                     bool hdr);
+    /// bbport: XeSS selected and the bridge is ready (Intel XeSS, gpu/xess_bridge).
+    [[nodiscard]] bool UseXess() const;
+    /// Records XeSS into `cmdbuf` (output in General). `hdr`: linear scene color input.
+    bool RecordXess(vk::CommandBuffer cmdbuf, const Xess::Resource& color,
+                    const Xess::Resource& depth, u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
+                    bool hdr);
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
     bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
                     u32 w, u32 h, u32 ow, u32 oh, float frame_ms);
@@ -301,6 +308,7 @@ private:
     std::unique_ptr<Fsr4Upscaler> fsr4;
     bool fsr4_failed = false;
     bool dlss_failed = false;
+    bool xess_failed = false;
     VideoCore::UniqueImage motion_image;
     VideoCore::UniqueImage output_image;
     vk::UniqueImageView motion_view;

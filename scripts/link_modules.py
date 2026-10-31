@@ -13,17 +13,132 @@ Output: out/boot-linked.bin (format BBPROBE5) and out/link.json.
 import collections
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 from prepare import parse_self, span, unpack
 from link_libc import encode_id
 
-DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx')
+DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx', 'libSceNpToolkit2.prx')
 # libc exports the runtime calls itself (frame stats: malloc_stats), by NID: each libc.prx build
 # has them at its own offsets (Bloodborne's and GODZILLA's +0x1f8c0, GUNDAM VERSUS' +0x55c50).
 # One the game does not import gets an import entry of its own, bound to the export.
 RUNTIME_EXPORTS = ('CC-BLMBu9-I',)  # malloc_stats
 FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
+
+# The game's own linker keeps a registry of loaded objects: register (0x15c9d08) hashes an
+# address into an id, lookup (0x15c8678) maps an id back to the address, unregister
+# (0x15c9ec8) removes it. A module entry stores its object's id, and when the object is
+# unregistered elsewhere (a reload), the id goes stale: lookup returns NULL and the entry
+# walker at 0x15cef28 dereferences it without a check (guest+0xb6ee00 in the shipped image,
+# register r12=0, fault at 0x22 - every long run ends there, thread CApplicationBase).
+# The sibling walker at 0x15ca068 does check for NULL, so skipping is the game's own
+# defensive pattern. These patches (eboot image offsets; each verifies the bytes it
+# replaces) route the NULL through the entry-skip path at 0x15cf28d instead:
+#   0x15ceea9 (15 bytes of alignment nop): first entry jumps straight to the loop head as
+#     before; a new late entry at +2 zeroes the loop counter (eax), tests the object and,
+#     when it is NULL, jumps to the entry-skip path at 0x15cf28d;
+#   0x15cef1f (the object load): keeps `mov r12,rax`, then jumps into that late entry.
+_PATCH_WALKER = (
+    # The entry walker's NULL check (the two patches above).
+    (0xb6ed81, bytes.fromhex('6666666666662e0f1f840000000000'),
+     bytes.fromhex('eb0d31c04d85e47576e9d603000090')),
+    (0xb6edf7, bytes.fromhex('4989c431c00f1f4000'),
+     bytes.fromhex('4989c4e984ffffff90')),
+    # The walker's second phase (0xb6f210 loop) calls the same registry lookup
+    # (0xb68550) per module entry and, unlike the sibling walker at 0x15ca068,
+    # never checks the result: a stale or never-registered id dereferences NULL
+    # at 0xb6f230. Rather than duplicating a check with no room for one (the
+    # 5 bytes between the call and the loop head also hold the `xor r9d,r9d`
+    # the element loop needs), the call is routed through a 14-byte wrapper in
+    # alignment padding: on a NULL lookup it zeroes the child count (r14d), so
+    # the existing `test r14d,r14d / je <next entry>` skips the entry - the
+    # same defensive pattern the sibling walker uses.
+    (0xb6f21d, bytes.fromhex('e82e93ffff'), bytes.fromhex('e89f82ffff')),
+    (0xb674c1, bytes.fromhex('90' * 15),
+     bytes.fromhex('e88a1000004885c075034531f6c3' + '90')),
+)
+# Third phase (0xb6f33e call): the array base lands in rbx and the loop at
+# 0xb6f440 dereferences it. The child count is loaded from [r15+0x2a] right
+# after the call and `test r15d,r15d / je` skips empty entries - so the
+# helper simply zeroes the count when the lookup failed.
+_PATCH_SITE3 = (
+    (0xb6f34a, bytes.fromhex('450fb77f2a'), bytes.fromhex('e882d6ffff')),
+    (0xb6c9d1, bytes.fromhex('90' * 15),
+     bytes.fromhex('450fb77f2a4885c075034531ffc390')),
+)
+# Fourth phase (0xb6f5e7 call): same shape, count into ecx, skip at
+# 0xb6faf4. The game's own count==0 path already tolerates r13==0 there.
+_PATCH_SITE4 = (
+    (0xb6f5ec, bytes.fromhex('410fb74f2a'), bytes.fromhex('e8f0d3ffff')),
+    (0xb6c9e1, bytes.fromhex('90' * 15),
+     bytes.fromhex('410fb74f2a4885c0750231c9c390' + '90')),
+    # Fifth site (a sibling of the walker at 0xb6cb00): same unchecked array
+    # base, the loop at 0xb6cb50 reads [rbx+0x12] of the first element. Here
+    # the 13 bytes between the call and the loop head fit the whole check
+    # inline: test rax,rax / je <next entry at 0xb6cba3> / then the original
+    # `mov rbx,rax; add rbx,0x10`.
+    (0xb6cb43, bytes.fromhex('4889c34883c310660f1f440000'),
+     bytes.fromhex('4885c0745b4889c34883c31090')),
+)
+# Root fix: the walker's ids come from registry R1 (buckets 0x160b600 / 0x160b700,
+# node {+0x0,+0x8}=links,+0x10=key,+0x18=value). Unregister (0xb69da0) unlinks the node
+# and pushes it back onto the free list (0x160b688) WITHOUT zeroing the value, so the key
+# 0x1001 keeps its node in memory but becomes invisible to lookup -> walker F dereferences
+# NULL and crashes. Making unregister a no-op keeps every node (and its value) reachable
+# forever. The node pool (0x19000 nodes) is far larger than a session registers, so never
+# recycling it is safe; re-registering a live key still takes the collision-avoidance path
+# (id++) so it does not clobber the original node. (Enlarging the pool 8x was tried and
+# dropped: the game's own allocator cannot satisfy the 25MB request and init crashes at
+# 0x66a859 with a NULL pool base.)
+# The check the reader of the module's entry table does (0xb6952b) tests the address of
+# the element (base+index*48) for zero instead of the base, so a lookup that found
+# nothing slips through as soon as the index is not zero (guest+0xb69530). It is left
+# alone: the self-healing lookup below makes the lookup find the object, so the check
+# is not reached. (Patching it to test the base makes the game take the "not found"
+# path and call through a null pointer a few minutes later - worse.)
+# The root fix for the lookups that fail. The module's entry table holds, at entry+0x2c, the
+# offset of the symbol inside the module; the linker converts it to an id with the register
+# function (0xb69be0) and looks the id up in the registry (0xb68550). The conversion only
+# happens when the entry is not converted yet (the flag is the sign bit of the word at
+# entry+0x26), and the entries that carry the flag were never converted here: the registry
+# stays empty (used=0) and every lookup of such an entry returns NULL. The walker then
+# dereferences the NULL (guest+0xb6ee00) and the other reader of the same table does the
+# same (guest+0xb69530).
+# The lookup is therefore made self-healing: when it finds nothing, the entry is converted
+# then (the register function is idempotent - an address that is already registered gets the
+# id it has), the id is written back into the entry, and the lookup is done again. The
+# helper lives in the alignment padding of libc.prx; the call reaches it from anywhere.
+_PATCH_SELFHEAL = (
+    (0x2764b4b, bytes.fromhex('90' * 53),
+     bytes.fromhex('e8003a40fe4885c0751e53488b9d60ffffff8b7b2c4c01f7e8785040fe89432c89c75be8dd3940fec3')),
+    (0xb6ede2, bytes.fromhex('e86997ffff'), bytes.fromhex('e8645dbf01')),
+)
+_PATCH_SELFHEAL2 = (
+    (0x2765447, bytes.fromhex('90' * 57),
+     bytes.fromhex('e8043140fe4885c07507488d05c0969bfec3')),
+    (0xb69519, bytes.fromhex('e832f0ffff'), bytes.fromhex('e829bfbf01')),
+)
+_PATCH_DRET = (
+    (0xb69da0, bytes.fromhex('554889e55350'), bytes.fromhex('c39090909090')),
+)
+# Pool enlargement is intentionally not used (see note above).
+_PATCH_POOL8X = ()
+_PATCH_GROUPS = {'walker': _PATCH_WALKER, 'dret': _PATCH_DRET, 'pool8x': _PATCH_POOL8X,
+                 'site3': _PATCH_SITE3, 'site4': _PATCH_SITE4, 'selfheal': _PATCH_SELFHEAL,
+                 'selfheal2': _PATCH_SELFHEAL2}
+
+
+def _selected_patches():
+    spec = os.environ.get('BBPATCH')
+    if not spec or spec == 'all':
+        return (_PATCH_WALKER + _PATCH_DRET + _PATCH_POOL8X
+                + _PATCH_SITE3 + _PATCH_SITE4 + _PATCH_SELFHEAL + _PATCH_SELFHEAL2)
+    return tuple(patch for name in spec.split(',')
+                 for patch in _PATCH_GROUPS[name.strip()])
+
+
+LINKER_PATCHES = _selected_patches()
 
 
 def module(path):
@@ -144,18 +259,37 @@ def link(game, out, module_names=DEFAULT_MODULES):
         return identities[key]
 
     exports, by_nid = {}, collections.defaultdict(list)
+    # The layout of the modules first, then their exports: the main program is linked
+    # before the libraries, and it imports some of the libraries' symbols, which are
+    # their exports (the same identity, another spelling). Without knowing them, the
+    # import would be left to the runtime, which does not have it, and the game would
+    # call nothing.
+    layout = {}
+    base = (size + 65535) & ~65535
+    for filename in module_names:
+        m = module(game / 'sce_module' / filename)
+        loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
+        modsize = max(p['vaddr'] + p['memsz'] for p in loads)
+        if base + modsize > 512 * 1024 * 1024:
+            raise ValueError('linked image exceeds probe limit')
+        layout[filename] = (m, base, modsize, loads)
+        base = (base + modsize + 65535) & ~65535
+    for filename, (m, module_base, modsize, loads) in layout.items():
+        for s in m['symbols']:
+            if s['section'] and s['binding'] in (1, 2) and s['identity'] and s['type'] in (1, 2):
+                if s['identity'] in exports:
+                    raise ValueError(f'{filename}: ambiguous export')
+                entry_value = (module_base + s['value'], 2 if s['type'] == 1 else 1, filename)
+                exports[s['identity']] = entry_value
+                by_nid[(s['identity'][0], s['identity'][1][0])].append(entry_value)
     table = []
     base = (size + 65535) & ~65535
     fs_patched = patch_fs_loads(image, main['ph'], 0)
     tls_module = 2
     module_phs = []
     for filename in module_names:
-        m = module(game / 'sce_module' / filename)
+        m, base, modsize, loads = layout[filename]
         module_phs.append(m['ph'])
-        loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
-        modsize = max(p['vaddr'] + p['memsz'] for p in loads)
-        if base + modsize > 512 * 1024 * 1024:
-            raise ValueError('linked image exceeds probe limit')
         image.extend(bytes(base + modsize - len(image)))
 
         def mapped(address, length=8, loads=loads):
@@ -195,10 +329,15 @@ def link(game, out, module_names=DEFAULT_MODULES):
                 elif not symbol['identity'] and symbol['binding'] == 2:
                     struct.pack_into('<Q', image, target, 0)  # weak undefined (module_start/stop)
                 else:
-                    rk = 2 if symbol['type'] == 1 else 1
-                    if (rk == 1 and addend) or not 0 <= addend < 4096:
-                        raise ValueError(f'{filename}: unsupported import addend')
-                    relocs.append((target, rk, imported(symbol), addend))
+                    found = exports.get(symbol['identity'])
+                    if found is not None and found[2] != filename:
+                        # The symbol is another module's export: the call goes there.
+                        struct.pack_into('<Q', image, target, found[0])
+                    else:
+                        rk = 2 if symbol['type'] == 1 else 1
+                        if (rk == 1 and addend) or not 0 <= addend < 4096:
+                            raise ValueError(f'{filename}: unsupported import addend')
+                        relocs.append((target, rk, imported(symbol), addend))
             else:
                 raise ValueError(f'{filename}: unsupported relocation type {kind}')
         count = 0
@@ -206,10 +345,8 @@ def link(game, out, module_names=DEFAULT_MODULES):
             if s['section'] and s['binding'] in (1, 2) and s['identity'] and s['type'] in (1, 2):
                 if not mapped(s['value'], max(1, s['size'])):
                     raise ValueError(f'{filename}: export outside load segments')
-                if s['identity'] in exports:
-                    raise ValueError(f'{filename}: ambiguous export')
                 entry_value = (base + s['value'], 2 if s['type'] == 1 else 1, filename)
-                exports[s['identity']] = entry_value
+                exports.setdefault(s['identity'], entry_value)
                 by_nid[(s['identity'][0], s['identity'][1][0])].append(entry_value)
                 count += 1
         fs_patched += patch_fs_loads(image, m['ph'], base)
@@ -246,6 +383,11 @@ def link(game, out, module_names=DEFAULT_MODULES):
     unwind = [unwind_entry(image, main['ph'], 0, 'eboot.bin')]
     for t, ph in zip(table, module_phs):
         unwind.append(unwind_entry(image, ph, t['base'], t['file']))
+    for offset, original, replacement in LINKER_PATCHES:
+        if bytes(image[offset:offset + len(original)]) != original:
+            raise ValueError(f'eboot.bin changed: linker patch site {offset:#x} does not match '
+                             f'(found {bytes(image[offset:offset + len(original)]).hex()})')
+        image[offset:offset + len(replacement)] = replacement
     (out / 'unwind.txt').write_text(''.join(
         f'{a:#x} {b:#x} {c:#x} {d:#x} {e:#x} {n}\n' for a, b, c, d, e, n in filter(None, unwind)))
     with (out / 'boot-linked.bin').open('wb') as f:

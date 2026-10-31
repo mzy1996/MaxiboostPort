@@ -72,6 +72,9 @@ def entries(data):
     writes. The cheats that are not a checkbox (a value to type, a slider) have no writes and
     are skipped."""
     found = []
+    if not isinstance(data, dict):
+        # No table (the player has not chosen a cheat file yet).
+        return found
     for mod in data.get('mods', []):
         if not isinstance(mod, dict) or mod.get('type') != 'checkbox':
             continue

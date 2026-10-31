@@ -115,6 +115,10 @@ def link(game, out):
             identities[key] = len(names)
             names.append(name)
         return identities[key]
+    own_exports = {}
+    for s_ in libc['symbols']:
+        if s_['section'] and s_['binding'] in (1,2) and s_['identity'] and s_['type'] in (1,2):
+            own_exports[s_['identity']] = s_
     tls_count = 0
     for target, kind, symid, addend in libc['relocs']:
         if not mapped(target):
@@ -137,11 +141,22 @@ def link(game, out):
                     struct.pack_into('<Q',image,target,symbol['value']+addend)
                 else:
                     relocs.append((target,0,base+symbol['value']+addend,0))
+            elif not symbol['identity'] and addend:
+                # A call to a function of the library itself: the offset says where. The
+                # symbol has no name (the table does not name these), and as an import
+                # it would be left to the runtime, which does not have it: the call would
+                # go nowhere.
+                relocs.append((target,0,base+addend,0))
             else:
-                rk = 2 if symbol['type']==1 else 1
-                if (rk==1 and addend) or not 0 <= addend < 4096:
-                    raise ValueError('unsupported libc import addend')
-                relocs.append((target,rk,imported(symbol),addend))
+                own = own_exports.get(symbol['identity'])
+                if own is not None:
+                    # The library's own export: the call goes there.
+                    relocs.append((target,0,base+own['value']+addend,0))
+                else:
+                    rk = 2 if symbol['type']==1 else 1
+                    if (rk==1 and addend) or not 0 <= addend < 4096:
+                        raise ValueError('unsupported libc import addend')
+                    relocs.append((target,rk,imported(symbol),addend))
         else:
             raise ValueError(f'unsupported libc relocation type {kind}')
     exports = {}

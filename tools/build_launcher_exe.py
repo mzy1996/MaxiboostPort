@@ -27,6 +27,7 @@ LAUNCHER = ROOT / "launcher" / "win_launcher.py"
 # about them: they are code, not data.
 HIDDEN = [
     "bbport_i18n",
+    "input_devices",
     "game_check",
     "cheats",
     "patches",

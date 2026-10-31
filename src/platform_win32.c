@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <io.h>
+#include <errno.h>
 
 /* MapViewOfFileEx returns NULL when it fails; this is the value the caller compares with. */
 #define MAP_FAILED NULL
@@ -87,6 +90,29 @@ void platform_unmap(void *address, size_t size) {
     if (address) VirtualFree(address,size,MEM_RELEASE);
 }
 
+int platform_unmap_full(void *address) {
+    /* The guest's memory is a single MEM_RESERVE reservation into which section views are mapped
+     * with MapViewOfFileEx. Such a view must be unmapped with UnmapViewOfFile on its allocation
+     * base (VirtualFree(...,MEM_RELEASE) is invalid for a mapped view: it returns ERROR_INVALID_
+     * PARAMETER). The runtime records the guest's requested address as the VMA start, but the
+     * view's real allocation base is page-aligned below it, so find it with VirtualQuery first. */
+    if (!address) return -1;
+    MEMORY_BASIC_INFORMATION info;
+    if (!VirtualQuery(address,&info,sizeof(info))) {
+        fprintf(stderr,"platform_unmap_full(%p) query FAILED err=%lu\n",address,GetLastError());
+        return -1;
+    }
+    if (info.State!=MEM_COMMIT) return 0; /* already gone */
+    if (!UnmapViewOfFile(info.AllocationBase)) {
+        fprintf(stderr,"platform_unmap_full(%p base %p size %#llx) UnmapViewOfFile FAILED err=%lu\n",
+                address,info.AllocationBase,(unsigned long long)info.RegionSize,GetLastError());
+        return -1;
+    }
+    return 0;
+}
+
+int platform_last_error(void) { return (int)GetLastError(); }
+
 /* The sections the guest's memory is made of (a memory section on Windows). */
 #define BB_MAX_SECTIONS 512
 static HANDLE sections[BB_MAX_SECTIONS];
@@ -98,7 +124,7 @@ int platform_section_create(int *index, size_t size, const char *name) {
     if (section_count>=BB_MAX_SECTIONS) return -1;
     HANDLE handle=CreateFileMappingW(INVALID_HANDLE_VALUE,NULL,PAGE_READWRITE,
                                       (DWORD)(size>>32),(DWORD)(size&0xffffffffu),NULL);
-    if (!handle) return -1;
+    if (!handle) { fprintf(stderr,"Runtime: platform_section_create FAILED size=%zu err=%lu\n",size,GetLastError()); fflush(stderr); return -1; }
     sections[section_count]=handle;
     section_sizes[section_count]=size;
     *index=(int)section_count;
@@ -121,7 +147,23 @@ void *platform_section_map(int index, void *address, size_t size, uint64_t offse
 void *platform_section_backing(int index, size_t size) {
     if (index<0 || (size_t)index>=section_count) return NULL;
     (void)size;
-    return MapViewOfFile(sections[index],FILE_MAP_ALL_ACCESS,0,0,0);
+    const size_t full=section_sizes[index];
+    /* Reserve a contiguous window first so the view has a guaranteed hole to land in.
+     * MapViewOfFile with no address intermittently fails to place a multi-GiB view when the
+     * many loaded DLLs fragment the lower address space; the reservation (which costs no
+     * physical memory) lets us map at an exact, properly aligned address via MapViewOfFileEx. */
+    void *res=VirtualAlloc(NULL,full,MEM_RESERVE,PAGE_READWRITE);
+    if (res) {
+        void *view=MapViewOfFileEx(sections[index],FILE_MAP_ALL_ACCESS,0,0,full,res);
+        if (view) return view;
+        const DWORD e=GetLastError();
+        VirtualFree(res,0,MEM_RELEASE);
+        fprintf(stderr,"Runtime: platform_section_backing MapViewOfFileEx FAILED size=%zu err=%lu (reserved %p)\n",
+                full,e,res); fflush(stderr);
+    }
+    void *view=MapViewOfFile(sections[index],FILE_MAP_ALL_ACCESS,0,0,0);
+    if (!view) { fprintf(stderr,"Runtime: platform_section_backing FAILED size=%zu err=%lu\n",full,GetLastError()); fflush(stderr); }
+    return view;
 }
 
 void platform_section_release(int index) {
@@ -133,6 +175,12 @@ void platform_section_release(int index) {
 int platform_section_punch_hole(int index, uint64_t offset, size_t size) {
     /* The pages are given back to the host and read as zero again (MEM_RESET). */
     if (index<0 || (size_t)index>=section_count) return -1;
+    /* bbport (diagnostics): every punch hole is said with its section index and offset, so the
+     * zeroing of the registry pool's physical range (guest 0x800410040, phys ~0x4900040, pool is
+     * section index 0) is named even though no runtime memory operation lands on it. */
+    fprintf(stderr,"Runtime: PUNCH section %d offset %#llx size %#zx\n",
+            index,(unsigned long long)offset,size);
+    fflush(stderr);
     void *view=MapViewOfFileEx(sections[index],FILE_MAP_ALL_ACCESS,
                                (DWORD)(offset>>32),(DWORD)(offset&0xffffffffu),size,NULL);
     if (!view) return -1;
@@ -182,21 +230,59 @@ void *platform_reserve_low(size_t size, int prot) {
     return VirtualAlloc(NULL, rounded, MEM_RESERVE, host_protect(prot));
 }
 
+void *platform_private_memory(size_t size, int prot) {
+    /* The pages are reserved, not committed: the game gets them as it writes them, so a
+     * machine with little memory is not charged for the whole heap. */
+    return VirtualAlloc(NULL,size,MEM_RESERVE,host_protect(prot));
+}
+
 void *platform_alloc_executable(size_t size) {
     /* The runtime's own code: it has to be executable and writable (the thunks are patched). */
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 }
 
+int platform_read_memory_checked(void *address, void *buffer, size_t size) {
+    /* The address has to be readable: the pages are asked about first (a wrong
+     * address would take the program down otherwise). */
+    MEMORY_BASIC_INFORMATION info;
+    if (!address || !size) return -1;
+    if (VirtualQuery(address,&info,sizeof(info))!=sizeof(info)) return -1;
+    if (info.State!=MEM_COMMIT) return -1;
+    if ((uintptr_t)address+size > (uintptr_t)info.BaseAddress+info.RegionSize) return -1;
+    if (info.Protect&PAGE_NOACCESS) return -1;
+    memcpy(buffer,address,size);
+    return 0;
+}
 int platform_read_memory(void *address, void *buffer, size_t size) {
-    /* The host reads its own memory: no permissions are needed, but the pages must be
-     * readable, which is what the runtime guarantees. */
+    /* The host reads its own memory, but the address comes from the game's stack: it
+     * can be anything (a frame pointer that was never set, a wild pointer). The pages
+     * are asked about first: a wrong address would take the program down while it is
+     * reporting a fault of its own. */
     if (!size) return 0;
-    memcpy(buffer, address, size);
+    MEMORY_BASIC_INFORMATION info;
+    if (!address) return -1;
+    if (VirtualQuery(address,&info,sizeof(info))!=sizeof(info)) return -1;
+    if (info.State!=MEM_COMMIT) return -1;
+    if ((uintptr_t)address+size > (uintptr_t)info.BaseAddress+info.RegionSize) return -1;
+    if (info.Protect&PAGE_NOACCESS) return -1;
+    memcpy(buffer,address,size);
     return 0;
 }
 
 uint64_t platform_thread_id(void) {
     return (uint64_t)GetCurrentThreadId();
+}
+
+uint64_t platform_thread_stack_limit(void) {
+    /* The thread environment block's StackLimit (GS:[0x10]): where the thread's own
+     * stack ends. */
+    uint64_t limit;
+    __asm__ volatile("mov %%gs:0x10, %0" : "=r"(limit));
+    return limit;
+}
+
+void platform_set_thread_stack_limit(uint64_t limit) {
+    __asm__ volatile("mov %0, %%gs:0x10" : : "r"(limit) : "memory");
 }
 
 uint64_t platform_monotonic_ns(void) {
@@ -337,26 +423,56 @@ int platform_real_path(const char *path, char *buffer, size_t size) {
     return written>0 && written<size;
 }
 
+/* A positional read and write on Windows.
+ *
+ * The descriptor is the C library's own (not a Win32 handle): the Win32 call with it
+ * fails, and the game then never gets its archives - it reads the header, the table
+ * stays empty and every lookup in it fails. So the positional read is the library's
+ * seek and read. The two are together under a lock, so a second read of the same file
+ * does not get in between them. */
+static CRITICAL_SECTION positional_lock;
+static int positional_lock_ready;
+static void positional_enter(void) {
+    if (!positional_lock_ready) {
+        InitializeCriticalSection(&positional_lock);
+        positional_lock_ready=1;
+    }
+    EnterCriticalSection(&positional_lock);
+}
+static void positional_leave(void) { LeaveCriticalSection(&positional_lock); }
+
 int64_t platform_pread(int handle, void *buffer, size_t size, int64_t offset) {
-    OVERLAPPED overlapped;
-    memset(&overlapped,0,sizeof(overlapped));
-    overlapped.Offset=(DWORD)(offset & 0xffffffff);
-    overlapped.OffsetHigh=(DWORD)((uint64_t)offset>>32);
-    if (!ReadFile((HANDLE)handle,buffer,(DWORD)size,NULL,&overlapped)) {
-        if (GetLastError()==ERROR_HANDLE_EOF) return 0;
+    positional_enter();
+    if (_lseeki64(handle,(__int64)offset,SEEK_SET)<0) {
+        positional_leave();
         return -1;
     }
-    return (int64_t)GetOverlappedResult((HANDLE)handle,&overlapped,NULL,FALSE);
+    const ssize_t n=read(handle,buffer,size);
+    positional_leave();
+    if (n<0) {
+        {   /* Why the read failed: the game stops reading when a read fails, and the
+             * reason is only here (the message is written without a buffer, so it is
+             * there even if the game dies right after). */
+            char line[192];
+            const int length=snprintf(line,sizeof(line),"pread: the read failed (errno %d, %lu bytes asked at %lld)\n",
+                                      errno,(unsigned long)size,(long long)offset);
+            if (length>0) platform_write_stdout(line,(size_t)length);
+        }
+        return -1;
+    }
+    return (int64_t)n;
 }
 
 int64_t platform_pwrite(int handle, const void *buffer, size_t size, int64_t offset) {
-    OVERLAPPED overlapped;
-    memset(&overlapped,0,sizeof(overlapped));
-    overlapped.Offset=(DWORD)(offset & 0xffffffff);
-    overlapped.OffsetHigh=(DWORD)((uint64_t)offset>>32);
-    DWORD written=0;
-    if (!WriteFile((HANDLE)handle,buffer,(DWORD)size,&written,&overlapped)) return -1;
-    return (int64_t)written;
+    positional_enter();
+    if (_lseeki64(handle,(__int64)offset,SEEK_SET)<0) {
+        positional_leave();
+        return -1;
+    }
+    const ssize_t n=write(handle,buffer,size);
+    positional_leave();
+    if (n<0) return -1;
+    return (int64_t)n;
 }
 
 char *platform_strcasestr(const char *haystack, const char *needle) {
@@ -457,9 +573,18 @@ int platform_context_is_fetch(const PlatformContext *context) {
     return record->ExceptionInformation[0]==3;
 }
 void platform_write_stdout(const char *text, size_t size) {
-    /* The runtime's log: the standard output, which the launcher reads. */
-    fwrite(text, 1, size, stdout);
-    fflush(stdout);
+    /* The runtime's log: the standard output, which the launcher reads. It is written
+     * straight to the handle, without the C library's buffer: a message that comes
+     * just before a crash (a fault, a stack overflow) must not be lost with the
+     * buffer, and the write needs almost no stack. */
+    HANDLE handle=GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD written=0;
+    if (handle!=INVALID_HANDLE_VALUE && handle)
+        WriteFile(handle,text,(DWORD)size,&written,NULL);
+    else {
+        fwrite(text, 1, size, stdout);
+        fflush(stdout);
+    }
 }
 
 /* A shared library the runtime loads at run time (the online module). */
@@ -610,6 +735,45 @@ void platform_cpu_times(uint64_t *process_ns, uint64_t *thread_ns) {
         u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
         if (thread_ns) *thread_ns = (k.QuadPart + u.QuadPart) * 100;
     } else if (thread_ns) *thread_ns = 0;
+}
+
+/* bbport: the search for a value that leaked from the host into the guest's memory. The guest's
+ * memory is the host's memory, so every committed, readable region of this process is a place
+ * where the value could be. The budget keeps the crash report quick: the huge regions (the GPU
+ * library's, the image's) are skipped, because a leak into the guest's heap is in a small one. */
+int platform_scan_memory(uint64_t value, uintptr_t *hits, int max_hits, uint64_t *scanned) {
+    if (scanned) *scanned = 0;
+    if (!hits || max_hits <= 0) return 0;
+    unsigned char pattern[8];
+    memcpy(pattern, &value, sizeof(pattern));
+    int found = 0;
+    uint64_t budget = UINT64_C(1) << 30; /* 1 GiB is looked at */
+    uintptr_t address = 0;
+    const uintptr_t limit = (uintptr_t)0x00007FFFFFFF0000ull;
+    MEMORY_BASIC_INFORMATION info;
+    while (address < limit && budget > 0) {
+        if (VirtualQuery((const void *)address, &info, sizeof(info)) == 0) break;
+        const uintptr_t base = (uintptr_t)info.BaseAddress;
+        const uintptr_t end = base + (uintptr_t)info.RegionSize;
+        if (end <= address) break;
+        address = end;
+        if (info.State != MEM_COMMIT) continue;
+        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) continue;
+        const uintptr_t size = (uintptr_t)info.RegionSize;
+        if ((uint64_t)size > budget) continue; /* too big to be worth the time */
+        budget -= size;
+        if (scanned) *scanned += size;
+        const unsigned char *p = (const unsigned char *)base;
+        for (uintptr_t i = 0; i + sizeof(pattern) <= size; ++i) {
+            if (p[i] != pattern[0]) continue;
+            if (memcmp(p + i, pattern, sizeof(pattern)) != 0) continue;
+            if (found < max_hits) hits[found] = base + i;
+            ++found;
+            i += sizeof(pattern) - 1; /* a match cannot start inside itself */
+            if (found >= max_hits) return found;
+        }
+    }
+    return found;
 }
 
 #endif /* _WIN32 */

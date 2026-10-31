@@ -40,6 +40,9 @@ static ABI int32_t attr_type(GuestAttr **attr, int type) {
     if (!attr || !*attr || type < 1 || type > 4) return orbis_error(EINVAL);
     (*attr)->type = type; return 0;
 }
+/* The mutex types of the guest (PthreadMutexType in the SDK): 1 error check, 2 recursive,
+ * 3 normal, 4 adaptive (it spins before it waits, which is what the game's job system
+ * wants). The host's own numbers are different, so they are translated here. */
 /* Priority protocols need a PS4 scheduler; the value is validated and recorded only. */
 static ABI int32_t attr_protocol(GuestAttr **attr, int protocol) {
     if (!attr || !*attr || protocol < 0 || protocol > 2) return orbis_error(EINVAL);
@@ -59,7 +62,8 @@ static ABI int32_t mutex_init(GuestMutex **out, GuestAttr **attr, const char *na
     pthread_mutexattr_t native_attr;
     int e = pthread_mutexattr_init(&native_attr);
     if (e) { free(mutex); return orbis_error(e); }
-    int native_type = type == 2 ? PTHREAD_MUTEX_RECURSIVE : type == 3 ? PTHREAD_MUTEX_NORMAL : PTHREAD_MUTEX_ERRORCHECK;
+    int native_type = type == 2 ? PTHREAD_MUTEX_RECURSIVE : type == 3 ? PTHREAD_MUTEX_NORMAL
+                     : type == 4 ? PTHREAD_MUTEX_ADAPTIVE_NP : PTHREAD_MUTEX_ERRORCHECK;
     e = pthread_mutexattr_settype(&native_attr, native_type);
     if (!e) e = pthread_mutex_init(&mutex->native, &native_attr);
     pthread_mutexattr_destroy(&native_attr);
@@ -198,7 +202,9 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     ++waits;
     const uint64_t start = runtime_wait_clock();
+    runtime_wait_mark("a condition variable");
     const int e2 = pthread_cond_wait(&(*cond)->native, &(*mutex)->native);
+    runtime_wait_mark(0);
     runtime_wait_note(0, runtime_wait_clock() - start);
     return orbis_error(e2);
 }
@@ -208,7 +214,9 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
     const uint64_t start = runtime_wait_clock();
+    runtime_wait_mark("a condition variable (with a time)");
     const int e2 = pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end);
+    runtime_wait_mark(0);
     runtime_wait_note(0, runtime_wait_clock() - start);
     return timed_error(e2);
 }

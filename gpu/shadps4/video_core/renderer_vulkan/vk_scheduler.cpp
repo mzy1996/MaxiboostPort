@@ -1004,6 +1004,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 }
 
 void Scheduler::SubmitAsync(SubmitInfo& info) {
+    {   /* How much work the game hands to the GPU (BB_GPU_TRACE=1 says it now and then). */
+        static std::atomic<u64> submits{0};
+        static std::atomic<u64> last_report{0};
+        const u64 now=++submits;
+        if (const char *t=std::getenv("BB_GPU_TRACE")) {
+            if (t[0]=='1' && now-last_report.load()>=100) {
+                last_report=now;
+                std::printf("GPU trace: %llu submissions\n",(unsigned long long)now);
+            }
+        }
+    }
     const u64 signal_value = work_semaphore.NextTick();
     if (on_submit) {
         on_submit(info);

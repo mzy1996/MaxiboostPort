@@ -836,6 +836,14 @@ EN = {
     "Корейский": "Korean",
     "HDR": "HDR",
     "Чит": "Cheat",
+    "Память игры": "Game memory",
+    "512 МБ (экономичный)": "512 MB (economical)",
+    "1024 МБ": "1024 MB",
+    "2048 МБ": "2048 MB",
+    "4096 МБ": "4096 MB",
+    "5056 МБ (как на PS4)": "5056 MB (as on the PS4)",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -1717,6 +1725,14 @@ PT_BR = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Trapaça",
+    "Память игры": "Game memory",
+    "2048 МБ": "2048 MB",
+    "5056 МБ (как на PS4)": "5056 MB (as on the PS4)",
+    "4096 МБ": "4096 MB",
+    "512 МБ (экономичный)": "512 MB (economical)",
+    "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -2515,6 +2531,14 @@ ES = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Truco",
+    "Память игры": "Game memory",
+    "2048 МБ": "2048 MB",
+    "5056 МБ (как на PS4)": "5056 MB (as on the PS4)",
+    "4096 МБ": "4096 MB",
+    "512 МБ (экономичный)": "512 MB (economical)",
+    "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -3313,6 +3337,14 @@ IT = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Truffa",
+    "Память игры": "Game memory",
+    "2048 МБ": "2048 MB",
+    "5056 МБ (как на PS4)": "5056 MB (as on the PS4)",
+    "4096 МБ": "4096 MB",
+    "512 МБ (экономичный)": "512 MB (economical)",
+    "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -4111,6 +4143,14 @@ FR = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Triche",
+    "Память игры": "Game memory",
+    "2048 МБ": "2048 MB",
+    "5056 МБ (как на PS4)": "5056 MB (as on the PS4)",
+    "4096 МБ": "4096 MB",
+    "512 МБ (экономичный)": "512 MB (economical)",
+    "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -4909,6 +4949,14 @@ DE = {
     "Кнопка геймпада": "Gamepad button",
     "HDR": "HDR",
     "Чит": "Cheat",
+    "Память игры": "Game memory",
+    "2048 МБ": "2048 MB",
+    "5056 МБ (как на PS4)": "5056 MB (as on the PS4)",
+    "4096 МБ": "4096 MB",
+    "512 МБ (экономичный)": "512 MB (economical)",
+    "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "A library (DLL) is missing. Check that the bin folder is whole.",
+    "Неверный формат программы (64-разрядный режим).": "Wrong program format (the 64-bit mode).",
 }
 
 
@@ -5679,6 +5727,14 @@ ZH_CN = {
     "Circle": "Circle",
     "Кнопка геймпада": "手柄按键",
     "HDR": "HDR",
+    "Память игры": "游戏内存",
+    "2048 МБ": "2048 MB",
+    "5056 МБ (как на PS4)": "5056 MB（与 PS4 相同）",
+    "4096 МБ": "4096 MB",
+    "512 МБ (экономичный)": "512 MB（省电）",
+    "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "缺少库文件（DLL）。请检查 bin 文件夹是否完整。",
+    "Неверный формат программы (64-разрядный режим).": "程序格式错误（64 位模式）。",
 }
 
 
@@ -6311,6 +6367,14 @@ ZH_TW = {
     "Circle": "Circle",
     "Кнопка геймпада": "手柄按鍵",
     "HDR": "HDR",
+    "Память игры": "遊戲記憶體",
+    "2048 МБ": "2048 MB",
+    "5056 МБ (как на PS4)": "5056 MB（與 PS4 相同）",
+    "4096 МБ": "4096 MB",
+    "512 МБ (экономичный)": "512 MB（省電）",
+    "1024 МБ": "1024 MB",
+    "Не найдена библиотека (DLL). Проверьте, что папка bin целая.": "缺少庫檔案（DLL）。請檢查 bin 資料夾是否完整。",
+    "Неверный формат программы (64-разрядный режим).": "程式格式錯誤（64 位模式）。",
 }
 
 # Translations by language code; Russian is the key itself. Strings missing in a translation

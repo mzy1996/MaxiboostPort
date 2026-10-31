@@ -1,6 +1,7 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
+#include "platform.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,52 @@ static _Atomic size_t memory_calls;
 #define TLS_MODULES 8
 static struct { const void *data; uint64_t filesz, memsz; } tls_modules[TLS_MODULES];
 static _Thread_local unsigned char *tls_blocks[TLS_MODULES];
+/* bbport: the modules' dynamic TLS blocks are host blocks too (one per thread and module), so a
+ * pointer into one of them is a host address. The crash report says when it happens. */
+#define DYN_TLS_BLOCKS 64
+static struct { uintptr_t base; uint64_t size; int module; } dyn_tls_blocks[DYN_TLS_BLOCKS];
+static int dyn_tls_count;
+static void note_dynamic_tls(uintptr_t base, uint64_t size, int module) {
+    for (int i=0;i<dyn_tls_count;++i)
+        if (dyn_tls_blocks[i].base==base && dyn_tls_blocks[i].module==module) return;
+    if (dyn_tls_count < DYN_TLS_BLOCKS) {
+        dyn_tls_blocks[dyn_tls_count].base=base;
+        dyn_tls_blocks[dyn_tls_count].size=size;
+        dyn_tls_blocks[dyn_tls_count].module=module;
+        ++dyn_tls_count;
+    }
+}
+/* bbport: what kind of memory an address is: the current thread's stack, a module's dynamic TLS,
+ * a thread's static TLS. The guest's address space is the host's, so the guest's thread-local
+ * variables live in the host's heap. */
+int runtime_guest_memory_of(uintptr_t address, int *kind, int *module, uint64_t *offset, uint64_t *size) {
+    if (kind) *kind=BB_MEM_NONE;
+    if (module) *module=-1;
+    void *low=NULL,*high=NULL;
+    platform_thread_stack(&low,&high);
+    if (low && high && address>=(uintptr_t)low && address<(uintptr_t)high) {
+        if (kind) *kind=BB_MEM_STACK;
+        if (offset) *offset=address-(uintptr_t)low;
+        if (size) *size=(uintptr_t)high-(uintptr_t)low;
+        return 1;
+    }
+    for (int i=0;i<dyn_tls_count;++i)
+        if (address>=dyn_tls_blocks[i].base && address<dyn_tls_blocks[i].base+dyn_tls_blocks[i].size) {
+            if (kind) *kind=BB_MEM_DYNAMIC_TLS;
+            if (module) *module=dyn_tls_blocks[i].module;
+            if (offset) *offset=address-dyn_tls_blocks[i].base;
+            if (size) *size=dyn_tls_blocks[i].size;
+            return 1;
+        }
+    uint64_t off=0,sz=0,memsz=0;
+    if (runtime_static_tls_of(address,&off,&sz,&memsz)) {
+        if (kind) *kind=BB_MEM_STATIC_TLS;
+        if (offset) *offset=off;
+        if (size) *size=sz;
+        return 1;
+    }
+    return 0;
+}
 static void *process_param;
 const unsigned char *runtime_libc_module;
 uint64_t runtime_libc_module_size;
@@ -38,7 +85,13 @@ void runtime_set_procparam(void *param) {
     process_param=param;
     /* bbport: the game's libc heap settings (SceProcParam +0x30: SceLibcParam; its +0x10.. pointers to
      * the heap size, delayed and extended allocation flags, initial size). */
-    const uint64_t *p=(const uint64_t *)param;
+    uint64_t *p=(uint64_t *)param;
+    if (!p) return;
+    /* The game dumps the library's settings through +0x30, and the game's own file leaves
+     * that field empty (the system builds the struct). The library's settings are at +0x38
+     * (the same structure), so the pointer goes there. Without it the game stops in the
+     * library's own check of its heap. */
+    if (!p[6] && p[7]) p[6]=p[7];
     if (!p || p[0]<0x38 || !p[6]) return;
     const uint64_t *libc=(const uint64_t *)p[6];
     printf("Runtime: libc param size %#llx, entries %u", (unsigned long long)libc[0], (unsigned)libc[1]);
@@ -72,6 +125,7 @@ static ABI void *guest_tls_get_addr(const uint64_t *index) {
         *block=calloc(1,tls_modules[index[0]].memsz);
         if (!*block) { fputs("Cannot allocate module TLS\n",stderr); exit(1); }
         memcpy(*block,tls_modules[index[0]].data,tls_modules[index[0]].filesz);
+        note_dynamic_tls((uintptr_t)*block,tls_modules[index[0]].memsz,(int)index[0]);
     }
     return *block+index[1];
 }
@@ -106,6 +160,7 @@ void runtime_report(void) {
     runtime_font_report();
     runtime_content_report();
     runtime_memory_report();
+    runtime_file_report();
     runtime_ajm_report();
     runtime_audio_report();
     runtime_pad_report();
@@ -189,26 +244,60 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
     fputs("STOP: guest stack protector detected corruption\n", stderr);
     exit(22);
 }
+/* BB_CPU_WATCH (probe.c): copies into the watched range name the game's code that asked for them.
+   A memset is the way a pool is erased, so the same watch is applied to it.
+   BB_GUEST_WATCH watches an address of the guest's own memory (its heap), which is a host
+   address too: the copies into it are named the same way.
+   BB_COPY_WATCH=<bytes>: name the guest's copies that land outside the guest's own memory
+   (the regions the runtime manages). A copy into memory the guest does not own is how the
+   game's data ends up beside the host's own. */
+uintptr_t runtime_cpu_watch_lo, runtime_cpu_watch_hi;
+uintptr_t runtime_guest_watch_lo, runtime_guest_watch_hi;
+uintptr_t runtime_image_base;
+uint64_t runtime_image_bytes;
+static size_t copy_watch_min = 0;
+static int copy_watch_ready = 0;
+static void watch_copy(const char *what, const void *dst, size_t size, const void *caller) {
+    const uintptr_t d=(uintptr_t)dst;
+    const int in_image = runtime_cpu_watch_hi && d<runtime_cpu_watch_hi && d+size>runtime_cpu_watch_lo;
+    const int in_guest = runtime_guest_watch_hi && d<runtime_guest_watch_hi && d+size>runtime_guest_watch_lo;
+    if (in_image || in_guest) {
+        bb_cpu_copy_note(what,dst,size,caller);
+        return;
+    }
+    if (!copy_watch_ready) {
+        copy_watch_ready = 1;
+        const char *env = getenv("BB_COPY_WATCH");
+        if (env && *env) {
+            const unsigned long long at = strtoull(env, NULL, 0);
+            copy_watch_min = at ? (size_t)at : 4096;
+        }
+    }
+    if (!copy_watch_min || size < copy_watch_min) return;
+    /* The image is the guest's own memory too, but it is not one of the regions the runtime
+     * manages (it is mapped at its fixed address), so it is excluded by hand. */
+    if (runtime_image_bytes && d>=runtime_image_base && d<runtime_image_base+runtime_image_bytes) return;
+    /* The guest's thread stacks are the host's stacks (the guest's address space is the
+     * host's), so a copy into one of them is the guest's own doing. */
+    { int kind=0; uint64_t off=0,sz=0;
+      if (runtime_guest_memory_of(d,&kind,NULL,&off,&sz) && kind==BB_MEM_STACK) return; }
+    if (!runtime_memory_is_mapped(d, size))
+        bb_cpu_copy_note(what,dst,size,caller);
+}
 static ABI void *guest_memset(void *dst, int value, size_t size) {
+    watch_copy("memset",dst,size,__builtin_return_address(0));
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
     runtime_memory_prepare_cpu_write((uintptr_t)dst, size);
     memset(dst, value, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
-/* BB_CPU_WATCH (probe.c): copies into the watched range name the game's code that asked for them. */
-uintptr_t runtime_cpu_watch_lo, runtime_cpu_watch_hi;
-static void watch_copy(const void *dst, size_t size, const void *caller) {
-    const uintptr_t d=(uintptr_t)dst;
-    if (runtime_cpu_watch_hi && d<runtime_cpu_watch_hi && d+size>runtime_cpu_watch_lo)
-        printf("CPU watch: memcpy of %zu bytes to %#lx from %p\n",size,(unsigned long)d,caller);
-}
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
-    watch_copy(dst,size,__builtin_return_address(0));
+    watch_copy("memcpy",dst,size,__builtin_return_address(0));
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
     runtime_memory_prepare_cpu_write((uintptr_t)dst, size);
     memcpy(dst, src, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
-    watch_copy(dst,size,__builtin_return_address(0));
+    watch_copy("memmove",dst,size,__builtin_return_address(0));
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
     runtime_memory_prepare_cpu_write((uintptr_t)dst, size);
     memmove(dst, src, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
@@ -229,6 +318,11 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
         if (runtime_nid_is(name,"f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
         if (runtime_nid_is(name,"ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
+        /* The three streams of the program: the game asks for them by name and hands
+         * them back to the functions of the C library. */
+        if (runtime_nid_is(name,"2sWzhYqFH4E#libSceLibcInternal")) return (uintptr_t)runtime_stdio_stream(1);
+        if (runtime_nid_is(name,"H8AprKeZtNg#libSceLibcInternal")) return (uintptr_t)runtime_stdio_stream(2);
+        if (runtime_nid_is(name,"1TDo-ImqkJc#libSceLibcInternal")) return (uintptr_t)runtime_stdio_stream(0);
         return runtime_process_resolve_data(name);
     }
     /* Exact scoped imports for CUSA03173; the suffix identifies library/module. */
@@ -250,6 +344,10 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (runtime_nid_is(name,"vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
     if (runtime_nid_is(name,"959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
     if (runtime_nid_is(name,"p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
+    uintptr_t printing = runtime_printf_resolve(name);
+    if (printing) return printing;
+    uintptr_t stdio = runtime_stdio_resolve(name);
+    if (stdio) return stdio;
     uintptr_t mutex = runtime_mutex_resolve(name);
     if (mutex) return mutex;
     uintptr_t thread = runtime_thread_resolve(name);
@@ -274,6 +372,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (memory) return memory;
     uintptr_t kernel = runtime_kernel_resolve(name);
     if (kernel) return kernel;
+    uintptr_t ces = runtime_ces_resolve(name);
+    if (ces) return ces;
     uintptr_t json = runtime_json_resolve(name);
     if (json) return json;
     uintptr_t services = runtime_services_resolve(name);

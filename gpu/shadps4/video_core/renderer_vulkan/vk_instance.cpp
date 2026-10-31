@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_xess.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -491,6 +492,19 @@ bool Instance::CreateDevice() {
             }
         }
     }
+    // bbport: XeSS (optional bridge library) needs its own device extensions (usually none; runs on
+    // any vendor, selecting its Intel-XMX or DP4a / generic path internally).
+    std::vector<const char*> xess_extensions;
+    if (Xess* xess = Xess::Get()) {
+        xess->AppendDeviceExtensions(physical_device, xess_extensions);
+        for (const char* name : xess_extensions) {
+            if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                             [&](const char* e) { return std::string_view{e} == name; }) &&
+                enabled_extensions.size() < enabled_extensions.capacity()) {
+                enabled_extensions.push_back(name);
+            }
+        }
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,
@@ -733,6 +747,10 @@ bool Instance::CreateDevice() {
                                      "(check NVIDIA CUDA/UVM availability)",
                                      vk::to_string(device_result)));
         }
+        if (Xess* xess = Xess::Get()) {
+            xess->Disable(fmt::format("Vulkan device creation failed with XeSS extensions: {}",
+                                     vk::to_string(device_result)));
+        }
         enabled_extensions.resize(renderer_extension_count);
         device_chain.get().enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
         auto retry = physical_device.createDeviceUnique(device_chain.get());
@@ -748,6 +766,10 @@ bool Instance::CreateDevice() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
     if (Dlss* dlss = Dlss::Get()) {
         dlss->Initialize(*instance, physical_device, *device);
+    }
+    // bbport: XeSS needs the graphics queue family (its evaluate dispatches compute work).
+    if (Xess* xess = Xess::Get()) {
+        xess->Initialize(*instance, physical_device, *device, queue_family_index);
     }
 
     graphics_queue = device->getQueue(queue_family_index, 0);

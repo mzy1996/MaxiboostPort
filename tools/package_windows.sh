@@ -28,19 +28,41 @@ cp "$root/out/win/bb-probe.exe" "$package/bin/"
 gpu_dll=$(find "$root/out/gpu-win" -name 'bbgpu.dll' | head -1)
 [ -n "$gpu_dll" ] && cp "$gpu_dll" "$package/bin/"
 
+# Optional upscaler bridges that the GPU library loads at run time (not through the import table,
+# so collect_dlls.py does not see them). Each is copied only when it was built and staged in
+# out/win beside bb-probe. XeSS: bbport_xess.dll + Intel's libxess.dll (+ libxell.dll for frame
+# generation). DLSS: bbport_dlss.dll + NVIDIA's nvidia-ngx libraries.
+for extra in bbport_xess.dll libxess.dll libxell.dll bbport_dlss.dll \
+             nvngx_dlss.dll nvidia-ngx-dlss.dll nvngx_dlssg.dll; do
+    [ -f "$root/out/win/$extra" ] && cp "$root/out/win/$extra" "$package/bin/"
+done
+[ -f "$root/out/win/INTEL-XESS-LICENSE.txt" ] && cp "$root/out/win/INTEL-XESS-LICENSE.txt" "$package/docs/"
+
 # The debug symbols are dropped: the library is 300 MB with them and 13 MB without, and the
-# player has no use for them.
+# player has no use for them. The stripped file is written beside the original and moved
+# over it: strip works in place through a temporary file (stXXXXXX) on Windows, and when
+# that fails the file it was stripping is left empty (a package that cannot start).
 strip_bin="$msys/mingw64/bin/strip.exe"
 if [ -x "$strip_bin" ]; then
     for binary in "$package/bin/bb-probe.exe" "$package/bin/bbgpu.dll"; do
-        [ -f "$binary" ] && "$strip_bin" --strip-unneeded "$binary" 2>/dev/null || true
+        [ -f "$binary" ] || continue
+        stripped="$binary.stripped"
+        if "$strip_bin" --strip-unneeded -o "$stripped" "$binary" 2>/dev/null && [ -s "$stripped" ]; then
+            mv -f "$stripped" "$binary"
+        else
+            rm -f "$stripped"
+            echo "WARNING: $binary could not be stripped; it keeps its symbols"
+        fi
     done
 fi
 
 # The DLLs the program needs at run time. The list is worked out from the program's own
 # import table (tools/collect_dlls.py), so it stays right when a dependency changes; the
 # ones that come with Windows are left out.
-# The Python interpreter: the one of the environment, then the usual ones.
+# The Python interpreter: the one of the environment, then the usual ones. The paths
+# below are given to the interpreter, so they have to be in its own flavour: a native
+# Windows interpreter does not understand the paths of this shell (it splits "C:/..."
+# at its colon), and one that runs under the MSYS2 runtime wants them as they are.
 python_bin=""
 for candidate in "${PYTHON:-}" python python3 py; do
     if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1; then
@@ -54,20 +76,35 @@ if [ -z "$python_bin" ]; then
 fi
 # The search path: the toolchain's libraries and the program itself. The runtime is not
 # a DLL (the GPU library imports its symbols), so it is not looked for.
-dll_path="$msys/mingw64/bin:$package/bin"
+# The paths are given to the interpreter, so they have to be in its own flavour: a native
+# Windows interpreter does not understand the paths of this shell (it splits "C:/..." at
+# its colon), and one that runs under the MSYS2 runtime wants them as they are.
+py_sep=$("$python_bin" -c 'import os; print(os.pathsep)')
+if [ "$py_sep" = ";" ]; then
+    msys_bin=$(cygpath -m "$msys/mingw64/bin")
+    pkg_bin=$(cygpath -m "$package/bin")
+    pkg_dir=$(cygpath -m "$package")
+    sep=";"
+else
+    msys_bin="$msys/mingw64/bin"
+    pkg_bin="$package/bin"
+    pkg_dir="$package"
+    sep=":"
+fi
+dll_path="$msys_bin${sep}$pkg_bin"
 if ! BB_DLL_PATH="$dll_path" BB_DLL_IGNORE="bb-probe.exe" \
         "$python_bin" "$root/tools/collect_dlls.py" \
-        "$package/bin/bbgpu.dll" "$package/bin"; then
+        "$pkg_bin/bbgpu.dll" "$pkg_bin"; then
     echo "STOP: some DLLs the program needs were not found: the package would not run" >&2
     exit 1
 fi
 BB_DLL_PATH="$dll_path" BB_DLL_IGNORE="bb-probe.exe" \
     "$python_bin" "$root/tools/collect_dlls.py" \
-    "$package/bin/bb-probe.exe" "$package/bin" || true
+    "$pkg_bin/bb-probe.exe" "$pkg_bin" || true
 
 # The check: every import of every file in the package must be satisfied by the package
 # itself (or by Windows). A package that would not start is caught here.
-if ! "$python_bin" "$root/tools/check_package.py" "$package"; then
+if ! "$python_bin" "$root/tools/check_package.py" "$pkg_dir"; then
     echo "STOP: the package is not complete" >&2
     exit 1
 fi
@@ -76,9 +113,8 @@ fi
 cp "$root/scripts"/*.py "$package/scripts/"
 
 # The launcher (the Windows one and the translations it uses).
-cp "$root/launcher/win_launcher.py" "$package/launcher/"
-cp "$root/launcher/bbport_i18n.py" "$package/launcher/"
-cp "$root/launcher/bbport_assets.py" "$package/launcher/" 2>/dev/null || true
+# The launcher's own scripts (every one of them: a missing one stops the window).
+cp "$root/launcher/"*.py "$package/launcher/"
 cp "$root/launcher/maxiboost.svg" "$package/launcher/" 2>/dev/null || true
 # The file that starts the launcher by a double click.
 cp "$root/launcher/launcher.bat" "$package/launcher/"

@@ -5,15 +5,75 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include "platform.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
+/* The semaphore's own parts: the host's critical section and condition variable on
+ * Windows, the C library's elsewhere. */
+#ifdef _WIN32
+/* A critical section has to be made before it is used: a zeroed one is not a
+ * section (the host's own code reads a field of it that says what it is), and
+ * making it once per lock keeps the lock and the making of it together. */
+typedef struct {
+    CRITICAL_SECTION section;
+    INIT_ONCE once;
+} bb_sema_lock_t;
+typedef CONDITION_VARIABLE bb_cond_t;
+static BOOL CALLBACK bb_lock_init(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once; (void)context;
+    InitializeCriticalSection(&((bb_sema_lock_t *)parameter)->section);
+    return TRUE;
+}
+#define bb_lock_ready(l) InitOnceExecuteOnce(&(l)->once,bb_lock_init,(l),NULL)
+#define bb_lock(l)   do { bb_lock_ready(l); EnterCriticalSection(&(l)->section); } while (0)
+#define bb_unlock(l) LeaveCriticalSection(&(l)->section)
+#define BB_LOCK_INITIAL { {0}, INIT_ONCE_STATIC_INIT }
+#define bb_cond_init(c) do { InitializeConditionVariable(c); } while (0)
+#define bb_cond_destroy(c) do { (void)(c); } while (0)
+#define bb_cond_signal(c) (WakeConditionVariable(c), 0)
+#define bb_cond_broadcast(c) (WakeAllConditionVariable(c), 0)
+static int bb_cond_wait(bb_cond_t *c, bb_sema_lock_t *l) {
+    return SleepConditionVariableCS(c,&l->section,INFINITE) ? 0 : ETIMEDOUT;
+}
+static int bb_cond_timedwait(bb_cond_t *c, bb_sema_lock_t *l, uint32_t milliseconds) {
+    return SleepConditionVariableCS(c,&l->section,milliseconds) ? 0 : ETIMEDOUT;
+}
+static uint64_t now_ns(void) { return platform_realtime_ns(); }
+#else
+typedef pthread_mutex_t bb_sema_lock_t;
+typedef pthread_cond_t bb_cond_t;
+#define bb_lock_ready(l) (void)(l)
+#define bb_lock(l) pthread_mutex_lock(l)
+#define bb_unlock(l) pthread_mutex_unlock(l)
+#define BB_LOCK_INITIAL PTHREAD_MUTEX_INITIALIZER
+#define bb_cond_init(c) pthread_cond_init(c,NULL)
+#define bb_cond_destroy(c) pthread_cond_destroy(c)
+#define bb_cond_signal(c) bb_cond_signal(c)
+#define bb_cond_broadcast(c) bb_cond_broadcast(c)
+static int bb_cond_wait(bb_cond_t *c, bb_sema_lock_t *l) { return pthread_cond_wait(c,l); }
+static int bb_cond_timedwait(bb_cond_t *c, bb_sema_lock_t *l, uint32_t milliseconds) {
+    struct timespec end;
+    clock_gettime(CLOCK_REALTIME,&end);
+    end.tv_sec+=(time_t)(milliseconds/1000);
+    end.tv_nsec+=(long)(milliseconds%1000)*1000000L;
+    if (end.tv_nsec>=1000000000L) { end.tv_sec++; end.tv_nsec-=1000000000L; }
+    return pthread_cond_timedwait(c,l,&end);
+}
+static uint64_t now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec;
+}
+#endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 typedef struct Waiter {
     int32_t need, result;
     int done;
-    pthread_cond_t event;
+    bb_cond_t event;
     struct Waiter *next;
 } Waiter;
 typedef struct Sema {
@@ -24,7 +84,7 @@ typedef struct Sema {
     Waiter *first;
     struct Sema *next;
 } Sema;
-static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+static bb_sema_lock_t lock = BB_LOCK_INITIAL;
 static Sema *registry;
 static uint32_t next_id=1;
 static size_t created, deleted, acquired, signaled, timed_out;
@@ -35,27 +95,22 @@ static Sema *find(uint32_t id) {
 static void host_check(int e) {
     if (e) { fprintf(stderr,"STOP: semaphore host error %d\n",e); exit(21); }
 }
-static uint64_t now_ns(void) {
-    struct timespec t;
-    if (clock_gettime(CLOCK_MONOTONIC,&t)) { perror("clock_gettime"); exit(1); }
-    return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec;
-}
 static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
                               int32_t initial,int32_t maximum,const void *options) {
     if (!out || !name || attr>2 || initial<0 || maximum<=0 || initial>maximum) return ERR(22);
     if (options) { fputs("STOP: semaphore options are not implemented\n",stderr); exit(21); }
     Sema *s=calloc(1,sizeof(*s));
     if (!s) return ERR(12);
-    pthread_mutex_lock(&lock);
-    if (next_id==UINT32_MAX) { pthread_mutex_unlock(&lock); free(s); return ERR(28); }
+    bb_lock(&lock);
+    if (next_id==UINT32_MAX) { bb_unlock(&lock); free(s); return ERR(28); }
     s->id=next_id++; s->attr=attr; s->count=s->initial=initial; s->maximum=maximum;
     s->next=registry; registry=s; *out=s->id; ++created;
     printf("Runtime: semaphore id=%u, attr=%u, initial=%d, max=%d\n",s->id,attr,initial,maximum);
-    pthread_mutex_unlock(&lock);
+    bb_unlock(&lock);
     return 0;
 }
 static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) {
-    pthread_mutex_lock(&lock);
+    bb_lock(&lock);
     Sema *s=find(id);
     int32_t result=0;
     if (!s) result=ERR(3);
@@ -68,19 +123,21 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
            PS4 priority scheduler, host threads run at equal priority. */
         if (getenv("BB_TRACE_SEMA")) fprintf(stderr,"Runtime: blocking wait on semaphore %u (need %d, count %d)\n",id,need,s->count); /* deadlock diagnosis */
         Waiter w={.need=need};
-        pthread_condattr_t attr;
-        host_check(pthread_condattr_init(&attr));
-        host_check(pthread_condattr_setclock(&attr,CLOCK_MONOTONIC));
-        host_check(pthread_cond_init(&w.event,&attr));
-        host_check(pthread_condattr_destroy(&attr));
+        bb_cond_init(&w.event);
         Waiter **tail=&s->first;
         while (*tail) tail=&(*tail)->next;
         *tail=&w; ++s->active;
         const uint64_t wait_start=runtime_wait_clock();
-        uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000 : 0;
-        struct timespec end={.tv_sec=(time_t)(deadline/1000000000),.tv_nsec=(long)(deadline%1000000000)};
+        uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000000 : 0;
         while (!w.done) {
-            int e=timeout ? pthread_cond_timedwait(&w.event,&lock,&end) : pthread_cond_wait(&w.event,&lock);
+            int e;
+            runtime_wait_mark("a semaphore");
+            if (!timeout) e=bb_cond_wait(&w.event,&lock);
+            else {
+                const uint64_t left=deadline>now_ns() ? deadline-now_ns() : 0;
+                e=bb_cond_timedwait(&w.event,&lock,(uint32_t)((left+999999)/1000000));
+            }
+            runtime_wait_mark(0);
             if (e==ETIMEDOUT && !w.done) {
                 Waiter **p=&s->first;
                 while (*p!=&w) p=&(*p)->next;
@@ -94,16 +151,16 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
             uint64_t now=now_ns();
             *timeout=result ? 0 : (uint32_t)(now>=deadline ? 0 : (deadline-now)/1000);
         }
-        host_check(pthread_cond_destroy(&w.event));
+        bb_cond_destroy(&w.event);
         if (!--s->active && s->deleted) free(s);
     }
-    pthread_mutex_unlock(&lock);
+    bb_unlock(&lock);
     return result;
 }
 static ABI int32_t sem_wait(uint32_t id,int32_t need,uint32_t *timeout) { return wait_count(id,need,timeout,1); }
 static ABI int32_t sem_poll(uint32_t id,int32_t need) { return wait_count(id,need,NULL,0); }
 static ABI int32_t sem_signal(uint32_t id,int32_t count) {
-    pthread_mutex_lock(&lock);
+    bb_lock(&lock);
     Sema *s=find(id);
     int32_t result=0;
     if (!s) result=ERR(3);
@@ -115,10 +172,10 @@ static ABI int32_t sem_signal(uint32_t id,int32_t count) {
             Waiter *w=*p;
             if (w->need>s->count) { p=&w->next; continue; }
             s->count-=w->need; *p=w->next; w->done=1;
-            host_check(pthread_cond_signal(&w->event));
+            host_check(bb_cond_signal(&w->event));
         }
     }
-    pthread_mutex_unlock(&lock);
+    bb_unlock(&lock);
     return result;
 }
 static int32_t wake_all(Sema *s,int32_t result) {
@@ -126,12 +183,12 @@ static int32_t wake_all(Sema *s,int32_t result) {
     while (s->first) {
         Waiter *w=s->first; s->first=w->next;
         w->result=result; w->done=1; ++count;
-        host_check(pthread_cond_signal(&w->event));
+        host_check(bb_cond_signal(&w->event));
     }
     return count;
 }
 static ABI int32_t sem_cancel(uint32_t id,int32_t count,int32_t *waiters) {
-    pthread_mutex_lock(&lock);
+    bb_lock(&lock);
     Sema *s=find(id);
     int32_t result=0;
     if (!s) result=ERR(3);
@@ -141,26 +198,26 @@ static ABI int32_t sem_cancel(uint32_t id,int32_t count,int32_t *waiters) {
         if (waiters) *waiters=n;
         s->count=count<0 ? s->initial : count;
     }
-    pthread_mutex_unlock(&lock);
+    bb_unlock(&lock);
     return result;
 }
 static ABI int32_t sem_delete(uint32_t id) {
-    pthread_mutex_lock(&lock);
+    bb_lock(&lock);
     Sema **p=&registry;
     while (*p && (*p)->id!=id) p=&(*p)->next;
-    if (!*p) { pthread_mutex_unlock(&lock); return ERR(3); }
+    if (!*p) { bb_unlock(&lock); return ERR(3); }
     Sema *s=*p; *p=s->next; s->deleted=1; ++deleted;
     wake_all(s,ERR(13));
     if (!s->active) free(s);
-    pthread_mutex_unlock(&lock);
+    bb_unlock(&lock);
     return 0;
 }
 /* Read-only test/diagnostic snapshot, not exposed to guest code. */
 unsigned runtime_sema_waiters(uint32_t id) {
-    pthread_mutex_lock(&lock);
+    bb_lock(&lock);
     Sema *s=find(id); unsigned n=0;
     if (s) for (Waiter *w=s->first;w;w=w->next) ++n;
-    pthread_mutex_unlock(&lock);
+    bb_unlock(&lock);
     return n;
 }
 uintptr_t runtime_sema_resolve(const char *name) {
@@ -173,13 +230,8 @@ uintptr_t runtime_sema_resolve(const char *name) {
     return 0;
 }
 void runtime_sema_report(void) {
-    pthread_mutex_lock(&lock);
+    bb_lock(&lock);
     printf("Runtime: semaphores created=%zu, deleted=%zu, acquired=%zu, signals=%zu, timeouts=%zu\n",
            created,deleted,acquired,signaled,timed_out);
-    pthread_mutex_unlock(&lock);
+    bb_unlock(&lock);
 }
-#else
-uintptr_t runtime_sema_resolve(const char *name) { (void)name; return 0; }
-void runtime_sema_report(void) { puts("Runtime: Windows semaphore backend not implemented"); }
-unsigned runtime_sema_waiters(uint32_t id) { (void)id; return 0; }
-#endif

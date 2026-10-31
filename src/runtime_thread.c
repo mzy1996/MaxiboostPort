@@ -4,6 +4,7 @@
  * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "platform.h"
 #include "asm.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,12 +52,13 @@ typedef struct GuestThread {
     uint64_t *tcb;
     unsigned char *tls_block;
     pthread_t host;
+    uint64_t host_id;
     GuestEntry entry;
     void *argument, *result;
     ThreadAttr attr;
     char name[32];
     int detached, finished, joined, host_owned;
-    jmp_buf exit_jump;
+    runtime_thread_jump exit_jump;
     struct GuestThread *next;
 } GuestThread;
 
@@ -67,6 +69,30 @@ static _Thread_local GuestThread *current;
 static _Thread_local int32_t guest_errno;
 static const unsigned char *tls_template;
 static uint64_t tls_filesz, tls_memsz, tls_align=16;
+/* bbport: the guest's static TLS (with its TCB) is one host block per guest thread. The crash
+ * report says when an address is inside one: the guest's thread-local variables live in the
+ * host's heap, so a pointer into one of them is a host address. */
+#define STATIC_TLS_BLOCKS 64
+static struct { uintptr_t base; uint64_t size; uint64_t memsz; } static_tls_blocks[STATIC_TLS_BLOCKS];
+static int static_tls_count;
+void runtime_note_static_tls(uintptr_t base, uint64_t size, uint64_t memsz) {
+    if (static_tls_count < STATIC_TLS_BLOCKS) {
+        static_tls_blocks[static_tls_count].base=base;
+        static_tls_blocks[static_tls_count].size=size;
+        static_tls_blocks[static_tls_count].memsz=memsz;
+        ++static_tls_count;
+    }
+}
+int runtime_static_tls_of(uintptr_t address, uint64_t *offset, uint64_t *size, uint64_t *memsz) {
+    for (int i=0;i<static_tls_count;++i)
+        if (address>=static_tls_blocks[i].base && address<static_tls_blocks[i].base+static_tls_blocks[i].size) {
+            if (offset) *offset=address-static_tls_blocks[i].base;
+            if (size) *size=static_tls_blocks[i].size;
+            if (memsz) *memsz=static_tls_blocks[i].memsz;
+            return 1;
+        }
+    return 0;
+}
 static size_t created, joined_count, exited;
 
 void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64_t align) {
@@ -75,8 +101,8 @@ void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64
 static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1); }
 #ifdef _WIN32
 /* Windows keeps the GS base for itself: the program cannot set it. The guest's TCB pointer
- * lives in the thread's own TLS slot instead (src/runtime_tls_win32.c), and the loader's
- * rewrite reads that slot. */
+ * lives in the thread's own word instead (src/runtime_tls_win32.c), and the loader's
+ * rewrite reads that word. */
 static void set_gs(void *base) { runtime_tls_set_tcb(base); }
 #else
 static void set_gs(void *base) {
@@ -103,6 +129,7 @@ static void attach(GuestThread *t) {
     tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
     t->tls_block=block; t->tcb=tcb;
+    runtime_note_static_tls((uintptr_t)block,(uint64_t)rounded,tls_memsz);
     set_gs(tcb);
     current=t;
 }
@@ -257,8 +284,11 @@ static void set_host_name(const char *name) {
 /* Calls fn(arg) with rsp at stack_top (16-byte aligned), then returns on the caller's stack: a
  * thread created with a stack of the game's own (scePthreadAttrSetstack) runs its guest code on
  * it, as on a PS4 (MAXIBOOST ON reads its callers' frames there, above the entry's own). The
- * thread's exit (longjmp to host_start) leaves it as any return does. */
-void *runtime_call_on_stack(void *(ABI *fn)(void *),void *arg,uintptr_t stack_top);
+ * thread's exit (longjmp to host_start) leaves it as any return does.
+ * The hand-written code takes its arguments in %rdi, %rsi and %rdx (the System V way, which the
+ * guest's code follows), so the declaration says so: the host's compiler has to put them there
+ * (its own convention puts them in %rcx, %rdx and %r8). */
+void *runtime_call_on_stack(void *(ABI *fn)(void *),void *arg,uintptr_t stack_top) ABI;
 __asm__(BB_ASM_TEXT BB_ASM_GLOBAL("runtime_call_on_stack") BB_ASM_TYPE("runtime_call_on_stack")
         "runtime_call_on_stack:\n"
         "  push %rbp\n  mov %rsp,%rbp\n"
@@ -273,11 +303,23 @@ __asm__(BB_ASM_TEXT BB_ASM_GLOBAL("runtime_call_on_stack") BB_ASM_TYPE("runtime_
 static void (ABI *thread_dtors)(void);
 static void *host_start(void *p) {
     GuestThread *t=p;
+    t->host_id=platform_thread_id();
     attach(t);
     set_host_name(t->name);
-    if (!setjmp(t->exit_jump))
-        t->result=t->attr.stack_address ? runtime_call_on_stack(t->entry,t->argument,t->attr.stack_address+t->attr.stack)
-                                        : t->entry(t->argument);
+    if (!runtime_setjmp(&t->exit_jump)) {
+        /* A thread of the game may run on a stack of the game's own: the C library's
+         * stack probe (which the host's own functions use for their big frames) walks
+         * down from the thread's stack limit, which is somewhere else entirely then, and
+         * touches pages that are not the stack's. While the thread is on a stack of the
+         * game's, the limit is put out of the way (nothing is probed then). */
+        if (t->attr.stack_address) {
+            const uint64_t limit=platform_thread_stack_limit();
+            platform_set_thread_stack_limit(0);
+            t->result=runtime_call_on_stack(t->entry,t->argument,t->attr.stack_address+t->attr.stack);
+            platform_set_thread_stack_limit(limit);
+        } else
+            t->result=t->entry(t->argument);
+    }
     if (thread_dtors) thread_dtors();
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
@@ -303,6 +345,12 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
     *out=t;
+    /* bbport: the CApplicationBase object's vtable/handler slot is overwritten with the image base
+     * (0x10000000) by a neighbour write. The object is a heap-allocated thread control block whose
+     * address we cannot predict, so we locate it by the "CApplicationBase" name string it keeps and
+     * watch its real page (not the thread's argument page, which is a different allocation). */
+    if (name && !strcmp(name,"CApplicationBase"))
+        runtime_watch_capplicationbase_tcb();
     int e=pthread_create(&t->host,&host,host_start,t);
     pthread_attr_destroy(&host);
     if (e) { fprintf(stderr,"STOP: host pthread_create failed: %d\n",e); exit(21); }
@@ -341,7 +389,7 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     if (t->host_owned) { fputs("STOP: pthread_exit on host-owned/main thread\n",stderr); exit(21); }
     t->result=value;
     /* No host unwinder: guest frames have no registered FDEs. */
-    longjmp(t->exit_jump,1);
+    runtime_longjmp(&t->exit_jump,1);
 }
 static ABI int32_t thread_yield(void) { sched_yield(); return 0; }
 static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
@@ -413,8 +461,11 @@ static ABI int32_t posix_create(GuestThread **t,ThreadAttr **a,GuestEntry e,void
 static ABI int32_t posix_create_name(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg,const char *name) { return posix(create(t,a,e,arg,name)); }
 static ABI int32_t posix_join(GuestThread *t,void **r) { return posix(thread_join(t,r)); }
 
-int32_t runtime_thread_spawn(void **out,void *(ABI *entry)(void *),void *argument,uint64_t stack,const char *name) {
-    ThreadAttr *attr=NULL;
+uintptr_t runtime_thread_current_entry(void) {
+    GuestThread *t=runtime_thread_current();
+    return t ? (uintptr_t)t->entry : 0;
+}
+int32_t runtime_thread_spawn(void **out,void *(ABI *entry)(void *),void *argument,uint64_t stack,const char *name) {    ThreadAttr *attr=NULL;
     int32_t r=attr_init(&attr);
     if (!r && stack) r=attr_set_stack(&attr,stack);
     if (!r) r=create((GuestThread **)out,&attr,entry,argument,name);
@@ -450,6 +501,23 @@ uintptr_t runtime_thread_resolve(const char *name) {
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
         if (runtime_nid_is(name,table[i].nid)) return (uintptr_t)table[i].fn;
     return RUNTIME_LOOKUP(named_exports,name);
+}
+/* The numbers and the names of the guest's threads: the watchdog looks at where each
+ * of them is (the name says which part of the game it is). */
+size_t runtime_thread_guest_threads(uint64_t *ids,char *names,size_t name_size,size_t max) {
+    size_t n=0;
+    pthread_mutex_lock(&lock);
+    for (GuestThread *t=threads;t && n<max;t=t->next)
+        if (t->host_id) {
+            ids[n]=t->host_id;
+            if (names && name_size) {
+                strncpy(names+n*name_size,t->name,name_size-1);
+                names[n*name_size+name_size-1]=0;
+            }
+            ++n;
+        }
+    pthread_mutex_unlock(&lock);
+    return n;
 }
 void runtime_thread_report(void) {
     pthread_mutex_lock(&lock);
